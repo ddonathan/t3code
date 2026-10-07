@@ -2801,12 +2801,17 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                   WHERE ordinal >= (SELECT ordinal FROM boundary)
                   ORDER BY ordinal DESC, turn_item_id DESC
                   -- Sentinel 0 is one open turn, or no user turn. LIMIT -1
-                  -- would read every payload in that turn. Cap it at rowLimit.
-                  -- Any positive boundary is a turn window and stays whole.
+                  -- would read every payload in that turn. The first snapshot
+                  -- has the same problem when earlier turns exist: the turn
+                  -- window can still be tens of megabytes and holds the write
+                  -- lock long enough for the shell request to be cancelled.
+                  -- Cap that first read. An older page already has a cursor,
+                  -- so its turn window stays whole.
                   LIMIT CASE
                     WHEN ${window.rowLimit} = 0 THEN 0
                     WHEN (SELECT ordinal FROM boundary) > 0
-                      AND (SELECT COUNT(*) FROM user_anchors) > 0 THEN -1
+                      AND (SELECT COUNT(*) FROM user_anchors) > 0
+                      AND ${window.anchorItemId ?? null} IS NOT NULL THEN -1
                     ELSE ${window.rowLimit}
                   END
                 ), older_history AS (
@@ -6379,10 +6384,9 @@ export const layerMemory: Layer.Layer<ProjectionStoreV2> = Layer.effect(
               (index) => index >= rawStart && isThreadHistoryUserTurn(candidates[index]!.item),
             );
             const anchorLimit = (options.userTurnLimit ?? 0) + 2;
-            // Match the SQL window. A full user-turn window or a raw-turn cap
-            // keeps that span. A shorter multi-turn remainder starts at its
-            // oldest user turn. One open turn, or none, keeps the rowLimit tail.
-            const start =
+            // Match the SQL window. A paged turn window stays whole. The first
+            // snapshot keeps the rowLimit tail even when older turns exist.
+            const turnStart =
               anchors.length >= anchorLimit
                 ? anchors.at(-anchorLimit)!
                 : anchors.length > 0 && rawStart > 0
@@ -6390,6 +6394,10 @@ export const layerMemory: Layer.Layer<ProjectionStoreV2> = Layer.effect(
                   : anchors.length > 1
                     ? anchors[0]!
                     : Math.max(0, anchorIndex - options.rowLimit);
+            const start =
+              options.anchorItemId === undefined
+                ? Math.max(turnStart, Math.max(0, anchorIndex - options.rowLimit))
+                : turnStart;
             const visibleTurnItems = candidates.slice(start);
             return {
               ...snapshot,

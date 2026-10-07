@@ -491,7 +491,7 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
     }),
   );
 
-  it.effect("pages complete user turns through SQL regardless of tool count or payload size", () =>
+  it.effect("caps the first snapshot at the row window and pages omitted turns whole", () =>
     Effect.gen(function* () {
       const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
       const sql = yield* SqlClient.SqlClient;
@@ -607,34 +607,48 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
             ),
         (parse) => Effect.sync(() => parse.mockRestore()),
       );
-      // Only the selected turn cohort and two lookahead anchors are decoded.
-      assert.lengthOf(initial.projection.turnItems, 12 * 102);
+      // The first connect reads the row cap, not every tool row in the turn window.
+      assert.isTrue(initial.olderHistoryExists);
+      assert.lengthOf(initial.projection.turnItems, 77);
+      assert.strictEqual(initial.projection.turnItems.at(-1)?.id, allIds.at(-1));
+      assert.isFalse(initial.projection.turnItems.some((item) => item.id === allIds[0]));
       const bounded = buildBoundedThreadProjection({
         projection: initial.projection,
         snapshotSequence: 0,
+        olderHistoryExists: initial.olderHistoryExists,
+        olderHistoryThreadId: initial.olderHistoryThreadId,
       });
-      assert.lengthOf(bounded.projection.visibleTurnItems, 10 * 102);
-      assert.strictEqual(bounded.projection.visibleTurnItems[0]?.sourceItemId, allIds[35 * 102]);
+      assert.isTrue(bounded.hasMoreHistory);
       const loaded = bounded.projection.visibleTurnItems.map((row) => String(row.sourceItemId));
       let cursor = bounded.historyCursor;
-      for (const turns of [20, 15]) {
-        assert.isNotNull(cursor);
-        const anchor = decodeThreadHistoryCursor(cursor!);
+      let sawWholeTurnPage = false;
+      let pages = 1;
+      while (cursor !== null) {
+        const anchor = decodeThreadHistoryCursor(cursor);
         const snapshot = yield* projectionStore.getThreadSnapshotWindow(threadId, {
           rowLimit: 77,
           userTurnLimit: 20,
           anchorItemId: TurnItemId.make(anchor.si),
           anchorThreadId: ThreadId.make(anchor.st),
         });
+        if (snapshot.projection.turnItems.length > 77) sawWholeTurnPage = true;
         const page = selectHistoryPageFromCursor({
           items: snapshot.projection.visibleTurnItems,
-          cursor: cursor!,
+          cursor,
           snapshotSequence: 0,
         });
-        assert.lengthOf(page.items, turns * 102);
+        const revealed = revealOlderSqlHistory({
+          page,
+          olderHistoryExists: snapshot.olderHistoryExists,
+          olderHistoryThreadId: snapshot.olderHistoryThreadId,
+          snapshotSequence: 0,
+        });
         loaded.unshift(...page.items.map((row) => String(row.sourceItemId)));
-        cursor = page.nextCursor;
+        cursor = revealed.nextCursor;
+        pages += 1;
+        if (pages > 20) break;
       }
+      assert.isTrue(sawWholeTurnPage);
       assert.isNull(cursor);
       assert.deepEqual(loaded, allIds);
     }),

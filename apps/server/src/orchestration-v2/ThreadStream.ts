@@ -1,6 +1,7 @@
 import type {
   OrchestrationV2ThreadProjection,
   OrchestrationV2ThreadStreamItem,
+  ThreadId,
 } from "@t3tools/contracts";
 
 import { buildBoundedThreadProjection } from "./threadHistoryPaging.ts";
@@ -44,6 +45,7 @@ export function buildBoundedThreadStreamSnapshot(input: {
   readonly snapshotSequence: number;
   readonly projection: OrchestrationV2ThreadProjection;
   readonly olderHistoryExists?: boolean | undefined;
+  readonly olderHistoryThreadId?: ThreadId | null | undefined;
 }): ThreadSnapshotStreamItem {
   const bounded = buildBoundedThreadProjection({
     snapshotSequence: input.snapshotSequence,
@@ -51,6 +53,9 @@ export function buildBoundedThreadStreamSnapshot(input: {
     ...(input.olderHistoryExists === undefined
       ? {}
       : { olderHistoryExists: input.olderHistoryExists }),
+    ...(input.olderHistoryThreadId === undefined
+      ? {}
+      : { olderHistoryThreadId: input.olderHistoryThreadId }),
   });
   return {
     kind: "snapshot",

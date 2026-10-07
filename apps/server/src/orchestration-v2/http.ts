@@ -210,6 +210,7 @@ export const layer = HttpApiBuilder.group(
             projection: snapshot.projection,
             snapshotSequence: snapshot.snapshotSequence,
             olderHistoryExists: snapshot.olderHistoryExists,
+            olderHistoryThreadId: snapshot.olderHistoryThreadId,
           });
           return {
             snapshotSequence: snapshot.snapshotSequence,
@@ -258,6 +259,7 @@ export const layer = HttpApiBuilder.group(
           const revealed = revealOlderSqlHistory({
             page: pageOrError.page,
             olderHistoryExists: snapshot.olderHistoryExists,
+            olderHistoryThreadId: snapshot.olderHistoryThreadId,
             snapshotSequence: snapshot.snapshotSequence,
           });
           return {

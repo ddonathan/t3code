@@ -279,6 +279,33 @@ describe("threadHistoryPaging", () => {
     expect(revealed.nextCursor).toBe("already");
   });
 
+  it("keeps an older-history cursor on the local segment when a fork page also shows inherited rows", () => {
+    const parent = ThreadId.make("parent-thread");
+    const inheritedId = TurnItemId.make("inherited-item");
+    const inherited = {
+      ...makeRow(0),
+      visibility: "inherited" as const,
+      sourceThreadId: parent,
+      sourceItemId: inheritedId,
+      item: {
+        ...makeRow(0).item,
+        id: inheritedId,
+        threadId: parent,
+      },
+    };
+    const local = makeRow(1);
+    const revealed = revealOlderSqlHistory({
+      page: { items: [inherited, local], nextCursor: null, hasMoreHistory: false },
+      olderHistoryExists: true,
+      olderHistoryThreadId: THREAD,
+      snapshotSequence: 4,
+    });
+    expect(revealed.hasMoreHistory).toBe(true);
+    const cursor = decodeThreadHistoryCursor(revealed.nextCursor!);
+    expect(cursor.st).toBe(String(THREAD));
+    expect(cursor.si).toBe(String(local.sourceItemId));
+  });
+
   it("encodes opaque cursors with stable source identity", () => {
     const cursor = encodeThreadHistoryCursor({
       snapshotSequence: 9,

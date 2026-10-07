@@ -484,6 +484,8 @@ export interface ProjectionStoreV2Shape {
        * alone cannot say so: a user turn inside the tail looks complete.
        */
       readonly olderHistoryExists: boolean;
+      /** Segment that still has eligible rows older than this window. */
+      readonly olderHistoryThreadId: ThreadId | null;
     },
     ProjectionStoreV2Error
   >;
@@ -911,6 +913,7 @@ type WindowedPayloadRow = PayloadRow & {
 type ReadProjectionResult = {
   readonly projection: OrchestrationV2ThreadProjection;
   readonly olderHistoryExists: boolean;
+  readonly olderHistoryThreadId: ThreadId | null;
 };
 
 type ShellThreadRow = {
@@ -2675,7 +2678,9 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
 
         // A long agent turn can be tens of megabytes. `olderHistoryExists`
         // records when the window below leaves older eligible rows unread.
+        // `olderHistoryThreadId` is the segment those rows belong to.
         let olderHistoryExists = false;
+        let olderHistoryThreadId: ThreadId | null = null;
         const boundedTurnItemRows =
           fields !== undefined && !fields.includes("turnItems")
             ? []
@@ -2853,6 +2858,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
           "older_history" in firstBoundedRow
         ) {
           olderHistoryExists = Number(firstBoundedRow.older_history) === 1;
+          olderHistoryThreadId = olderHistoryExists ? threadId : null;
         }
         // Reuse the decoded items for cohort IDs and the resulting projection.
         // Parsing these rows separately duplicates every retained tool output.
@@ -3263,6 +3269,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
         return {
           projection: fields === undefined ? withLocalVisibleTurnItems(projection) : projection,
           olderHistoryExists,
+          olderHistoryThreadId,
         };
       }).pipe(
         Effect.mapError((cause) =>
@@ -3300,6 +3307,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
         const finish = (visible: OrchestrationV2ThreadProjection): ReadProjectionResult => ({
           projection: visible,
           olderHistoryExists: read.olderHistoryExists,
+          olderHistoryThreadId: read.olderHistoryThreadId,
         });
         const forkedFrom = projection.thread.forkedFrom;
         if (forkedFrom?.type !== "run" || seenThreadIds.has(forkedFrom.threadId)) {
@@ -3419,6 +3427,9 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
             }),
           },
           olderHistoryExists: read.olderHistoryExists || source.olderHistoryExists,
+          // Local omitted rows are newer than inherited history. Keep the
+          // cursor on that segment until they have been paged.
+          olderHistoryThreadId: read.olderHistoryThreadId ?? source.olderHistoryThreadId,
         };
       }).pipe(
         Effect.mapError((cause) =>
@@ -4962,6 +4973,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
               snapshotSequence: rows[0]?.snapshot_sequence ?? 0,
               projection: read.projection,
               olderHistoryExists: read.olderHistoryExists,
+              olderHistoryThreadId: read.olderHistoryThreadId,
             };
           }),
         )
@@ -6381,6 +6393,7 @@ export const layerMemory: Layer.Layer<ProjectionStoreV2> = Layer.effect(
               ...snapshot,
               projection: { ...snapshot.projection, visibleTurnItems },
               olderHistoryExists: start > 0,
+              olderHistoryThreadId: start > 0 ? threadId : null,
             };
           }),
         ),

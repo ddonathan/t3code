@@ -241,8 +241,40 @@ function selectOlderTimelinePage(input: {
 export function revealOlderSqlHistory(input: {
   readonly page: SelectTimelinePageResult;
   readonly olderHistoryExists: boolean;
+  /** Segment whose omitted rows must be paged before any other segment. */
+  readonly olderHistoryThreadId?: ThreadId | null | undefined;
   readonly snapshotSequence: number;
 }): Pick<SelectTimelinePageResult, "hasMoreHistory" | "nextCursor"> {
+  const preferredId =
+    input.olderHistoryThreadId === undefined || input.olderHistoryThreadId === null
+      ? undefined
+      : String(input.olderHistoryThreadId);
+  if (preferredId !== undefined) {
+    const oldestPreferred = input.page.items.find(
+      (row) => String(row.sourceThreadId) === preferredId,
+    );
+    const cursorThread =
+      input.page.nextCursor === null
+        ? undefined
+        : decodeThreadHistoryCursor(input.page.nextCursor).st;
+    if (input.page.hasMoreHistory && cursorThread === preferredId) {
+      return {
+        hasMoreHistory: true,
+        nextCursor: input.page.nextCursor,
+      };
+    }
+    if (oldestPreferred !== undefined) {
+      return {
+        hasMoreHistory: true,
+        nextCursor: encodeThreadHistoryCursor({
+          snapshotSequence: input.snapshotSequence,
+          sourceThreadId: oldestPreferred.sourceThreadId,
+          sourceItemId: oldestPreferred.sourceItemId,
+          position: oldestPreferred.position,
+        }),
+      };
+    }
+  }
   const oldest = input.page.items[0];
   if (input.page.hasMoreHistory || !input.olderHistoryExists || oldest === undefined) {
     return {
@@ -451,6 +483,7 @@ export function buildBoundedThreadProjection(input: {
   readonly policy?: ThreadHistoryPagePolicy | undefined;
   /** SQL omitted eligible rows older than `projection`. */
   readonly olderHistoryExists?: boolean | undefined;
+  readonly olderHistoryThreadId?: ThreadId | null | undefined;
 }): BoundedProjectionResult {
   const policy = input.policy ?? THREAD_HISTORY_PAGE_POLICY;
   const threadId = input.projection.thread.id;
@@ -502,6 +535,7 @@ export function buildBoundedThreadProjection(input: {
   const revealed = revealOlderSqlHistory({
     page: window,
     olderHistoryExists: input.olderHistoryExists === true,
+    olderHistoryThreadId: input.olderHistoryThreadId,
     snapshotSequence: input.snapshotSequence,
   });
   const visibleTurnItems = renumberPositions(window.items);

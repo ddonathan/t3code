@@ -317,6 +317,7 @@ export interface OrchestratorV2Shape {
       readonly snapshotSequence: number;
       readonly projection: OrchestrationV2ThreadProjection;
       readonly olderHistoryExists: boolean;
+      readonly olderHistoryThreadId: ThreadId | null;
     },
     OrchestratorV2Error
   >;

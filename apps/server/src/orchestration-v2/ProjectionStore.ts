@@ -2661,6 +2661,8 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
         readonly anchorItemId?: TurnItemId | undefined;
         readonly requiredRunId?: RunId | undefined;
         readonly suppressLocal?: boolean | undefined;
+        /** Client asked for an older page of this thread. Fork bounds are not one. */
+        readonly olderPage?: boolean | undefined;
       },
       fields?: ReadonlyArray<ProjectionRecordField>,
       filter?: ProjectionRecordFilter,
@@ -2805,13 +2807,14 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                   -- has the same problem when earlier turns exist: the turn
                   -- window can still be tens of megabytes and holds the write
                   -- lock long enough for the shell request to be cancelled.
-                  -- Cap that first read. An older page already has a cursor,
-                  -- so its turn window stays whole.
+                  -- Cap that first read. A client older page already has a
+                  -- cursor, so its turn window stays whole. The anchor used to
+                  -- bound inherited fork history is not that cursor.
                   LIMIT CASE
                     WHEN ${window.rowLimit} = 0 THEN 0
                     WHEN (SELECT ordinal FROM boundary) > 0
                       AND (SELECT COUNT(*) FROM user_anchors) > 0
-                      AND ${window.anchorItemId ?? null} IS NOT NULL THEN -1
+                      AND ${window.olderPage === true ? 1 : 0} = 1 THEN -1
                     ELSE ${window.rowLimit}
                   END
                 ), older_history AS (
@@ -3303,11 +3306,14 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       },
     ): Effect.Effect<ReadProjectionResult, ProjectionStoreV2Error> =>
       Effect.gen(function* () {
+        const olderPage = window?.historyAnchor?.threadId === threadId;
         const localWindow =
           window?.suppressLocal === true ||
           (window?.historyAnchor !== undefined && window.historyAnchor.threadId !== threadId)
-            ? { ...window, rowLimit: 0, anchorItemId: undefined }
-            : window;
+            ? { ...window, rowLimit: 0, anchorItemId: undefined, olderPage }
+            : window === undefined
+              ? undefined
+              : { ...window, olderPage };
         const read = yield* readCanonicalProjection(threadId, localWindow);
         const projection = read.projection;
         const finish = (visible: OrchestrationV2ThreadProjection): ReadProjectionResult => ({
@@ -6403,7 +6409,7 @@ export const layerMemory: Layer.Layer<ProjectionStoreV2> = Layer.effect(
               ...snapshot,
               projection: { ...snapshot.projection, visibleTurnItems },
               olderHistoryExists: start > 0,
-              olderHistoryThreadId: start > 0 ? threadId : null,
+              olderHistoryThreadId: start > 0 ? candidates[start - 1]!.sourceThreadId : null,
             };
           }),
         ),

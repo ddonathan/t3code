@@ -4110,6 +4110,16 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
         `;
       }
 
+      const cappedInitialFork = yield* projectionStore.getThreadSnapshotWindow(targetThreadId, {
+        rowLimit: 2,
+        userTurnLimit: 10,
+      });
+      assert.isAtMost(
+        cappedInitialFork.projection.visibleTurnItems.filter(
+          (row) => row.visibility === "inherited",
+        ).length,
+        2,
+      );
       const boundedFork = yield* projectionStore.getThreadSnapshotWindow(targetThreadId, {
         rowLimit: 2,
       });

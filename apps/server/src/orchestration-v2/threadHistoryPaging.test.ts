@@ -13,6 +13,7 @@ import * as DateTime from "effect/DateTime";
 import {
   buildBoundedThreadProjection,
   boundedTimelineEncodedBytes,
+  revealOlderSqlHistory,
   computeLatestLocalTurnOrdinal,
   decodeThreadHistoryCursor,
   encodeThreadHistoryCursor,
@@ -237,6 +238,45 @@ describe("threadHistoryPaging", () => {
     });
     expect(older.items[0]?.item.type).toBe("user_message");
     expect([...older.items, ...recent.items]).toHaveLength(items.length);
+  });
+
+  it("reports older history when SQL left rows outside a user turn that fits the page", () => {
+    const commandRows = Array.from({ length: 4 }, (_, index) => makeRow(index + 1));
+    const first = makeRow(0);
+    const prompt = {
+      ...first,
+      item: {
+        ...first.item,
+        type: "user_message" as const,
+        createdBy: "user" as const,
+        creationSource: "web" as const,
+        inputIntent: "turn_start" as const,
+        messageId: MessageId.make("prompt"),
+        text: "Continue",
+        attachments: [],
+      },
+    } as OrchestrationV2ProjectedTurnItem;
+    const items = [prompt, ...commandRows];
+    const whole = buildBoundedThreadProjection({
+      projection: makeProjection(items),
+      snapshotSequence: 4,
+    });
+    expect(whole.hasMoreHistory).toBe(false);
+    expect(whole.historyCursor).toBeNull();
+
+    const truncated = buildBoundedThreadProjection({
+      projection: makeProjection(items),
+      snapshotSequence: 4,
+      olderHistoryExists: true,
+    });
+    expect(truncated.hasMoreHistory).toBe(true);
+    expect(truncated.historyCursor).not.toBeNull();
+    const revealed = revealOlderSqlHistory({
+      page: { items, nextCursor: "already", hasMoreHistory: true },
+      olderHistoryExists: true,
+      snapshotSequence: 4,
+    });
+    expect(revealed.nextCursor).toBe("already");
   });
 
   it("encodes opaque cursors with stable source identity", () => {

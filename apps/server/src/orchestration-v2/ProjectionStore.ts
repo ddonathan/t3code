@@ -479,6 +479,11 @@ export interface ProjectionStoreV2Shape {
       readonly schemaVersion: number;
       readonly snapshotSequence: number;
       readonly projection: OrchestrationV2ThreadProjection;
+      /**
+       * True when this window omitted older eligible turn items. The array
+       * alone cannot say so: a user turn inside the tail looks complete.
+       */
+      readonly olderHistoryExists: boolean;
     },
     ProjectionStoreV2Error
   >;
@@ -897,6 +902,15 @@ function applyToProjectionReplayState(
 
 type PayloadRow = {
   readonly payload_json: string;
+};
+
+type WindowedPayloadRow = PayloadRow & {
+  readonly older_history: number;
+};
+
+type ReadProjectionResult = {
+  readonly projection: OrchestrationV2ThreadProjection;
+  readonly olderHistoryExists: boolean;
 };
 
 type ShellThreadRow = {
@@ -2659,6 +2673,9 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
           return yield* new ProjectionStoreThreadNotFoundError({ threadId });
         }
 
+        // A long agent turn can be tens of megabytes. `olderHistoryExists`
+        // records when the window below leaves older eligible rows unread.
+        let olderHistoryExists = false;
         const boundedTurnItemRows =
           fields !== undefined && !fields.includes("turnItems")
             ? []
@@ -2673,10 +2690,12 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                   ${filter?.turnItemRunIds === undefined ? sql`` : sql`AND (run_id IN (SELECT value FROM json_each(${encodeIdList(filter.turnItemRunIds.filter((id): id is RunId => id !== null))})) OR (${filter.turnItemRunIds.includes(null) ? 1 : 0} = 1 AND run_id IS NULL))`}
                 ORDER BY ordinal ASC, turn_item_id ASC
               `
-              : yield* sql<PayloadRow>`
+              : yield* sql<WindowedPayloadRow>`
                 WITH eligible AS NOT MATERIALIZED (
-                  SELECT item.payload_json, item.ordinal, item.turn_item_id,
-                    item.run_id, item.node_id, item.type
+                  -- Omit payload_json. SQLite skips overflow pages for columns
+                  -- this scan does not touch, so a multi-megabyte turn does not
+                  -- have to be read before the tail is chosen.
+                  SELECT item.ordinal, item.turn_item_id, item.run_id, item.type
                   FROM orchestration_v2_projection_turn_items AS item
                   LEFT JOIN orchestration_v2_projection_runs AS run
                     ON run.run_id = item.run_id
@@ -2739,12 +2758,18 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                       )
                     )
                 ), turn_anchors AS (
-                  SELECT ordinal, payload_json
-                  FROM eligible
-                  WHERE type = 'user_message'
-                    AND json_extract(payload_json, '$.inputIntent') IN ('turn_start', 'queued_turn')
+                  -- Payload JSON is read only for user-message rows. Tool rows
+                  -- stay in eligible as ordinals and never touch their blobs.
+                  SELECT item.ordinal AS ordinal, item.payload_json AS payload_json
+                  FROM orchestration_v2_projection_turn_items AS item
+                  WHERE item.thread_id = ${threadId}
+                    AND item.type = 'user_message'
+                    AND item.turn_item_id IN (
+                      SELECT turn_item_id FROM eligible WHERE type = 'user_message'
+                    )
+                    AND json_extract(item.payload_json, '$.inputIntent') IN ('turn_start', 'queued_turn')
                     AND ${window.userTurnLimit ?? null} IS NOT NULL
-                  ORDER BY ordinal DESC
+                  ORDER BY item.ordinal DESC
                   LIMIT ${THREAD_HISTORY_MAX_RAW_TURNS + 2}
                 ), user_anchors AS (
                   SELECT ordinal
@@ -2757,21 +2782,44 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                     WHEN COUNT(*) >= ${(window.userTurnLimit ?? 0) + 2} THEN MIN(ordinal)
                     WHEN (SELECT COUNT(*) FROM turn_anchors) >= ${THREAD_HISTORY_MAX_RAW_TURNS + 2}
                       THEN (SELECT MIN(ordinal) FROM turn_anchors)
+                    -- Fewer turns than the window, but more than one. Start at
+                    -- the oldest so the remainder stays whole. A single open
+                    -- turn stays at the sentinel and uses the row cap below.
+                    WHEN COUNT(*) > 1 THEN MIN(ordinal)
                     ELSE 0
                   END AS ordinal
                   FROM user_anchors
                 ), selected AS (
-                  SELECT payload_json, ordinal, turn_item_id, run_id, type
+                  SELECT ordinal, turn_item_id, run_id, type
                   FROM eligible
                   WHERE ordinal >= (SELECT ordinal FROM boundary)
                   ORDER BY ordinal DESC, turn_item_id DESC
+                  -- Sentinel 0 is one open turn, or no user turn. LIMIT -1
+                  -- would read every payload in that turn. Cap it at rowLimit.
+                  -- Any positive boundary is a turn window and stays whole.
                   LIMIT CASE
                     WHEN ${window.rowLimit} = 0 THEN 0
-                    WHEN (SELECT COUNT(*) FROM user_anchors) > 0 THEN -1
+                    WHEN (SELECT ordinal FROM boundary) > 0
+                      AND (SELECT COUNT(*) FROM user_anchors) > 0 THEN -1
                     ELSE ${window.rowLimit}
                   END
+                ), older_history AS (
+                  SELECT CASE
+                    WHEN EXISTS (
+                      SELECT 1
+                      FROM eligible
+                      WHERE ordinal < (SELECT MIN(ordinal) FROM selected)
+                    ) THEN 1
+                    ELSE 0
+                  END AS value
                 ), retained AS (
-                  SELECT payload_json, ordinal, turn_item_id FROM selected
+                  SELECT item.payload_json AS payload_json,
+                    selected.ordinal AS ordinal,
+                    selected.turn_item_id AS turn_item_id
+                  FROM selected
+                  INNER JOIN orchestration_v2_projection_turn_items AS item
+                    ON item.thread_id = ${threadId}
+                   AND item.turn_item_id = selected.turn_item_id
                   UNION
                   SELECT request.payload_json, request.ordinal, request.turn_item_id
                   FROM orchestration_v2_projection_turn_items AS request
@@ -2792,10 +2840,20 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                     LIMIT 1
                   ) AS latest
                 )
-                SELECT payload_json
+                SELECT retained.payload_json AS payload_json,
+                  older_history.value AS older_history
                 FROM retained
-                ORDER BY ordinal ASC, turn_item_id ASC
+                CROSS JOIN older_history
+                ORDER BY retained.ordinal ASC, retained.turn_item_id ASC
               `;
+        const firstBoundedRow = boundedTurnItemRows[0];
+        if (
+          window !== undefined &&
+          firstBoundedRow !== undefined &&
+          "older_history" in firstBoundedRow
+        ) {
+          olderHistoryExists = Number(firstBoundedRow.older_history) === 1;
+        }
         // Reuse the decoded items for cohort IDs and the resulting projection.
         // Parsing these rows separately duplicates every retained tool output.
         const turnItems = yield* decodeRows(decodeTurnItemPayload, threadId)(boundedTurnItemRows);
@@ -3202,7 +3260,10 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
           visibleTurnItems: [],
           updatedAt: thread.updatedAt,
         } satisfies OrchestrationV2ThreadProjection;
-        return fields === undefined ? withLocalVisibleTurnItems(projection) : projection;
+        return {
+          projection: fields === undefined ? withLocalVisibleTurnItems(projection) : projection,
+          olderHistoryExists,
+        };
       }).pipe(
         Effect.mapError((cause) =>
           isProjectionStoreThreadNotFoundError(cause)
@@ -3227,17 +3288,22 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
           | { readonly threadId: ThreadId; readonly itemId: TurnItemId }
           | undefined;
       },
-    ): Effect.Effect<OrchestrationV2ThreadProjection, ProjectionStoreV2Error> =>
+    ): Effect.Effect<ReadProjectionResult, ProjectionStoreV2Error> =>
       Effect.gen(function* () {
         const localWindow =
           window?.suppressLocal === true ||
           (window?.historyAnchor !== undefined && window.historyAnchor.threadId !== threadId)
             ? { ...window, rowLimit: 0, anchorItemId: undefined }
             : window;
-        const projection = yield* readCanonicalProjection(threadId, localWindow);
+        const read = yield* readCanonicalProjection(threadId, localWindow);
+        const projection = read.projection;
+        const finish = (visible: OrchestrationV2ThreadProjection): ReadProjectionResult => ({
+          projection: visible,
+          olderHistoryExists: read.olderHistoryExists,
+        });
         const forkedFrom = projection.thread.forkedFrom;
         if (forkedFrom?.type !== "run" || seenThreadIds.has(forkedFrom.threadId)) {
-          return withLocalVisibleTurnItems(projection);
+          return finish(withLocalVisibleTurnItems(projection));
         }
 
         // A row-limited segment without turn anchors must finish paging locally
@@ -3249,7 +3315,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
           projection.turnItems.length >= localWindow.rowLimit &&
           !projection.turnItems.some(isThreadHistoryUserTurn)
         ) {
-          return withLocalVisibleTurnItems(projection);
+          return finish(withLocalVisibleTurnItems(projection));
         }
 
         const sourceWindow =
@@ -3339,17 +3405,20 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 };
               });
 
-        const sourceProjection = yield* readProjection(
+        const source = yield* readProjection(
           forkedFrom.threadId,
           new Set([...seenThreadIds, threadId]),
           sourceWindow,
         );
         return {
-          ...projection,
-          visibleTurnItems: buildVisibleTurnItems({
-            projection,
-            sourceProjection,
-          }),
+          projection: {
+            ...projection,
+            visibleTurnItems: buildVisibleTurnItems({
+              projection,
+              sourceProjection: source.projection,
+            }),
+          },
+          olderHistoryExists: read.olderHistoryExists || source.olderHistoryExists,
         };
       }).pipe(
         Effect.mapError((cause) =>
@@ -3863,7 +3932,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       }).pipe(Effect.mapError((cause) => new ProjectionStoreReadError({ threadId, cause })));
 
     const getThreadProjection: ProjectionStoreV2Shape["getThreadProjection"] = (threadId) =>
-      readProjection(threadId, new Set());
+      readProjection(threadId, new Set()).pipe(Effect.map((read) => read.projection));
 
     const getRuntimeRecoveryProjection: ProjectionStoreV2Shape["getRuntimeRecoveryProjection"] = (
       threadId,
@@ -4637,10 +4706,10 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
     ) =>
       sql.withTransaction(readCanonicalProjection(threadId, undefined, fields, filter)).pipe(
         Effect.map(
-          (projection) =>
+          (read) =>
             Object.fromEntries([
-              ["thread", projection.thread],
-              ...fields.map((field) => [field, projection[field]]),
+              ["thread", read.projection.thread],
+              ...fields.map((field) => [field, read.projection[field]]),
             ]) as ProjectionRecords<(typeof fields)[number]>,
         ),
         Effect.mapError(controlReadError(threadId)),
@@ -4873,7 +4942,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                       `).map((row) => ThreadId.make(row.thread_id))[0] ??
                       threadId,
                   };
-            const projection = yield* readProjection(threadId, new Set(), {
+            const read = yield* readProjection(threadId, new Set(), {
               rowLimit: options.rowLimit,
               userTurnLimit: options.userTurnLimit,
               ...(historyAnchor?.threadId === threadId
@@ -4891,7 +4960,8 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
             return {
               schemaVersion: ORCHESTRATION_V2_PROJECTION_SCHEMA_VERSION,
               snapshotSequence: rows[0]?.snapshot_sequence ?? 0,
-              projection,
+              projection: read.projection,
+              olderHistoryExists: read.olderHistoryExists,
             };
           }),
         )
@@ -6295,16 +6365,22 @@ export const layerMemory: Layer.Layer<ProjectionStoreV2> = Layer.effect(
               (index) => index >= rawStart && isThreadHistoryUserTurn(candidates[index]!.item),
             );
             const anchorLimit = (options.userTurnLimit ?? 0) + 2;
+            // Match the SQL window. A full user-turn window or a raw-turn cap
+            // keeps that span. A shorter multi-turn remainder starts at its
+            // oldest user turn. One open turn, or none, keeps the rowLimit tail.
             const start =
-              anchors.length > 0
-                ? anchors.length < anchorLimit
+              anchors.length >= anchorLimit
+                ? anchors.at(-anchorLimit)!
+                : anchors.length > 0 && rawStart > 0
                   ? rawStart
-                  : anchors.at(-anchorLimit)!
-                : Math.max(0, anchorIndex - options.rowLimit);
+                  : anchors.length > 1
+                    ? anchors[0]!
+                    : Math.max(0, anchorIndex - options.rowLimit);
             const visibleTurnItems = candidates.slice(start);
             return {
               ...snapshot,
               projection: { ...snapshot.projection, visibleTurnItems },
+              olderHistoryExists: start > 0,
             };
           }),
         ),

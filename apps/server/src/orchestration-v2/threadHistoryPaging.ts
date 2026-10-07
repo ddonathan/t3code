@@ -231,6 +231,36 @@ function selectOlderTimelinePage(input: {
   };
 }
 
+/**
+ * The SQL window can omit rows older than the array it returned. A user turn
+ * inside that tail looks complete to the in-memory pager, which would then
+ * tell the client there is nothing left to load. Keep the pager's cursor when
+ * it already found another page. Otherwise point a cursor at the oldest
+ * returned row.
+ */
+export function revealOlderSqlHistory(input: {
+  readonly page: SelectTimelinePageResult;
+  readonly olderHistoryExists: boolean;
+  readonly snapshotSequence: number;
+}): Pick<SelectTimelinePageResult, "hasMoreHistory" | "nextCursor"> {
+  const oldest = input.page.items[0];
+  if (input.page.hasMoreHistory || !input.olderHistoryExists || oldest === undefined) {
+    return {
+      hasMoreHistory: input.page.hasMoreHistory,
+      nextCursor: input.page.nextCursor,
+    };
+  }
+  return {
+    hasMoreHistory: true,
+    nextCursor: encodeThreadHistoryCursor({
+      snapshotSequence: input.snapshotSequence,
+      sourceThreadId: oldest.sourceThreadId,
+      sourceItemId: oldest.sourceItemId,
+      position: oldest.position,
+    }),
+  };
+}
+
 export function selectRecentTimelineWindow(input: {
   readonly items: ReadonlyArray<OrchestrationV2ProjectedTurnItem>;
   readonly snapshotSequence: number;
@@ -419,6 +449,8 @@ export function buildBoundedThreadProjection(input: {
   readonly projection: OrchestrationV2ThreadProjection;
   readonly snapshotSequence: number;
   readonly policy?: ThreadHistoryPagePolicy | undefined;
+  /** SQL omitted eligible rows older than `projection`. */
+  readonly olderHistoryExists?: boolean | undefined;
 }): BoundedProjectionResult {
   const policy = input.policy ?? THREAD_HISTORY_PAGE_POLICY;
   const threadId = input.projection.thread.id;
@@ -466,6 +498,11 @@ export function buildBoundedThreadProjection(input: {
     snapshotSequence: input.snapshotSequence,
     policy: windowPolicy,
     rowEncodedBytes: (row) => projectedRowBoundedSnapshotEncodedBytes(row, threadId),
+  });
+  const revealed = revealOlderSqlHistory({
+    page: window,
+    olderHistoryExists: input.olderHistoryExists === true,
+    snapshotSequence: input.snapshotSequence,
   });
   const visibleTurnItems = renumberPositions(window.items);
   const windowTurnItems = localTurnItemsForVisibleWindow(controlProjection, visibleTurnItems);
@@ -522,8 +559,8 @@ export function buildBoundedThreadProjection(input: {
   };
   return {
     projection,
-    historyCursor: window.nextCursor,
-    hasMoreHistory: window.hasMoreHistory,
+    historyCursor: revealed.nextCursor,
+    hasMoreHistory: revealed.hasMoreHistory,
     // Always from the full projection so inherited-only windows still carry a
     // watermark for partial live reducers.
     latestLocalTurnOrdinal,

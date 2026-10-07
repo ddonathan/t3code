@@ -24,6 +24,7 @@ import {
   buildBoundedThreadProjection,
   decodeThreadHistoryCursor,
   InvalidThreadHistoryCursorError,
+  revealOlderSqlHistory,
   selectHistoryPageFromCursor,
   THREAD_HISTORY_SNAPSHOT_ROW_LIMIT,
   THREAD_HISTORY_PAGE_POLICY,
@@ -208,6 +209,7 @@ export const layer = HttpApiBuilder.group(
           const bounded = buildBoundedThreadProjection({
             projection: snapshot.projection,
             snapshotSequence: snapshot.snapshotSequence,
+            olderHistoryExists: snapshot.olderHistoryExists,
           });
           return {
             snapshotSequence: snapshot.snapshotSequence,
@@ -253,11 +255,16 @@ export const layer = HttpApiBuilder.group(
               pageOrError.cause,
             );
           }
+          const revealed = revealOlderSqlHistory({
+            page: pageOrError.page,
+            olderHistoryExists: snapshot.olderHistoryExists,
+            snapshotSequence: snapshot.snapshotSequence,
+          });
           return {
             snapshotSequence: snapshot.snapshotSequence,
             items: pageOrError.page.items,
-            nextCursor: pageOrError.page.nextCursor,
-            hasMoreHistory: pageOrError.page.hasMoreHistory,
+            nextCursor: revealed.nextCursor,
+            hasMoreHistory: revealed.hasMoreHistory,
           };
         }),
       );

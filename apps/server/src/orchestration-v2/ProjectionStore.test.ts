@@ -36,6 +36,7 @@ import * as ProjectionStore from "./ProjectionStore.ts";
 import {
   buildBoundedThreadProjection,
   decodeThreadHistoryCursor,
+  revealOlderSqlHistory,
   selectHistoryPageFromCursor,
   THREAD_HISTORY_PAGE_POLICY,
 } from "./threadHistoryPaging.ts";
@@ -633,6 +634,164 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
         assert.lengthOf(page.items, turns * 102);
         loaded.unshift(...page.items.map((row) => String(row.sourceItemId)));
         cursor = page.nextCursor;
+      }
+      assert.isNull(cursor);
+      assert.deepEqual(loaded, allIds);
+    }),
+  );
+
+  it.effect("caps one long user turn at the row window and still pages the omitted tail", () =>
+    Effect.gen(function* () {
+      const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
+      const sql = yield* SqlClient.SqlClient;
+      const now = yield* DateTime.now;
+      const nowIso = DateTime.formatIso(now);
+      const threadId = ThreadId.make("thread:long-user-turn");
+      yield* projectionStore.apply({
+        id: EventId.make("event:long-user-turn:thread"),
+        type: "thread.created",
+        threadId,
+        occurredAt: now,
+        payload: {
+          createdBy: "user",
+          creationSource: "web",
+          id: threadId,
+          projectId: ProjectId.make("project:long-user-turn"),
+          title: "One long turn",
+          providerInstanceId,
+          modelSelection,
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          branch: null,
+          worktreePath: null,
+          activeProviderThreadId: null,
+          lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: threadId },
+          forkedFrom: null,
+          createdAt: now,
+          updatedAt: now,
+          archivedAt: null,
+          settledOverride: null,
+          settledAt: null,
+          lastVisitedAt: null,
+          deletedAt: null,
+        },
+      });
+
+      const rowLimit = 77;
+      const userOrdinal = 181;
+      const lastOrdinal = 220;
+      const allIds = Array.from({ length: lastOrdinal }, (_, index) => {
+        const ordinal = index + 1;
+        return ordinal === userOrdinal
+          ? `item:long-user-turn:user`
+          : `item:long-user-turn:${ordinal}`;
+      });
+      const rows = allIds.map((id, index) => {
+        const ordinal = index + 1;
+        const item =
+          ordinal === userOrdinal
+            ? {
+                createdBy: "user",
+                creationSource: "web",
+                id,
+                threadId,
+                runId: null,
+                nodeId: null,
+                providerThreadId: null,
+                providerTurnId: null,
+                nativeItemRef: null,
+                parentItemId: null,
+                ordinal,
+                status: "completed",
+                title: "Continue",
+                startedAt: nowIso,
+                completedAt: nowIso,
+                updatedAt: nowIso,
+                type: "user_message",
+                messageId: "message:long-user-turn",
+                inputIntent: "turn_start",
+                text: "Continue",
+                attachments: [],
+              }
+            : {
+                id,
+                threadId,
+                runId: null,
+                nodeId: null,
+                providerThreadId: null,
+                providerTurnId: null,
+                nativeItemRef: null,
+                parentItemId: null,
+                ordinal,
+                status: "completed",
+                title: `command ${ordinal}`,
+                startedAt: nowIso,
+                completedAt: nowIso,
+                updatedAt: nowIso,
+                type: "command_execution",
+                input: "command",
+                output: "x".repeat(2048),
+                exitCode: 0,
+              };
+        return {
+          turn_item_id: id,
+          thread_id: threadId,
+          run_id: null,
+          node_id: null,
+          provider_thread_id: null,
+          provider_turn_id: null,
+          parent_item_id: null,
+          ordinal,
+          type: item.type,
+          status: "completed",
+          updated_at: nowIso,
+          payload_json: encodeUnknownJsonString(item),
+        };
+      });
+      yield* sql`INSERT INTO orchestration_v2_projection_turn_items ${sql.insert(rows)}`;
+
+      const initial = yield* projectionStore.getThreadSnapshotWindow(threadId, {
+        rowLimit,
+        userTurnLimit: 10,
+      });
+      assert.isTrue(initial.olderHistoryExists);
+      assert.lengthOf(initial.projection.turnItems, rowLimit);
+      assert.isTrue(
+        initial.projection.turnItems.some((item) => item.id === "item:long-user-turn:user"),
+      );
+      assert.isFalse(initial.projection.turnItems.some((item) => item.ordinal === 1));
+
+      const bounded = buildBoundedThreadProjection({
+        projection: initial.projection,
+        snapshotSequence: initial.snapshotSequence,
+        olderHistoryExists: initial.olderHistoryExists,
+      });
+      assert.isTrue(bounded.hasMoreHistory);
+      assert.isNotNull(bounded.historyCursor);
+      const loaded = bounded.projection.visibleTurnItems.map((row) => String(row.sourceItemId));
+      let cursor: string | null = bounded.historyCursor;
+      let pages = 1;
+      while (cursor !== null) {
+        const anchor = decodeThreadHistoryCursor(cursor);
+        const snapshot = yield* projectionStore.getThreadSnapshotWindow(threadId, {
+          rowLimit,
+          userTurnLimit: 20,
+          anchorItemId: TurnItemId.make(anchor.si),
+        });
+        const page = selectHistoryPageFromCursor({
+          items: snapshot.projection.visibleTurnItems,
+          cursor,
+          snapshotSequence: snapshot.snapshotSequence,
+        });
+        const revealed = revealOlderSqlHistory({
+          page,
+          olderHistoryExists: snapshot.olderHistoryExists,
+          snapshotSequence: snapshot.snapshotSequence,
+        });
+        loaded.unshift(...page.items.map((row) => String(row.sourceItemId)));
+        cursor = revealed.nextCursor;
+        pages += 1;
+        if (pages > 20) break;
       }
       assert.isNull(cursor);
       assert.deepEqual(loaded, allIds);
@@ -4262,11 +4421,13 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
       const nestedTurnPage = buildBoundedThreadProjection({
         projection: nestedTurnWindow.projection,
         snapshotSequence: 1,
+        olderHistoryExists: nestedTurnWindow.olderHistoryExists,
       });
       const turnPagedIds = nestedTurnPage.projection.visibleTurnItems.map((row) =>
         String(row.sourceItemId),
       );
       let turnCursor = nestedTurnPage.historyCursor;
+      let turnPages = 1;
       while (turnCursor !== null) {
         const anchor = decodeThreadHistoryCursor(turnCursor);
         const snapshot = yield* projectionStore.getThreadSnapshotWindow(nestedThreadId, {
@@ -4280,9 +4441,17 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
           cursor: turnCursor,
           snapshotSequence: 1,
         });
+        const revealed = revealOlderSqlHistory({
+          page,
+          olderHistoryExists: snapshot.olderHistoryExists,
+          snapshotSequence: 1,
+        });
         turnPagedIds.unshift(...page.items.map((row) => String(row.sourceItemId)));
-        turnCursor = page.nextCursor;
+        turnCursor = revealed.nextCursor;
+        turnPages += 1;
+        if (turnPages > 40) break;
       }
+      assert.isNull(turnCursor);
       assert.deepEqual(turnPagedIds, expectedNestedIds);
       const fullNested = yield* projectionStore.getThreadProjection(nestedThreadId);
       const nestedForward = yield* projectionStore.getTimelinePage(nestedThreadId, {

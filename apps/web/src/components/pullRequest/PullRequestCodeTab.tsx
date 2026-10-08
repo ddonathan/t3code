@@ -37,6 +37,7 @@ import { orderDiffFiles } from "./pullRequestFileOrder.logic";
 import {
   buildFileDiffRenderKey,
   fnv1a32,
+  getDiffLineStat,
   getRenderablePatch,
   resolveDiffThemeName,
   resolveFileDiffPath,
@@ -596,6 +597,23 @@ function PullRequestCodeTab({
       ),
     [loadedSlices],
   );
+  const sourceFileStats = useMemo(
+    () =>
+      new Map(
+        parsedSlices.flatMap((parsed) =>
+          parsed?.kind === "files"
+            ? parsed.files.map(
+                (file, index) =>
+                  [
+                    buildFileDiffRenderKey(file),
+                    getDiffLineStat([parsed.sourceFiles[index] ?? file]),
+                  ] as const,
+              )
+            : [],
+        ),
+      ),
+    [parsedSlices],
+  );
   const fileKeys = useMemo(() => items.map((item) => item.id), [items]);
   const collapsedFileKeys = useMemo(
     () => new Set(items.filter((item) => item.collapsed === true).map((item) => item.id)),
@@ -811,12 +829,8 @@ function PullRequestCodeTab({
   const renderHeaderMetadata = useCallback(
     (item: CodeViewItem<ReviewAnnotationGroup>) => {
       if (item.type !== "diff") return null;
-      let additions = 0;
-      let deletions = 0;
-      for (const hunk of item.fileDiff.hunks) {
-        additions += hunk.additionLines;
-        deletions += hunk.deletionLines;
-      }
+      let { additions, deletions } =
+        sourceFileStats.get(item.id) ?? getDiffLineStat([item.fileDiff]);
       const path = resolveFileDiffPath(item.fileDiff);
       if (additions === 0 && deletions === 0) {
         const withheld = omittedFileStats.get(path);
@@ -858,13 +872,13 @@ function PullRequestCodeTab({
                 </TooltipPopup>
               </Tooltip>
             ) : (
-              "Viewed"
+              <span className="@max-xs:hidden">Viewed</span>
             )}
           </label>
         </span>
       );
     },
-    [omittedFileStats],
+    [omittedFileStats, sourceFileStats],
   );
 
   const diffViewOptions = useMemo(
@@ -1503,7 +1517,7 @@ function PullRequestCodeTab({
             // diff crosses the overflow boundary. The viewer is itself focusable for keyboard
             // interaction, but its native host outline clips and competes with the focus
             // indicators on its actual controls.
-            className="h-full overflow-auto [scrollbar-gutter:stable]"
+            className="@container h-full overflow-auto [scrollbar-gutter:stable]"
             viewerRef={setViewer}
             items={items}
             selectedLines={selectedLines}

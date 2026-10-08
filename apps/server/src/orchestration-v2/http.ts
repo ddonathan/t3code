@@ -33,6 +33,7 @@ import {
 import * as ThreadManagementService from "./ThreadManagementService.ts";
 import * as ProjectStore from "./ProjectStore.ts";
 import { buildActiveShellSnapshot } from "./ShellStream.ts";
+import { boundedSnapshotResponseFields } from "./ThreadStream.ts";
 import { projectThreadProjectionForWire } from "./WireProjection.ts";
 
 function isThreadNotFound(error: unknown): boolean {
@@ -214,11 +215,10 @@ export const layer = HttpApiBuilder.group(
           });
           return {
             snapshotSequence: snapshot.snapshotSequence,
-            projection: bounded.projection,
-            historyCursor: bounded.historyCursor,
-            hasMoreHistory: bounded.hasMoreHistory,
-            latestLocalTurnOrdinal: bounded.latestLocalTurnOrdinal,
-            payloadBudgetExceeded: bounded.payloadBudgetExceeded,
+            ...boundedSnapshotResponseFields({
+              bounded,
+              compactTurnItems: args.query.compactTurnItems === "1",
+            }),
           };
         }),
       )

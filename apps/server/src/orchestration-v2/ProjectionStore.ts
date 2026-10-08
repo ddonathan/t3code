@@ -2798,6 +2798,9 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                   END AS ordinal
                   FROM user_anchors
                 ), selected AS (
+                  -- Choose and sort rows by ID, then fetch payloads in that
+                  -- order. A turn window can hold megabytes of tool output, and
+                  -- carrying it through the union and sort cost about a second.
                   SELECT ordinal, turn_item_id, run_id, type
                   FROM eligible
                   WHERE ordinal >= (SELECT ordinal FROM boundary)
@@ -2826,16 +2829,10 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                     ) THEN 1
                     ELSE 0
                   END AS value
-                ), retained AS (
-                  SELECT item.payload_json AS payload_json,
-                    selected.ordinal AS ordinal,
-                    selected.turn_item_id AS turn_item_id
-                  FROM selected
-                  INNER JOIN orchestration_v2_projection_turn_items AS item
-                    ON item.thread_id = ${threadId}
-                   AND item.turn_item_id = selected.turn_item_id
+                ), retained AS MATERIALIZED (
+                  SELECT ordinal, turn_item_id FROM selected
                   UNION
-                  SELECT request.payload_json, request.ordinal, request.turn_item_id
+                  SELECT request.ordinal, request.turn_item_id
                   FROM orchestration_v2_projection_turn_items AS request
                   WHERE request.run_id IN (
                       SELECT run_id FROM selected
@@ -2843,9 +2840,9 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                     )
                     AND request.type = 'run_interrupt_request'
                   UNION
-                  SELECT latest.payload_json, latest.ordinal, latest.turn_item_id
+                  SELECT latest.ordinal, latest.turn_item_id
                   FROM (
-                    SELECT payload_json, ordinal, turn_item_id
+                    SELECT ordinal, turn_item_id
                     FROM orchestration_v2_projection_turn_items
                     WHERE thread_id = ${threadId}
                       AND ${window.anchorItemId ?? null} IS NULL
@@ -2853,11 +2850,16 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                     ORDER BY ordinal DESC, turn_item_id DESC
                     LIMIT 1
                   ) AS latest
+                  ORDER BY ordinal ASC, turn_item_id ASC
                 )
-                SELECT retained.payload_json AS payload_json,
-                  older_history.value AS older_history
+                -- CROSS JOIN keeps the sorted IDs as the outer loop, so SQLite
+                -- skips sorting again once the payloads are attached. The
+                -- older-history flag is a scalar, so it does not reorder that join.
+                SELECT item.payload_json AS payload_json,
+                  (SELECT value FROM older_history) AS older_history
                 FROM retained
-                CROSS JOIN older_history
+                CROSS JOIN orchestration_v2_projection_turn_items AS item
+                  ON item.turn_item_id = retained.turn_item_id
                 ORDER BY retained.ordinal ASC, retained.turn_item_id ASC
               `;
         const firstBoundedRow = boundedTurnItemRows[0];

@@ -28,6 +28,12 @@ import { ThreadTitleRegeneration } from "./threadTitle.ts";
 import {
   OrchestrationV2Actor,
   OrchestrationV2CreationSource,
+  OrchestrationV2ProviderGoal,
+  OrchestrationV2WorkContinuity,
+  OrchestrationV2WorkContinuityMaxChecks,
+  OrchestrationV2WorkContinuityReason,
+  OrchestrationV2WorkContinuityReportStatus,
+  OrchestrationV2WorkContinuityWait,
   OrchestrationV2RunStatus,
   OrchestrationV2TurnItemStatus,
 } from "./orchestrationV2.ts";
@@ -308,6 +314,11 @@ export const OrchestratorMcpThreadListItem = Schema.Struct({
   createdBy: OrchestrationV2Actor,
   creationSource: OrchestrationV2CreationSource,
   status: OrchestratorMcpThreadStatus,
+  /** Provider-reported objective state, separate from run status; absent on older servers. */
+  goal: Schema.optional(Schema.NullOr(OrchestrationV2ProviderGoal)),
+  continuity: Schema.optional(Schema.NullOr(OrchestrationV2WorkContinuity)),
+  /** Read the thread for full goal text when a list summary was clipped. */
+  goalTextTruncated: Schema.optional(Schema.Boolean),
   latestRunId: Schema.NullOr(RunId),
   providerInstanceId: ProviderInstanceId,
   model: Schema.String,
@@ -356,6 +367,9 @@ export const OrchestratorMcpThreadDetail = Schema.Struct({
   createdBy: OrchestrationV2Actor,
   creationSource: OrchestrationV2CreationSource,
   status: OrchestratorMcpThreadStatus,
+  /** Provider-reported objective state, separate from run status; absent on older servers. */
+  goal: Schema.optional(Schema.NullOr(OrchestrationV2ProviderGoal)),
+  continuity: Schema.optional(Schema.NullOr(OrchestrationV2WorkContinuity)),
   latestRunId: Schema.NullOr(RunId),
   activeRunId: Schema.NullOr(RunId),
   providerInstanceId: ProviderInstanceId,
@@ -671,3 +685,44 @@ export class OrchestratorMcpFailure extends Schema.TaggedError<OrchestratorMcpFa
     message: Schema.String,
   },
 ) {}
+
+const OrchestratorMcpWorkContinuityAction = Schema.Union([
+  Schema.Struct({
+    action: Schema.Literal("enable"),
+    threadId: Schema.optional(ThreadId),
+    authorityMessageId: MessageId,
+    maxChecks: Schema.optional(OrchestrationV2WorkContinuityMaxChecks),
+    clientRequestId: Schema.optional(OrchestratorMcpClientRequestId),
+  }),
+  Schema.Struct({
+    action: Schema.Literal("disable"),
+    threadId: Schema.optional(ThreadId),
+    clientRequestId: Schema.optional(OrchestratorMcpClientRequestId),
+  }),
+  Schema.Struct({
+    action: Schema.Literal("report"),
+    threadId: Schema.optional(ThreadId),
+    runId: RunId,
+    status: OrchestrationV2WorkContinuityReportStatus,
+    reason: OrchestrationV2WorkContinuityReason,
+    wait: Schema.optional(Schema.NullOr(OrchestrationV2WorkContinuityWait)),
+    clientRequestId: Schema.optional(OrchestratorMcpClientRequestId),
+  }),
+]);
+export const OrchestratorMcpWorkContinuityInput = Schema.Struct({
+  action: Schema.Literals(["enable", "disable", "report"]),
+  threadId: Schema.optional(ThreadId),
+  authorityMessageId: Schema.optional(MessageId),
+  maxChecks: Schema.optional(OrchestrationV2WorkContinuityMaxChecks),
+  runId: Schema.optional(RunId),
+  status: Schema.optional(OrchestrationV2WorkContinuityReportStatus),
+  reason: Schema.optional(OrchestrationV2WorkContinuityReason),
+  wait: Schema.optional(Schema.NullOr(OrchestrationV2WorkContinuityWait)),
+  clientRequestId: Schema.optional(OrchestratorMcpClientRequestId),
+}).pipe(Schema.decodeTo(OrchestratorMcpWorkContinuityAction));
+export type OrchestratorMcpWorkContinuityInput = typeof OrchestratorMcpWorkContinuityInput.Type;
+export const OrchestratorMcpWorkContinuityResult = Schema.Struct({
+  threadId: ThreadId,
+  continuity: Schema.NullOr(OrchestrationV2WorkContinuity),
+});
+export type OrchestratorMcpWorkContinuityResult = typeof OrchestratorMcpWorkContinuityResult.Type;

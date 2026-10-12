@@ -1,4 +1,5 @@
 import { scopeProjectRef } from "@t3tools/client-runtime/environment";
+import { randomUUID } from "../lib/utils";
 import { requestCustomSnooze } from "../components/CustomSnoozeDialog";
 import {
   type AtomCommandResult,
@@ -9,6 +10,7 @@ import {
 import { canSnooze, effectiveSnoozed } from "@t3tools/client-runtime/state/thread-settled";
 import {
   AuthOrchestrationOperateScope,
+  CommandId,
   type ScopedThreadRef,
   type ThreadId,
 } from "@t3tools/contracts";
@@ -22,7 +24,8 @@ import {
   type ThreadActionMenuId,
 } from "../components/threadActionMenu.logic";
 import { stackedThreadToast, toastManager } from "../components/ui/toast";
-import { threadEnvironment } from "../state/threads";
+import { threadEnvironment, environmentThreadDetails } from "../state/threads";
+import { appAtomRegistry } from "../rpc/atomRegistry";
 import { useOrchestrationCommand } from "../state/use-orchestration-command";
 import { readEnvironmentScope } from "../state/session";
 import {
@@ -100,6 +103,9 @@ export function useThreadActionMenu(input: {
     deleteThread,
     markThreadUnread,
   } = useThreadActions();
+  const setWorkContinuity = useOrchestrationCommand(threadEnvironment.setWorkContinuity, {
+    reportFailure: false,
+  });
   const updateThreadMetadata = useOrchestrationCommand(threadEnvironment.updateMetadata, {
     reportFailure: false,
   });
@@ -137,6 +143,18 @@ export function useThreadActionMenu(input: {
         // what the user is looking at.
         const thread = readThreadShell(threadRef);
         if (!thread) return;
+        const latestAuthority = appAtomRegistry
+          .get(environmentThreadDetails.threadAtom(threadRef))
+          ?.projection.messages.findLast(
+            (message) =>
+              message.role === "user" &&
+              message.createdBy === "user" &&
+              (message.creationSource === "web" || message.creationSource === "mobile") &&
+              message.scheduledTaskId === undefined &&
+              message.senderThreadId === undefined &&
+              message.notification === undefined &&
+              message.threadId === threadRef.threadId,
+          );
         const now = new Date();
         const supports = {
           settlement: readEnvironmentSupportsSettlement(threadRef.environmentId),
@@ -148,6 +166,26 @@ export function useThreadActionMenu(input: {
         const isRegeneratingTitle = thread.titleRegeneration != null;
         const snoozePresets = resolveSnoozePresets(now, timestampFormat);
         const items = buildThreadActionMenuItems({
+          ...(thread.continuity === undefined
+            ? {}
+            : {
+                continuityControl: {
+                  canEnable:
+                    latestAuthority !== undefined &&
+                    appAtomRegistry.get(
+                      threadEnvironment.setWorkContinuity.permissionAtom(threadRef.environmentId, {
+                        type: "thread.continuity.set",
+                      }),
+                    ),
+                  state: thread.continuity ?? null,
+                  canDisable: appAtomRegistry.get(
+                    threadEnvironment.setWorkContinuity.permissionAtom(threadRef.environmentId, {
+                      type: "thread.continuity.set",
+                    }),
+                  ),
+                  autoEnrollDisabled: thread.continuityAutoEnrollDisabled === true,
+                },
+              }),
           canOperate: readEnvironmentScope(threadRef.environmentId, AuthOrchestrationOperateScope),
           branch: thread.branch ?? null,
           projectFilter: null,
@@ -244,6 +282,24 @@ export function useThreadActionMenu(input: {
             await reportFailure("Failed to unpin thread", () => confirmAndUnpinThread(threadRef));
             return;
           }
+          case "continuity:enable":
+          case "continuity:disable":
+            if (action === "continuity:enable" && latestAuthority === undefined) return;
+            await reportFailure("Failed to update work continuity", () =>
+              setWorkContinuity({
+                environmentId: threadRef.environmentId,
+                input: {
+                  type: "thread.continuity.set",
+                  commandId: CommandId.make(randomUUID()),
+                  threadId: threadRef.threadId,
+                  enabled: action === "continuity:enable",
+                  ...(action === "continuity:enable" && latestAuthority !== undefined
+                    ? { authorityMessageId: latestAuthority.id }
+                    : {}),
+                },
+              }),
+            );
+            return;
           case "auto-settle:enabled":
           case "auto-settle:disabled":
             await reportFailure("Failed to update auto-settle", () =>
@@ -359,6 +415,7 @@ export function useThreadActionMenu(input: {
       projects,
       router,
       setThreadAutoSettle,
+      setWorkContinuity,
       settleThread,
       snoozeThread,
       threadRef,

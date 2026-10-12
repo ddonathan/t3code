@@ -71,6 +71,25 @@ it("stamps authoritative provenance on commands that create threads or messages"
   });
 });
 
+it.each([undefined, "mcp"] as const)(
+  "client intake stamps continuity control provenance over legacy or supplied %s origin",
+  (creationSource) => {
+    const command: OrchestrationV2Command = {
+      type: "thread.continuity.set",
+      commandId: CommandId.make("continuity-provenance"),
+      threadId: ThreadId.make("continuity-provenance"),
+      enabled: false,
+      ...(creationSource === undefined ? {} : { creationSource }),
+    };
+    expect(
+      ThreadManagementService.withCreationProvenance(command, {
+        createdBy: "user",
+        creationSource: "mobile",
+      }),
+    ).toMatchObject({ creationSource: "mobile" });
+  },
+);
+
 it("leaves commands that do not create durable authored content unchanged", () => {
   const command: OrchestrationV2Command = {
     type: "run.interrupt",

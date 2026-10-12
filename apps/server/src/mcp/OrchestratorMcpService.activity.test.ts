@@ -1,8 +1,15 @@
 import {
   EnvironmentId,
+  CommandId,
+  MessageId,
+  type OrchestrationV2WorkContinuity,
   NodeId,
   type OrchestrationV2ThreadProjection,
   type OrchestrationV2ThreadShell,
+  type OrchestrationV2ProviderGoal,
+  OrchestratorMcpThreadListResult,
+  OrchestratorMcpWorkContinuityInput,
+  OrchestratorMcpThreadReadResult,
   ProjectId,
   ProviderDriverKind,
   ProviderInstanceId,
@@ -10,9 +17,12 @@ import {
   ScheduledTaskId,
   ThreadId,
 } from "@t3tools/contracts";
+import { McpServer } from "effect/ai";
+import * as McpHttpServer from "./McpHttpServer.ts";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Schema from "effect/Schema";
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import { expect, it } from "vite-plus/test";
 
@@ -25,6 +35,7 @@ import * as SecretRequests from "../secrets/SecretRequests.ts";
 import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
 import type * as McpInvocationContext from "./McpInvocationContext.ts";
 import * as OrchestratorMcpService from "./OrchestratorMcpService.ts";
+import { idleThreadProjection, liveThreadShell } from "./McpToolAccess.testkit.ts";
 
 const environmentId = EnvironmentId.make("environment-mcp-orchestrator-detail");
 const projectId = ProjectId.make("project-mcp-orchestrator-detail");
@@ -39,6 +50,10 @@ const codexDriver = ProviderDriverKind.make("codex");
 // Distinct from driver kind so a regression that re-derives from driver fails.
 const customCodexInstanceId = ProviderInstanceId.make("codex-custom-workspace");
 const parentInstanceId = ProviderInstanceId.make("codex");
+const encodeThreadRead = Schema.encodeEffect(OrchestratorMcpThreadReadResult);
+const encodeThreadList = Schema.encodeEffect(OrchestratorMcpThreadListResult);
+const decodeContinuityInput = Schema.decodeUnknownEffect(OrchestratorMcpWorkContinuityInput);
+const decodeThreadRead = Schema.decodeEffect(OrchestratorMcpThreadReadResult);
 
 const makeScope = (): McpInvocationContext.McpInvocationScope => ({
   environmentId,
@@ -106,6 +121,316 @@ function makeRun(input: {
     completedAt: input.status === "cancelled" || input.status === "completed" ? now : null,
   };
 }
+
+it("the actual orchestrator MCP toolkit registers continuity with an object wire schema", async () => {
+  const layer = McpHttpServer.layerOrchestratorToolkit.pipe(
+    Layer.provideMerge(McpServer.McpServer.layer),
+    Layer.provide(
+      Layer.mergeAll(
+        Layer.mock(ThreadManagementService.ThreadManagementService)({}),
+        ServerSettings.layerTest(),
+        Layer.mock(ProviderRegistry.ProviderRegistry)({}),
+        Layer.mock(ProjectService.ProjectService)({}),
+        Layer.mock(SecretRequests.SecretRequests)({}),
+        Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
+        Layer.mock(ProviderAdapterRegistry.ProviderAdapterRegistryV2)({}),
+        NodeCrypto.layer,
+      ),
+    ),
+  );
+  await Effect.gen(function* () {
+    const server = yield* McpServer.McpServer;
+    const continuity = server.tools.find(({ tool }) => tool.name === "t3_work_continuity");
+    expect(continuity?.tool.inputSchema.type).toBe("object");
+  }).pipe(Effect.provide(layer), Effect.scoped, Effect.runPromise);
+});
+
+it("the continuity object codec still rejects missing action authority and malformed reports", async () => {
+  await Effect.gen(function* () {
+    for (const input of [
+      { action: "enable" },
+      { action: "report", status: "complete", reason: "Done" },
+      { action: "report", runId: activeRunId, status: "complete", reason: "   " },
+    ]) {
+      const refused = yield* decodeContinuityInput(input).pipe(Effect.flip);
+      expect(refused._tag).toBe("SchemaError");
+    }
+    const enable = yield* decodeContinuityInput({
+      action: "enable",
+      authorityMessageId: "authority-message",
+    });
+    expect(enable).toEqual({ action: "enable", authorityMessageId: "authority-message" });
+    const report = yield* decodeContinuityInput({
+      action: "report",
+      runId: activeRunId,
+      status: "complete",
+      reason: " Done ",
+    });
+    expect(report).toEqual({
+      action: "report",
+      runId: activeRunId,
+      status: "complete",
+      reason: "Done",
+    });
+  }).pipe(Effect.runPromise);
+});
+
+it("continuity mutations cannot target a different thread and read/list preserve the durable disposition", async () => {
+  const continuity: OrchestrationV2WorkContinuity = {
+    generation: CommandId.make("continuity-generation"),
+    authorityMessageId: MessageId.make("authority-message"),
+    maxChecks: 3,
+    checksRemaining: 2,
+    status: "waiting",
+    reason: "Waiting for the delegated task",
+    lastReportedRunId: activeRunId,
+    lastAdvancedRunId: null,
+    wait: { kind: "delegated_task", taskId },
+  };
+  const shell = { ...liveThreadShell(parentThreadId, { activeRunId: null }), continuity };
+  const layer = OrchestratorMcpService.layer.pipe(
+    Layer.provide(
+      Layer.mergeAll(
+        Layer.mock(ThreadManagementService.ThreadManagementService)({
+          getTimelinePage: () => Effect.succeed({ items: [], totalItems: 0, hasMore: false }),
+          getThreadRecords: () => Effect.succeed(idleThreadProjection(shell)),
+          getThreadShell: () => Effect.succeed(shell),
+          getProjectThreadRecords: () => Effect.succeed(idleThreadProjection(shell)),
+          listProjectThreads: () => Effect.succeed([shell]),
+          dispatch: () => Effect.die("A foreign continuity mutation must not reach dispatch"),
+        }),
+        ServerSettings.layerTest(),
+        Layer.mock(ProviderRegistry.ProviderRegistry)({ getProviders: Effect.succeed([]) }),
+        Layer.mock(ProjectService.ProjectService)({}),
+        Layer.mock(SecretRequests.SecretRequests)({}),
+        Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
+        Layer.mock(ProviderAdapterRegistry.ProviderAdapterRegistryV2)({
+          list: () => Effect.succeed([]),
+        }),
+        NodeCrypto.layer,
+      ),
+    ),
+  );
+  await Effect.gen(function* () {
+    const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+    const refused = yield* service
+      .workContinuity(makeScope(), {
+        action: "report",
+        threadId: childThreadId,
+        runId: activeRunId,
+        status: "complete",
+        reason: "Done",
+      })
+      .pipe(Effect.flip);
+    expect(refused.code).toBe("invalid_request");
+    for (const input of [
+      {
+        action: "enable" as const,
+        threadId: childThreadId,
+        authorityMessageId: MessageId.make("foreign-authority"),
+      },
+      { action: "disable" as const, threadId: childThreadId },
+    ]) {
+      const foreign = yield* service.workContinuity(makeScope(), input).pipe(Effect.flip);
+      expect(foreign.code).toBe("invalid_request");
+    }
+    const read = yield* service.readThread(makeScope(), { threadId: parentThreadId });
+    const listed = yield* service.listThreads(makeScope(), {});
+    expect((yield* encodeThreadRead(read)).thread.continuity).toEqual(continuity);
+    expect((yield* encodeThreadList(listed)).threads[0]?.continuity).toEqual(continuity);
+  }).pipe(Effect.provide(layer), Effect.runPromise);
+});
+
+it("MCP re-enrollment for the same authority cannot refill exhausted checks or reopen blocked work", async () => {
+  const continuity: OrchestrationV2WorkContinuity = {
+    generation: CommandId.make("exhausted-continuity-generation"),
+    authorityMessageId: MessageId.make("authority-message"),
+    maxChecks: 3,
+    checksRemaining: 0,
+    status: "blocked",
+    reason: "Continuation checks are exhausted",
+    lastReportedRunId: activeRunId,
+    lastAdvancedRunId: activeRunId,
+    wait: null,
+  };
+  const shell = { ...liveThreadShell(parentThreadId, { activeRunId: null }), continuity };
+  const layer = OrchestratorMcpService.layer.pipe(
+    Layer.provide(
+      Layer.mergeAll(
+        Layer.mock(ThreadManagementService.ThreadManagementService)({
+          getThreadRecords: () => Effect.succeed(idleThreadProjection(shell)),
+          dispatch: () => Effect.die("Same-authority MCP enrollment must not dispatch a reset"),
+        }),
+        ServerSettings.layerTest(),
+        Layer.mock(ProviderRegistry.ProviderRegistry)({ getProviders: Effect.succeed([]) }),
+        Layer.mock(ProjectService.ProjectService)({}),
+        Layer.mock(SecretRequests.SecretRequests)({}),
+        Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
+        Layer.mock(ProviderAdapterRegistry.ProviderAdapterRegistryV2)({
+          list: () => Effect.succeed([]),
+        }),
+        NodeCrypto.layer,
+      ),
+    ),
+  );
+  await Effect.gen(function* () {
+    const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+    const result = yield* service.workContinuity(makeScope(), {
+      action: "enable",
+      authorityMessageId: continuity.authorityMessageId,
+      maxChecks: 20,
+      clientRequestId: "new-idempotency-key-cannot-reset-budget",
+    });
+    expect(result.threadId).toBe(parentThreadId);
+    expect(result.continuity).toEqual(continuity);
+    expect(result.continuity?.checksRemaining).toBe(0);
+    expect(result.continuity?.status).toBe("blocked");
+    expect(result.continuity?.generation).toBe(continuity.generation);
+  }).pipe(Effect.provide(layer), Effect.runPromise);
+});
+
+it.each(["enable", "disable"] as const)(
+  "MCP %s cannot change the human opt-out and uses authoritative agent provenance",
+  async (action) => {
+    const shell = {
+      ...liveThreadShell(parentThreadId, { activeRunId: null }),
+      continuity: null,
+      continuityAutoEnrollDisabled: true,
+    };
+    let dispatched = 0;
+    const layer = OrchestratorMcpService.layer.pipe(
+      Layer.provide(
+        Layer.mergeAll(
+          Layer.mock(ThreadManagementService.ThreadManagementService)({
+            getThreadRecords: () => Effect.succeed(idleThreadProjection(shell)),
+            dispatch: (command) =>
+              Effect.sync(() => {
+                dispatched += 1;
+                expect(command).toMatchObject({
+                  type: "thread.continuity.set",
+                  creationSource: "mcp",
+                  enabled: false,
+                });
+                return { sequence: 0, storedEvents: [] };
+              }),
+          }),
+          ServerSettings.layerTest(),
+          Layer.mock(ProviderRegistry.ProviderRegistry)({ getProviders: Effect.succeed([]) }),
+          Layer.mock(ProjectService.ProjectService)({}),
+          Layer.mock(SecretRequests.SecretRequests)({}),
+          Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
+          Layer.mock(ProviderAdapterRegistry.ProviderAdapterRegistryV2)({
+            list: () => Effect.succeed([]),
+          }),
+          NodeCrypto.layer,
+        ),
+      ),
+    );
+    await Effect.gen(function* () {
+      const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+      if (action === "enable") {
+        const refused = yield* service
+          .workContinuity(makeScope(), {
+            action: "enable",
+            authorityMessageId: MessageId.make("real-authority"),
+            clientRequestId: "optout-enable",
+          })
+          .pipe(Effect.flip);
+        expect(refused.code).toBe("invalid_request");
+        expect(dispatched).toBe(0);
+      } else {
+        yield* service.workContinuity(makeScope(), {
+          action: "disable",
+          clientRequestId: "optout-disable",
+        });
+        expect(dispatched).toBe(1);
+      }
+      expect(shell.continuityAutoEnrollDisabled).toBe(true);
+    }).pipe(Effect.provide(layer), Effect.runPromise);
+  },
+);
+
+it.each(["active", "paused", "blocked", "usage_limited", "budget_limited", "complete"] as const)(
+  "thread tools preserve a %s native goal independently of execution and clear it on the next read",
+  async (status) => {
+    const oversized = status === "blocked";
+    let goal: OrchestrationV2ProviderGoal | null = {
+      objective: oversized
+        ? "Complete the assigned work. ".repeat(1_000).trim()
+        : "Convert all eligible workers and verify their cutover",
+      status,
+      tokensUsed: 123,
+      tokenBudget: 1000,
+      checks: 2,
+      lastCheck: oversized
+        ? "The dependency remains unavailable. ".repeat(1_000)
+        : "Availability remains unfinished",
+    };
+    const shell = (): OrchestrationV2ThreadShell => ({
+      ...liveThreadShell(parentThreadId, { activeRunId: null }),
+      status: "idle",
+      goal,
+    });
+    const layer = OrchestratorMcpService.layer.pipe(
+      Layer.provide(
+        Layer.mergeAll(
+          Layer.mock(ThreadManagementService.ThreadManagementService)({
+            getTimelinePage: () => Effect.succeed({ items: [], totalItems: 0, hasMore: false }),
+            getThreadRecords: () => Effect.succeed(idleThreadProjection(shell())),
+            getThreadShell: () => Effect.succeed(shell()),
+            getProjectThreadRecords: () => Effect.succeed(idleThreadProjection(shell())),
+            listProjectThreads: () => Effect.succeed([shell()]),
+          }),
+          ServerSettings.layerTest(),
+          Layer.mock(ProviderRegistry.ProviderRegistry)({ getProviders: Effect.succeed([]) }),
+          Layer.mock(ProjectService.ProjectService)({}),
+          Layer.mock(SecretRequests.SecretRequests)({}),
+          Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
+          Layer.mock(ProviderAdapterRegistry.ProviderAdapterRegistryV2)({
+            list: () => Effect.succeed([]),
+          }),
+          NodeCrypto.layer,
+        ),
+      ),
+    );
+    await Effect.gen(function* () {
+      const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+      const read = yield* service.readThread(makeScope(), { threadId: parentThreadId });
+      const listed = yield* service.listThreads(makeScope(), {});
+      // Exercise the tool's wire schema too: an unrecognized field would be lost on encoding.
+      const readWire = yield* encodeThreadRead(read);
+      const listWire = yield* encodeThreadList(listed);
+      expect(readWire.thread.goal).toEqual(goal);
+      const listedThread = listWire.threads[0]!;
+      expect(listedThread.goal?.status).toBe(status);
+      expect(listedThread.goalTextTruncated).toBe(oversized);
+      if (oversized) {
+        expect(listedThread.goal!.objective.length).toBeLessThanOrEqual(1_000);
+        expect(listedThread.goal!.lastCheck!.length).toBeLessThanOrEqual(2_000);
+      } else {
+        expect(listedThread.goal).toEqual(goal);
+      }
+      expect(readWire.thread.status).toBe("idle");
+      expect(readWire.thread.activeRunId).toBeNull();
+      expect(listWire.threads[0]?.status).toBe("idle");
+
+      goal = null;
+      const cleared = yield* service.readThread(makeScope(), { threadId: parentThreadId });
+      const clearedList = yield* service.listThreads(makeScope(), {});
+      expect(cleared.thread.goal).toBeNull();
+      expect(clearedList.threads[0]?.goal).toBeNull();
+      expect(clearedList.threads[0]?.goalTextTruncated).toBe(false);
+
+      // Old servers omitted goals; do not reinterpret that omission as a completed objective.
+      const { goal: _goal, ...legacyThread } = readWire.thread;
+      const legacy = yield* decodeThreadRead({
+        ...readWire,
+        thread: legacyThread,
+      });
+      expect(legacy.thread.goal).toBeUndefined();
+    }).pipe(Effect.provide(layer), Effect.runPromise);
+  },
+);
 
 it("readThread prefers activity-run status over a newer cancelled queued run", async () => {
   const projection = {

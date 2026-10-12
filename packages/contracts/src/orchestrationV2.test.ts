@@ -117,6 +117,19 @@ const encodeOrchestrationV2SubagentJson = Schema.encodeSync(OrchestrationV2Subag
 const decodeOrchestrationV2ThreadProjection = Schema.decodeUnknownSync(
   OrchestrationV2ThreadProjection,
 );
+it("historical thread projections omit the auto enrollment tombstone and new projections preserve opt-out", () => {
+  const oldProjection = emptyThreadProjection();
+  expect(
+    decodeOrchestrationV2ThreadProjection(oldProjection).thread.continuityAutoEnrollDisabled,
+  ).toBeUndefined();
+  expect(
+    decodeOrchestrationV2ThreadProjection({
+      ...oldProjection,
+      thread: { ...oldProjection.thread, continuityAutoEnrollDisabled: true },
+    }).thread.continuityAutoEnrollDisabled,
+  ).toBe(true);
+});
+
 const decodeOrchestrationV2ThreadStreamItem = Schema.decodeUnknownSync(
   OrchestrationV2ThreadStreamItem,
 );
@@ -1313,6 +1326,7 @@ describe("orchestration V2 contracts", () => {
     });
 
     expect(shell.pendingBackgroundTasks).toEqual([]);
+    expect(shell.continuityAutoEnrollDisabled).toBeUndefined();
   });
 });
 

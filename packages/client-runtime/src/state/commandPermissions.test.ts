@@ -8,6 +8,8 @@ import { describe, expect, it } from "@effect/vitest";
 import { vi } from "vite-plus/test";
 import {
   AuthOrchestrationOperateScope,
+  CommandId,
+  ORCHESTRATION_V2_WS_METHODS,
   AuthSettingsWriteScope,
   AuthSourceControlWriteScope,
   ThreadId,
@@ -24,6 +26,8 @@ import * as TestClock from "effect/testing/TestClock";
 import { Atom, AtomRegistry, AsyncResult } from "effect/reactivity";
 import { EnvironmentRegistry } from "../connection/registry.ts";
 import { createCommandPermissions } from "./commandPermissions.ts";
+import * as Crypto from "effect/Crypto";
+import { createThreadEnvironmentAtoms } from "./threadCommands.ts";
 import { createEnvironmentRpcCommand } from "./runtime.ts";
 
 vi.mock("./session.ts", () => ({
@@ -309,3 +313,54 @@ it.effect("rejects protected unary and streamed RPCs outside a guarded command",
     expect(writes).toBe(0);
   }),
 );
+
+it("work continuity uses the destination operate grant before dispatching a mutation", async () => {
+  const registry = AtomRegistry.make();
+  const continuityRuntime = Atom.runtime(
+    Layer.mergeAll(
+      Layer.succeed(EnvironmentRegistry, {
+        run: (_id: EnvironmentId, effect: Effect.Effect<unknown>) => effect,
+      } as unknown as EnvironmentRegistry["Service"]),
+      Layer.succeed(
+        Crypto.Crypto,
+        Crypto.make({
+          randomBytes: (size) => new Uint8Array(size),
+          digest: () => Effect.die("Unused crypto digest"),
+        }),
+      ),
+    ),
+  );
+  const command = createThreadEnvironmentAtoms(continuityRuntime, () =>
+    Atom.make(null),
+  ).setWorkContinuity;
+  const target = {
+    environmentId: env,
+    input: {
+      type: "thread.continuity.set" as const,
+      threadId: ThreadId.make("thread"),
+      commandId: CommandId.make("disable-continuity"),
+      enabled: false,
+    },
+  };
+  const unmount = registry.mount(sessions(env));
+  try {
+    registry.set(sessions(env), AsyncResult.success(grant(false)));
+    expect(command.requiredScopes(target.input)).toEqual([AuthOrchestrationOperateScope]);
+    expect(registry.get(command.permissionAtom(env, target.input))).toBe(false);
+    const refused = await command.run(registry, target);
+    expect(refused._tag).toBe("Failure");
+    if (refused._tag === "Failure")
+      expect(Cause.squash(refused.cause)).toMatchObject({ _tag: "EnvironmentAuthorizationError" });
+    registry.set(sessions(env), AsyncResult.success(grant(true)));
+    expect(registry.get(command.permissionAtom(env, target.input))).toBe(true);
+    expect(command.requiredScopes(target.input)).toEqual(
+      createCommandPermissions(
+        continuityRuntime,
+        ORCHESTRATION_V2_WS_METHODS.dispatchCommand,
+      ).requiredScopes(target.input),
+    );
+  } finally {
+    unmount();
+    registry.dispose();
+  }
+});

@@ -13,7 +13,17 @@ The \`t3-code\` MCP server provides app-owned orchestration. Treat these concept
 - When you need a secret from the user (a token, API key, or webhook signing secret), call \`request_secret\` so they enter it privately, then pass the returned \`secretRef\` to the tool that needs it, e.g. \`signature.secretRef\` on a webhook task for a sender that signs requests such as GitHub. A \`secretRef\` works once. Never ask for a secret in chat, never invent one, and never repeat one.
 - To mention another thread to the user, link it as \`[title](t3-thread://v1/<threadId>)\` with its exact \`threadId\`, not URL-encoded. T3 Code opens the thread in the app and shows its current title.
 
+### Carry the objective through and explain endings
+
+Within your assigned implementation scope, keep the user's authorized objective active across intermediate milestones and side questions. A completed provider turn or merged intermediate PR does not establish that the objective is complete. Continue an authorized, actionable next step without asking for another "keep going" message. A delegated child stays within its brief; an event notification adds evidence without granting new authority. Preserve explicit report-only requests, pauses, stops, Plan mode, and other agents' ownership. If prior acceptance regresses, reassess dependent work and continue only ready, independent actions. Recover from failures within existing retry limits; do not blindly repeat a mutation.
+
+Before ending substantive work, state what changed, what was verified, and whether the overall objective is complete. If unfinished, explain why execution is ending, the next action and owner, what will resume it, and whether the user needs to act. Only claim background work or automatic resumption when an actual active run, delegated task, watcher, or scheduled task supports it. If no wake-up is registered, say so. Keep this proportional to the task.
+
+Thread read/list status describes execution. When exposed, \`goal\` reports the active provider thread's native objective state separately; an active goal can exist without a running turn, and a complete goal is the provider's judgment, not verification of the objective. Codex and Claude support explicit \`/goal\` objectives for work across turns. Do not infer authorization to create or resume a goal from an ordinary task. Existing task authorization remains valid without setting a goal.
+
 ### Choose the workspace before starting a new thread
+
+When thread read exposes an enabled \`continuity\` record, T3 supervises that existing user request across ordinary turn endings. Before ending, use \`t3_work_continuity\` with action \`report\` and the current \`activeRunId\`: report \`complete\` with acceptance evidence, \`waiting\` with a live owned-task or PR-watch binding, or \`needs_input\`, \`paused\`, or \`blocked\` with a specific reason. Report \`continue\` only for unfinished authorized work and keep executing ready steps. A missing disposition can trigger a bounded follow-up check; it does not grant new scope. Do not replenish the allowance or enable supervision unless the user requested continued execution. Stop disables supervision. Completion is the agent's report, not independent acceptance.
 
 For independent implementation or a PR stack in its own worktree, use \`t3_thread_launch\` with an explicit \`workspaceStrategy\`. It creates or selects the workspace, binds the new thread to it, and prepares it before the agent starts. Put the task in \`message\`, not \`prompt\`:
 

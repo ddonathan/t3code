@@ -158,6 +158,86 @@ it("recovers an admitted continuation after another crash before provider start"
   assert.equal(restartContinuationRun(starting)?.id, runId);
 });
 
+it.effect.each(["ready", "stopped", "error"] as const)(
+  "startup judges all shared-session roots against its initial %s state",
+  (initialStatus) =>
+    Effect.gen(function* () {
+      const secondThreadId = ThreadId.make("thread:restart:second");
+      const secondRunId = RunId.make("run:restart:second");
+      let sharedSession = {
+        ...makeProjection().providerSessions[0]!,
+        status: initialStatus,
+        capabilities: { sessions: { supportsMultipleProviderThreadsPerSession: true } },
+      } as OrchestrationV2ThreadProjection["providerSessions"][number];
+      const commits: Parameters<EventSink.EventSinkV2["Service"]["commitCommand"]>[0][] = [];
+      const recovery = yield* ProviderRuntimeRecovery.make.pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            ServerSettings.layerTest({ continueThreadsAfterServerUpdate: true }),
+            Layer.mock(ProjectionStore.ProjectionStoreV2)({
+              getRecoveryThreadIds: () => Effect.succeed([threadId, secondThreadId]),
+              getRuntimeRecoveryProjection: (id) =>
+                Effect.sync(() => {
+                  const base = makeProjection();
+                  const rootThreadId = ProviderThreadId.make(`provider-thread:${id}`);
+                  return {
+                    ...base,
+                    thread: { ...base.thread, id },
+                    runs: [
+                      {
+                        ...base.runs[0]!,
+                        id: id === threadId ? runId : secondRunId,
+                        providerThreadId: rootThreadId,
+                      },
+                    ],
+                    providerThreads: [
+                      { ...base.providerThreads[0]!, id: rootThreadId, appThreadId: id },
+                    ],
+                    providerSessions: [sharedSession],
+                    providerTurns: [{ ...base.providerTurns[0]!, providerThreadId: rootThreadId }],
+                  };
+                }),
+            }),
+            Layer.mock(EventSink.EventSinkV2)({
+              commitCommand: (input) =>
+                Effect.sync(() => {
+                  commits.push(input);
+                  for (const event of input.events) {
+                    if (event.type === "provider-session.updated") sharedSession = event.payload;
+                  }
+                  return { committed: true, cancelledEffectCount: 0 } as never;
+                }),
+            }),
+            IdAllocator.layer,
+            Layer.mock(EffectOutbox.EffectOutboxV2)({
+              reconcileAfterProcessLoss: Effect.succeed({ requeued: 0, cancelled: 0 }),
+            }),
+          ),
+        ),
+      );
+      yield* recovery.recover;
+      assert.equal(sharedSession.status, initialStatus === "error" ? "error" : "stopped");
+      assert.deepEqual(
+        commits.flatMap((commit) => commit.effects.map((effect) => effect.request)),
+        initialStatus === "ready"
+          ? [
+              { type: "provider-runtime.continue", sourceRunId: runId },
+              { type: "provider-runtime.continue", sourceRunId: secondRunId },
+            ]
+          : [],
+      );
+      // Shared lifecycle alone never authorizes a stopped root or an orphaned turn.
+      const stopped = { ...makeProjection(), providerSessions: [sharedSession] };
+      assert.isUndefined(restartContinuationRun({ ...stopped, providerTurns: [] }));
+      assert.isUndefined(
+        restartContinuationRun({
+          ...stopped,
+          runs: [{ ...stopped.runs[0]!, status: "cancelled" }],
+        }),
+      );
+    }),
+);
+
 it("does not continue settled root runs with restart-cancelled background work", () => {
   const projection = makeProjection();
   const settled = {

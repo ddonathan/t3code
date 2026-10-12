@@ -35,6 +35,8 @@ import {
   type OrchestratorMcpListScheduledTasksInput,
   type ProjectId,
   type OrchestratorMcpThreadDetail,
+  type OrchestratorMcpWorkContinuityInput,
+  type OrchestratorMcpWorkContinuityResult,
   type OrchestratorMcpThreadInterruptInput,
   type OrchestratorMcpThreadInterruptResult,
   type OrchestratorMcpThreadListInput,
@@ -170,6 +172,10 @@ export interface OrchestratorMcpServiceShape {
     scope: McpInvocationScope,
     input: OrchestratorMcpThreadListInput,
   ) => Effect.Effect<OrchestratorMcpThreadListResult, OrchestratorMcpFailure>;
+  readonly workContinuity: (
+    scope: McpInvocationScope,
+    input: OrchestratorMcpWorkContinuityInput,
+  ) => Effect.Effect<OrchestratorMcpWorkContinuityResult, OrchestratorMcpFailure>;
   readonly readThread: (
     scope: McpInvocationScope,
     input: OrchestratorMcpThreadReadInput,
@@ -711,6 +717,8 @@ function listItemFromShell(
     createdBy: shell.createdBy,
     creationSource: shell.creationSource,
     status: shell.activityRunStatus ?? shell.status,
+    ...listGoal(shell.goal),
+    continuity: shell.continuity ?? null,
     latestRunId: shell.latestRunId,
     providerInstanceId: shell.modelSelection.instanceId,
     model: shell.modelSelection.model,
@@ -724,6 +732,16 @@ function listItemFromShell(
     itemCount: shell.visibleItemCount,
     createdAt: DateTime.formatIso(shell.createdAt),
     updatedAt: DateTime.formatIso(shell.updatedAt),
+  };
+}
+
+function listGoal(goal: OrchestrationV2ThreadShell["goal"]) {
+  if (goal == null) return { goal: null, goalTextTruncated: false };
+  const objective = goal.objective.slice(0, 1_000);
+  const lastCheck = goal.lastCheck?.slice(0, 2_000);
+  return {
+    goal: { ...goal, objective, ...(lastCheck === undefined ? {} : { lastCheck }) },
+    goalTextTruncated: objective !== goal.objective || lastCheck !== goal.lastCheck,
   };
 }
 
@@ -742,6 +760,8 @@ function threadDetail(
     createdBy: projection.thread.createdBy,
     creationSource: projection.thread.creationSource,
     status: active?.status ?? latest?.status ?? "idle",
+    goal: shell.goal ?? null,
+    continuity: shell.continuity ?? null,
     latestRunId: latest?.id ?? null,
     activeRunId: active?.id ?? null,
     providerInstanceId: projection.thread.modelSelection.instanceId,
@@ -2535,6 +2555,66 @@ const make = Effect.gen(function* () {
           nextPosition: page.at(-1)?.position ?? null,
           hasMore: timeline.hasMore,
         } satisfies OrchestratorMcpThreadReadResult;
+      }),
+    workContinuity: (scope, input) =>
+      Effect.gen(function* () {
+        const { parent } = yield* loadCaller(scope);
+        const threadId = input.threadId ?? parent?.thread.id;
+        if (threadId === undefined) {
+          return yield* failure("target_required", "Pass threadId when no calling thread exists.");
+        }
+        if (parent?.thread.id !== threadId) {
+          return yield* failure(
+            "invalid_request",
+            "Work continuity changes must belong to the calling thread.",
+          );
+        }
+        if (input.action === "enable" && parent.thread.continuityAutoEnrollDisabled === true)
+          return yield* failure(
+            "invalid_request",
+            "The user disabled automatic continuation for this thread. Re-enable it in the client before agent enrollment.",
+          );
+        if (
+          input.action === "enable" &&
+          parent.thread.continuity?.authorityMessageId === input.authorityMessageId
+        ) {
+          return { threadId, continuity: parent.thread.continuity };
+        }
+        const key = yield* requestKey(input.clientRequestId);
+        const commandId = stableCommandId({
+          scope,
+          requestKey: key,
+          operation: `continuity-${input.action}`,
+        });
+        yield* threadManagement
+          .dispatch(
+            input.action === "report"
+              ? {
+                  type: "thread.continuity.report",
+                  commandId,
+                  threadId,
+                  runId: input.runId,
+                  status: input.status,
+                  reason: input.reason,
+                  ...(input.wait === undefined ? {} : { wait: input.wait }),
+                }
+              : {
+                  type: "thread.continuity.set",
+                  creationSource: "mcp",
+                  commandId,
+                  threadId,
+                  enabled: input.action === "enable",
+                  ...(input.action === "enable"
+                    ? {
+                        authorityMessageId: input.authorityMessageId,
+                        ...(input.maxChecks === undefined ? {} : { maxChecks: input.maxChecks }),
+                      }
+                    : {}),
+                },
+          )
+          .pipe(Effect.mapError(threadManagementFailure));
+        const updated = yield* loadProjection(threadId);
+        return { threadId, continuity: updated.thread.continuity ?? null };
       }),
     sendToThread: (scope, input) =>
       Effect.gen(function* () {

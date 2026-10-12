@@ -634,6 +634,9 @@ export function useSettingsRestore(onRestored?: () => void) {
       DEFAULT_UNIFIED_SETTINGS.continueThreadsAfterServerUpdate
         ? ["Continue threads after restarts"]
         : []),
+      ...(settings.workContinuityAutoEnroll !== DEFAULT_UNIFIED_SETTINGS.workContinuityAutoEnroll
+        ? ["Automatic continuation checks"]
+        : []),
       ...(isBackgroundActivityDirty ? ["Background activity"] : []),
       ...(settings.defaultThreadEnvMode !== DEFAULT_UNIFIED_SETTINGS.defaultThreadEnvMode
         ? ["New thread mode"]
@@ -707,6 +710,7 @@ export function useSettingsRestore(onRestored?: () => void) {
       settings.persistComposerContextStrip,
       settings.enableProviderUpdateChecks,
       settings.continueThreadsAfterServerUpdate,
+      settings.workContinuityAutoEnroll,
       settings.sidebarAutoSettleAfterDays,
       settings.sidebarAutoSettleOnMerge,
       settings.autoResumeLimitedThreads,
@@ -821,6 +825,7 @@ export function useSettingsRestore(onRestored?: () => void) {
       responseStreamingMode: DEFAULT_UNIFIED_SETTINGS.responseStreamingMode,
       enableProviderUpdateChecks: DEFAULT_UNIFIED_SETTINGS.enableProviderUpdateChecks,
       continueThreadsAfterServerUpdate: DEFAULT_UNIFIED_SETTINGS.continueThreadsAfterServerUpdate,
+      workContinuityAutoEnroll: DEFAULT_UNIFIED_SETTINGS.workContinuityAutoEnroll,
       backgroundActivity: DEFAULT_UNIFIED_SETTINGS.backgroundActivity,
       backgroundActivityProfile: DEFAULT_UNIFIED_SETTINGS.backgroundActivityProfile,
       automaticGitFetchInterval: DEFAULT_UNIFIED_SETTINGS.automaticGitFetchInterval,
@@ -2207,6 +2212,12 @@ export function GeneralSettingsPanel() {
     connectedEnvironments.every(
       (target) => target.serverConfig?.environment.capabilities.threadRestartContinuation === true,
     );
+  const supportsAutomaticContinuity =
+    connectedEnvironments.length > 0 &&
+    connectedEnvironments.every(
+      (target) =>
+        target.serverConfig?.environment.capabilities.threadWorkContinuityAutoEnrollment === true,
+    );
 
   const textGenerationProviders = serverProviders.filter(
     (provider) => provider.supportsTextGeneration !== false,
@@ -2911,6 +2922,43 @@ export function GeneralSettingsPanel() {
                 updateSettings({ enableProviderUpdateChecks: Boolean(checked) })
               }
               aria-label="Check provider versions"
+            />
+          }
+        />
+
+        <SettingsRow
+          {...searchableSetting("work-continuity-auto-enroll")}
+          serverScoped
+          settingKeys={["workContinuityAutoEnroll"]}
+          description="Automatically enable up to three checks for new work, including a new job after completion. Paused, blocked, exhausted, and disabled checks stay closed."
+          status={
+            !supportsAutomaticContinuity
+              ? "All selected connected environments must support automatic continuation checks."
+              : undefined
+          }
+          resetAction={
+            supportsAutomaticContinuity &&
+            settings.workContinuityAutoEnroll !==
+              DEFAULT_UNIFIED_SETTINGS.workContinuityAutoEnroll ? (
+              <SettingResetButton
+                label="automatic continuation checks"
+                onClick={() =>
+                  updateSettings({
+                    workContinuityAutoEnroll: DEFAULT_UNIFIED_SETTINGS.workContinuityAutoEnroll,
+                  })
+                }
+              />
+            ) : null
+          }
+          control={
+            <ScopedSwitch
+              settingKeys={["workContinuityAutoEnroll"]}
+              checked={settings.workContinuityAutoEnroll}
+              disabled={!supportsAutomaticContinuity}
+              onCheckedChange={(checked) =>
+                updateSettings({ workContinuityAutoEnroll: Boolean(checked) })
+              }
+              aria-label="Automatic continuation checks"
             />
           }
         />

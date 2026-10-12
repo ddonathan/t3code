@@ -683,7 +683,7 @@ export class OrchestratorMcpFailure extends Schema.TaggedError<OrchestratorMcpFa
   },
 ) {}
 
-export const OrchestratorMcpWorkContinuityInput = Schema.Union([
+const OrchestratorMcpWorkContinuityAction = Schema.Union([
   Schema.Struct({
     action: Schema.Literal("enable"),
     threadId: Schema.optional(ThreadId),
@@ -706,6 +706,17 @@ export const OrchestratorMcpWorkContinuityInput = Schema.Union([
     clientRequestId: Schema.optional(OrchestratorMcpClientRequestId),
   }),
 ]);
+export const OrchestratorMcpWorkContinuityInput = Schema.Struct({
+  action: Schema.Literals(["enable", "disable", "report"]),
+  threadId: Schema.optional(ThreadId),
+  authorityMessageId: Schema.optional(MessageId),
+  maxChecks: Schema.optional(OrchestrationV2WorkContinuityMaxChecks),
+  runId: Schema.optional(RunId),
+  status: Schema.optional(OrchestrationV2WorkContinuityReportStatus),
+  reason: Schema.optional(OrchestrationV2WorkContinuityReason),
+  wait: Schema.optional(Schema.NullOr(OrchestrationV2WorkContinuityWait)),
+  clientRequestId: Schema.optional(OrchestratorMcpClientRequestId),
+}).pipe(Schema.decodeTo(OrchestratorMcpWorkContinuityAction));
 export type OrchestratorMcpWorkContinuityInput = typeof OrchestratorMcpWorkContinuityInput.Type;
 export const OrchestratorMcpWorkContinuityResult = Schema.Struct({
   threadId: ThreadId,

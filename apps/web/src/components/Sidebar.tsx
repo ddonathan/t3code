@@ -1,4 +1,4 @@
-import { type EnvironmentId, type ScopedProjectRef } from "@t3tools/contracts";
+import { CommandId, type EnvironmentId, type ScopedProjectRef } from "@t3tools/contracts";
 import { ThreadHoverCard, ThreadHoverCardPopup } from "./ThreadHoverCard";
 import { CollapsibleSectionHeader } from "./ui/collapsible-section-header";
 import { setThreadChangeRequestSnapshot } from "./ThreadStatusIndicators";
@@ -15,6 +15,7 @@ import { resolveThreadCurrentPullRequestLink } from "@t3tools/shared/threadPullR
 import { useAtomValue } from "@effect/atom-react";
 import { replaceComposerContextReferences } from "@t3tools/shared/composerContextReferences";
 import * as Schema from "effect/Schema";
+import * as Option from "effect/Option";
 import {
   DndContext,
   useSensor,
@@ -162,7 +163,10 @@ import {
 import { environmentServerConfigsAtom, primaryServerKeybindingsAtom } from "../state/server";
 import { environmentProjects } from "../state/projects";
 import { vcsEnvironment } from "../state/vcs";
-import { threadEnvironment } from "../state/threads";
+import { threadEnvironment, environmentThreadDetails } from "../state/threads";
+import { appAtomRegistry } from "../rpc/atomRegistry";
+import { waitForAtomValue } from "../state/waitForAtomValue";
+import { randomUUID } from "../lib/utils";
 import { useEnvironmentQuery } from "../state/query";
 import { useThreadSearch } from "../state/queries";
 import { useOrchestrationCommand } from "../state/use-orchestration-command";
@@ -2449,6 +2453,9 @@ export default function Sidebar() {
     archiveThread,
     deleteThread,
   } = useThreadActions();
+  const setWorkContinuity = useOrchestrationCommand(threadEnvironment.setWorkContinuity, {
+    reportFailure: false,
+  });
   const updateThreadMetadata = useOrchestrationCommand(threadEnvironment.updateMetadata, {
     reportFailure: false,
   });
@@ -4650,6 +4657,37 @@ export default function Sidebar() {
         }
         const thread = threadByKeyRef.current.get(threadKey);
         if (!thread) return;
+        const canChangeContinuity = appAtomRegistry.get(
+          threadEnvironment.setWorkContinuity.permissionAtom(threadRef.environmentId, {
+            type: "thread.continuity.set",
+          }),
+        );
+        const detailStateAtom =
+          thread.continuity === undefined || !canChangeContinuity
+            ? null
+            : environmentThreadDetails.stateAtom(threadRef);
+        const detailReady =
+          detailStateAtom !== null &&
+          (await waitForAtomValue({
+            registry: appAtomRegistry,
+            atom: detailStateAtom,
+            predicate: (state) => state.status === "live" && Option.isSome(state.data),
+            timeoutMs: 1_000,
+          }));
+        const detail =
+          detailReady && detailStateAtom !== null
+            ? Option.getOrNull(appAtomRegistry.get(detailStateAtom).data)
+            : null;
+        const latestAuthority = detail?.messages.findLast(
+          (message) =>
+            message.role === "user" &&
+            message.createdBy === "user" &&
+            (message.creationSource === "web" || message.creationSource === "mobile") &&
+            message.scheduledTaskId === undefined &&
+            message.senderThreadId === undefined &&
+            message.notification === undefined &&
+            message.threadId === threadRef.threadId,
+        );
         const threadWorkspacePath =
           thread.worktreePath ??
           projectByKey.get(`${thread.environmentId}:${thread.projectId}`)?.workspaceRoot ??
@@ -4687,6 +4725,16 @@ export default function Sidebar() {
         const clicked = await settlePromise(() =>
           api.contextMenu.show(
             buildThreadActionMenuItems({
+              ...(thread.continuity === undefined
+                ? {}
+                : {
+                    continuityControl: {
+                      state: thread.continuity,
+                      canEnable: canChangeContinuity && latestAuthority !== undefined,
+                      canDisable: canChangeContinuity,
+                      autoEnrollDisabled: thread.continuityAutoEnrollDisabled === true,
+                    },
+                  }),
               canOperate: readEnvironmentScope(
                 threadRef.environmentId,
                 AuthOrchestrationOperateScope,
@@ -4728,6 +4776,33 @@ export default function Sidebar() {
           return;
         }
         switch (clicked.value) {
+          case "continuity:enable":
+          case "continuity:disable": {
+            if (clicked.value === "continuity:enable" && latestAuthority === undefined) return;
+            const result = await setWorkContinuity({
+              environmentId: threadRef.environmentId,
+              input: {
+                type: "thread.continuity.set",
+                commandId: CommandId.make(randomUUID()),
+                threadId: threadRef.threadId,
+                enabled: clicked.value === "continuity:enable",
+                ...(clicked.value === "continuity:enable" && latestAuthority !== undefined
+                  ? { authorityMessageId: latestAuthority.id }
+                  : {}),
+              },
+            });
+            if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
+              const error = squashAtomCommandFailure(result);
+              toastManager.add(
+                stackedThreadToast({
+                  type: "error",
+                  title: "Could not update continuation checks",
+                  description: error instanceof Error ? error.message : "An error occurred.",
+                }),
+              );
+            }
+            return;
+          }
           case "filter-by-project":
             // This item is the only scope control here, so picking the
             // already-scoped project again is the way back to all projects.
@@ -4930,6 +5005,7 @@ export default function Sidebar() {
       setProjectScopeKey,
       setThreadAutoSettle,
       startThreadRename,
+      setWorkContinuity,
       updateThreadMetadata,
       timestampFormat,
     ],

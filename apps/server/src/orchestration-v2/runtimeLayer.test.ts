@@ -27,6 +27,7 @@ import {
   ProviderThreadId,
   ProviderTurnId,
   RunId,
+  ScheduledTaskId,
   ThreadId,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
@@ -278,7 +279,7 @@ const layerTest = Layer.mergeAll(
   Layer.provide(SqlitePersistence.layerMemory),
   Layer.provide(layerCheckpointStoreTest),
   Layer.provide(layerServerConfig),
-  Layer.provide(ServerSettings.layerTest()),
+  Layer.provideMerge(ServerSettings.layerTest()),
   Layer.provide(layerTestProviderInstanceRegistry),
   Layer.provide(layerGitWorkflowTest),
   Layer.provide(layerProjectServiceTest),
@@ -5587,7 +5588,7 @@ it.layer(layerQueueResumeDisabledInstanceTest)(
 it.layer(layerTest.pipe(Layer.provideMerge(SqlitePersistence.layerMemory)))(
   "bounded work continuity",
   (it) => {
-    const seedContinuity = (name: string, maxChecks?: number) =>
+    const seedContinuity = (name: string, maxChecks?: number, automatic = false) =>
       Effect.gen(function* () {
         const orchestrator = yield* Orchestrator.OrchestratorV2;
         const threadId = ThreadId.make(`continuity:${name}`);
@@ -5625,14 +5626,16 @@ it.layer(layerTest.pipe(Layer.provideMerge(SqlitePersistence.layerMemory)))(
           attachments: [],
           dispatchMode: { type: "start_immediately" },
         });
-        yield* orchestrator.dispatch({
-          type: "thread.continuity.set",
-          commandId: generation,
-          threadId,
-          enabled: true,
-          authorityMessageId,
-          ...(maxChecks === undefined ? {} : { maxChecks }),
-        });
+        if (!automatic)
+          yield* orchestrator.dispatch({
+            type: "thread.continuity.set",
+            creationSource: "web",
+            commandId: generation,
+            threadId,
+            enabled: true,
+            authorityMessageId,
+            ...(maxChecks === undefined ? {} : { maxChecks }),
+          });
         const run = (yield* orchestrator.getThreadProjection(threadId)).runs[0]!;
         return { threadId, authorityMessageId, generation, run };
       });
@@ -5716,6 +5719,631 @@ it.layer(layerTest.pipe(Layer.provideMerge(SqlitePersistence.layerMemory)))(
         }),
       );
 
+    const withAutoEnrollment = <A, E, R>(program: Effect.Effect<A, E, R>) =>
+      Effect.gen(function* () {
+        const settings = yield* ServerSettings.ServerSettingsService;
+        yield* settings.updateSettings({ workContinuityAutoEnroll: true });
+        return yield* program.pipe(
+          Effect.ensuring(
+            settings.updateSettings({ workContinuityAutoEnroll: false }).pipe(Effect.orDie),
+          ),
+        );
+      });
+    const sendHumanFollowup = (threadId: ThreadId, suffix: string) =>
+      Effect.flatMap(Orchestrator.OrchestratorV2, (orchestrator) =>
+        orchestrator.dispatch({
+          type: "message.dispatch",
+          commandId: CommandId.make(`${threadId}:${suffix}`),
+          threadId,
+          messageId: MessageId.make(`${threadId}:${suffix}`),
+          text: "What is the status?",
+          createdBy: "user",
+          creationSource: "web",
+          attachments: [],
+          dispatchMode: { type: "queue_after_active" },
+        }),
+      );
+
+    it.effect("disabled auto enrollment leaves accepted human messages unenrolled", () =>
+      Effect.gen(function* () {
+        const input = yield* seedContinuity("auto-off", undefined, true);
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        assert.isNull(
+          (yield* orchestrator.getThreadProjection(input.threadId)).thread.continuity ?? null,
+        );
+      }),
+    );
+
+    it.effect(
+      "automatic human enrollment spends exactly one check after a missing terminal report",
+      () =>
+        withAutoEnrollment(
+          Effect.gen(function* () {
+            const input = yield* seedContinuity("auto-on", undefined, true);
+            const orchestrator = yield* Orchestrator.OrchestratorV2;
+            const before = (yield* orchestrator.getThreadProjection(input.threadId)).thread
+              .continuity;
+            assert.equal(before?.authorityMessageId, input.authorityMessageId);
+            assert.equal(before?.checksRemaining, 3);
+            const events = yield* EventSink.EventSinkV2;
+            const started = yield* events
+              .stream({ afterSequence: yield* events.latestSequence(), eventType: "run.created" })
+              .pipe(
+                Stream.filter((stored) => stored.event.threadId === input.threadId),
+                Stream.take(1),
+                Stream.runCollect,
+                Effect.forkChild({ startImmediately: true }),
+              );
+            yield* finishRun(input.threadId, input.run);
+            yield* Fiber.join(started);
+            const after = yield* orchestrator.getThreadProjection(input.threadId);
+            assert.lengthOf(after.runs, 2);
+            assert.equal(after.thread.continuity?.checksRemaining, 2);
+            assert.equal(after.thread.continuity?.generation, before?.generation);
+            const continuation = after.runs.find((run) => run.id !== input.run.id)!;
+            yield* orchestrator.dispatch({
+              type: "thread.continuity.report",
+              commandId: CommandId.make(`${input.threadId}:continuation-complete`),
+              threadId: input.threadId,
+              runId: continuation.id,
+              status: "complete",
+              reason: "The continuation verified the enrolled assignment.",
+            });
+            const completed = (yield* orchestrator.getThreadProjection(input.threadId)).thread
+              .continuity;
+            assert.equal(completed?.status, "complete");
+            assert.equal(completed?.lastReportedRunId, continuation.id);
+            assert.equal(completed?.authorityMessageId, input.authorityMessageId);
+            assert.equal(completed?.checksRemaining, 2);
+          }),
+        ),
+    );
+
+    it.effect(
+      "enabling the setting alone does not enroll or wake existing work, but a queued human turn does",
+      () =>
+        Effect.gen(function* () {
+          const input = yield* seedContinuity("auto-queued", undefined, true);
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          yield* withAutoEnrollment(
+            Effect.gen(function* () {
+              const before = yield* orchestrator.getThreadProjection(input.threadId);
+              assert.isNull(before.thread.continuity ?? null);
+              assert.lengthOf(before.runs, 1);
+              yield* sendHumanFollowup(input.threadId, "queued");
+              const after = yield* orchestrator.getThreadProjection(input.threadId);
+              assert.equal(
+                after.thread.continuity?.authorityMessageId,
+                MessageId.make(`${input.threadId}:queued`),
+              );
+              assert.equal(after.thread.continuity?.checksRemaining, 3);
+              assert.lengthOf(after.runs, 2);
+            }),
+          );
+        }),
+    );
+
+    it.effect("an exhausted record is never replenished by a new human turn", () =>
+      withAutoEnrollment(
+        Effect.gen(function* () {
+          const input = yield* seedContinuity("auto-exhausted", 1);
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const projection = yield* orchestrator.getThreadProjection(input.threadId);
+          const events = yield* EventSink.EventSinkV2;
+          const now = yield* DateTime.now;
+          const exhausted = { ...projection.thread.continuity!, checksRemaining: 0 };
+          yield* events.write({
+            events: [
+              {
+                id: EventId.make(`${input.threadId}:exhausted`),
+                type: "thread.metadata-updated",
+                threadId: input.threadId,
+                occurredAt: now,
+                payload: { ...projection.thread, continuity: exhausted },
+              },
+            ],
+          });
+          yield* sendHumanFollowup(input.threadId, "status");
+          assert.deepEqual(
+            (yield* orchestrator.getThreadProjection(input.threadId)).thread.continuity,
+            exhausted,
+          );
+        }),
+      ),
+    );
+
+    it.effect(
+      "a status question preserves an enrolled assignment and its remaining allowance",
+      () =>
+        withAutoEnrollment(
+          Effect.gen(function* () {
+            const input = yield* seedContinuity("auto-status", 1);
+            const orchestrator = yield* Orchestrator.OrchestratorV2;
+            const before = (yield* orchestrator.getThreadProjection(input.threadId)).thread
+              .continuity;
+            yield* sendHumanFollowup(input.threadId, "status");
+            assert.deepEqual(
+              (yield* orchestrator.getThreadProjection(input.threadId)).thread.continuity,
+              before,
+            );
+          }),
+        ),
+    );
+
+    it.effect("a new accepted human assignment after complete receives its own three checks", () =>
+      withAutoEnrollment(
+        Effect.gen(function* () {
+          const input = yield* seedContinuity("auto-next-assignment", 1);
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          yield* orchestrator.dispatch({
+            type: "thread.continuity.report",
+            commandId: CommandId.make(`${input.threadId}:complete`),
+            threadId: input.threadId,
+            runId: input.run.id,
+            status: "complete",
+            reason: "First assignment verified.",
+          });
+          yield* finishRun(input.threadId, input.run);
+          const nextCommandId = CommandId.make(`${input.threadId}:next-job`);
+          const nextMessageId = MessageId.make(`${input.threadId}:next-job`);
+          yield* orchestrator.dispatch({
+            type: "message.dispatch",
+            commandId: nextCommandId,
+            threadId: input.threadId,
+            messageId: nextMessageId,
+            text: "Implement and verify the next independent job.",
+            createdBy: "user",
+            creationSource: "mobile",
+            attachments: [],
+            dispatchMode: { type: "start_immediately" },
+          });
+          const projection = yield* orchestrator.getThreadProjection(input.threadId);
+          assert.lengthOf(projection.runs, 2);
+          assert.equal(projection.thread.continuity?.generation, nextCommandId);
+          assert.equal(projection.thread.continuity?.authorityMessageId, nextMessageId);
+          assert.equal(projection.thread.continuity?.status, "active");
+          assert.equal(projection.thread.continuity?.maxChecks, 3);
+          assert.equal(projection.thread.continuity?.checksRemaining, 3);
+          assert.isNull(projection.thread.continuity?.lastAdvancedRunId);
+          assert.isNull(projection.thread.continuity?.lastReportedRunId);
+          yield* sendHumanFollowup(input.threadId, "status");
+          assert.deepEqual(
+            (yield* orchestrator.getThreadProjection(input.threadId)).thread.continuity,
+            projection.thread.continuity,
+          );
+        }),
+      ),
+    );
+
+    it.effect("Stop ends supervision without a sticky opt-out for the next human job", () =>
+      withAutoEnrollment(
+        Effect.gen(function* () {
+          const input = yield* seedContinuity("auto-after-stop");
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          yield* orchestrator.dispatch({
+            type: "thread.continuity.report",
+            commandId: CommandId.make(`${input.threadId}:input`),
+            threadId: input.threadId,
+            runId: input.run.id,
+            status: "needs_input",
+            reason: "Waiting for human clarification.",
+          });
+          yield* finishRun(input.threadId, input.run);
+          yield* orchestrator.dispatch({
+            type: "thread.stop",
+            commandId: CommandId.make(`${input.threadId}:stop`),
+            threadId: input.threadId,
+          });
+          const stopped = yield* orchestrator.getThreadProjection(input.threadId);
+          assert.isNull(stopped.thread.continuity);
+          assert.isFalse(stopped.thread.continuityAutoEnrollDisabled ?? false);
+          yield* advance(input, "late-after-stop");
+          assert.lengthOf((yield* orchestrator.getThreadProjection(input.threadId)).runs, 1);
+          const nextMessageId = MessageId.make(`${input.threadId}:new-job`);
+          yield* orchestrator.dispatch({
+            type: "message.dispatch",
+            commandId: CommandId.make(`${input.threadId}:new-job`),
+            threadId: input.threadId,
+            messageId: nextMessageId,
+            text: "Start and verify a new job.",
+            createdBy: "user",
+            creationSource: "web",
+            attachments: [],
+            dispatchMode: { type: "start_immediately" },
+          });
+          const next = yield* orchestrator.getThreadProjection(input.threadId);
+          assert.equal(next.thread.continuity?.authorityMessageId, nextMessageId);
+          assert.equal(next.thread.continuity?.checksRemaining, 3);
+        }),
+      ),
+    );
+
+    it.effect(
+      "cancelling the queued authority blocks supervision without spending or replacing its allowance",
+      () =>
+        Effect.gen(function* () {
+          const input = yield* seedContinuity("auto-queued-cancel", undefined, true);
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          yield* withAutoEnrollment(
+            Effect.gen(function* () {
+              yield* TestClock.adjust("1 millis");
+              yield* sendHumanFollowup(input.threadId, "queued-job");
+              const before = yield* orchestrator.getThreadProjection(input.threadId);
+              const queued = before.runs.find(
+                (run) => run.userMessageId === MessageId.make(`${input.threadId}:queued-job`),
+              )!;
+              const refused = yield* orchestrator
+                .dispatch({
+                  type: "thread.continuity.report",
+                  commandId: CommandId.make(`${input.threadId}:old-complete`),
+                  threadId: input.threadId,
+                  runId: input.run.id,
+                  status: "complete",
+                  reason: "The predecessor is done, not the queued job.",
+                })
+                .pipe(Effect.flip);
+              assert.instanceOf(refused, Orchestrator.OrchestratorDispatchError);
+              assert.deepEqual(
+                (yield* orchestrator.getThreadProjection(input.threadId)).thread.continuity,
+                before.thread.continuity,
+              );
+              const events = yield* EventSink.EventSinkV2;
+              const blockedEvent = yield* events
+                .stream({
+                  afterSequence: yield* events.latestSequence(),
+                  eventType: "thread.metadata-updated",
+                })
+                .pipe(
+                  Stream.filter(
+                    (stored) =>
+                      stored.event.threadId === input.threadId &&
+                      stored.event.type === "thread.metadata-updated" &&
+                      stored.event.payload.continuity?.status === "blocked",
+                  ),
+                  Stream.take(1),
+                  Stream.runCollect,
+                  Effect.forkChild({ startImmediately: true }),
+                );
+              yield* orchestrator.dispatch({
+                type: "queued-run.cancel",
+                commandId: CommandId.make(`${input.threadId}:cancel-queue`),
+                threadId: input.threadId,
+                runId: queued.id,
+              });
+              yield* finishRun(input.threadId, { ...input.run, startedAt: input.run.requestedAt });
+              yield* Fiber.join(blockedEvent);
+              const blocked = yield* orchestrator.getThreadProjection(input.threadId);
+              assert.equal(blocked.runs.find((run) => run.id === queued.id)?.status, "cancelled");
+              assert.equal(blocked.thread.continuity?.status, "blocked");
+              assert.equal(
+                blocked.thread.continuity?.generation,
+                before.thread.continuity?.generation,
+              );
+              assert.equal(blocked.thread.continuity?.authorityMessageId, queued.userMessageId);
+              assert.equal(blocked.thread.continuity?.checksRemaining, 3);
+              assert.equal(blocked.thread.continuity?.lastAdvancedRunId, queued.id);
+              yield* sendHumanFollowup(input.threadId, "another-job");
+              assert.deepEqual(
+                (yield* orchestrator.getThreadProjection(input.threadId)).thread.continuity,
+                blocked.thread.continuity,
+              );
+              assert.lengthOf((yield* orchestrator.getThreadProjection(input.threadId)).runs, 3);
+            }),
+          );
+        }),
+    );
+
+    it.effect(
+      "an accepted queued human job receives fresh supervision when its completed predecessor yields the queue",
+      () =>
+        withAutoEnrollment(
+          Effect.gen(function* () {
+            const input = yield* seedContinuity("auto-promoted-job", 1);
+            const orchestrator = yield* Orchestrator.OrchestratorV2;
+            const original = (yield* orchestrator.getThreadProjection(input.threadId)).thread
+              .continuity;
+            yield* sendHumanFollowup(input.threadId, "queued-job");
+            const queuedProjection = yield* orchestrator.getThreadProjection(input.threadId);
+            const queued = queuedProjection.runs.find(
+              (run) => run.userMessageId === MessageId.make(`${input.threadId}:queued-job`),
+            )!;
+            assert.equal(queued.status, "queued");
+            assert.deepEqual(queuedProjection.thread.continuity, original);
+            yield* orchestrator.dispatch({
+              type: "thread.continuity.report",
+              commandId: CommandId.make(`${input.threadId}:first-complete`),
+              threadId: input.threadId,
+              runId: input.run.id,
+              status: "complete",
+              reason: "First job verified; queued job still remains.",
+            });
+            const events = yield* EventSink.EventSinkV2;
+            const promoted = yield* events
+              .stream({
+                afterSequence: yield* events.latestSequence(),
+                eventType: "thread.metadata-updated",
+              })
+              .pipe(
+                Stream.filter(
+                  (stored) =>
+                    stored.event.threadId === input.threadId &&
+                    stored.event.type === "thread.metadata-updated" &&
+                    stored.event.payload.continuity?.authorityMessageId === queued.userMessageId,
+                ),
+                Stream.take(1),
+                Stream.runCollect,
+                Effect.forkChild({ startImmediately: true }),
+              );
+            yield* finishRun(input.threadId, input.run);
+            yield* Fiber.join(promoted);
+            const after = yield* orchestrator.getThreadProjection(input.threadId);
+            assert.equal(after.runs.find((run) => run.id === queued.id)?.status, "starting");
+            assert.equal(after.thread.continuity?.authorityMessageId, queued.userMessageId);
+            assert.equal(
+              after.thread.continuity?.generation,
+              CommandId.make(`command:system:start-queued:${queued.id}`),
+            );
+            assert.equal(after.thread.continuity?.status, "active");
+            assert.equal(after.thread.continuity?.maxChecks, 3);
+            assert.equal(after.thread.continuity?.checksRemaining, 3);
+            yield* orchestrator.dispatch({
+              type: "queue.resume",
+              commandId: CommandId.make(`${input.threadId}:resume-again`),
+              threadId: input.threadId,
+            });
+            assert.deepEqual(
+              (yield* orchestrator.getThreadProjection(input.threadId)).thread.continuity,
+              after.thread.continuity,
+            );
+          }),
+        ),
+    );
+
+    it.effect(
+      "agent continuity mutations preserve a human opt-out while human enable clears it",
+      () =>
+        withAutoEnrollment(
+          Effect.gen(function* () {
+            const input = yield* seedContinuity("auto-agent-optout");
+            const orchestrator = yield* Orchestrator.OrchestratorV2;
+            yield* orchestrator.dispatch({
+              type: "thread.continuity.set",
+              creationSource: "web",
+              commandId: CommandId.make(`${input.threadId}:human-disable`),
+              threadId: input.threadId,
+              enabled: false,
+            });
+            const refused = yield* orchestrator
+              .dispatch({
+                type: "thread.continuity.set",
+                creationSource: "mcp",
+                commandId: CommandId.make(`${input.threadId}:agent-enable`),
+                threadId: input.threadId,
+                enabled: true,
+                authorityMessageId: input.authorityMessageId,
+              })
+              .pipe(Effect.flip);
+            assert.instanceOf(refused, Orchestrator.OrchestratorDispatchError);
+            yield* orchestrator.dispatch({
+              type: "thread.continuity.set",
+              creationSource: "mcp",
+              commandId: CommandId.make(`${input.threadId}:agent-disable`),
+              threadId: input.threadId,
+              enabled: false,
+            });
+            assert.isTrue(
+              (yield* orchestrator.getThreadProjection(input.threadId)).thread
+                .continuityAutoEnrollDisabled,
+            );
+            yield* orchestrator.dispatch({
+              type: "thread.continuity.set",
+              creationSource: "mobile",
+              commandId: CommandId.make(`${input.threadId}:human-enable`),
+              threadId: input.threadId,
+              enabled: true,
+              authorityMessageId: input.authorityMessageId,
+            });
+            assert.isFalse(
+              (yield* orchestrator.getThreadProjection(input.threadId)).thread
+                .continuityAutoEnrollDisabled,
+            );
+            yield* orchestrator.dispatch({
+              type: "thread.continuity.set",
+              creationSource: "mcp",
+              commandId: CommandId.make(`${input.threadId}:agent-disable-unopted`),
+              threadId: input.threadId,
+              enabled: false,
+            });
+            const disabled = yield* orchestrator.getThreadProjection(input.threadId);
+            assert.isNull(disabled.thread.continuity);
+            assert.isFalse(disabled.thread.continuityAutoEnrollDisabled);
+          }),
+        ),
+    );
+
+    it.effect.each(["paused", "blocked"] as const)(
+      "automatic enrollment preserves an existing %s record",
+      (disposition) =>
+        withAutoEnrollment(
+          Effect.gen(function* () {
+            const input = yield* seedContinuity(`auto-closed-${disposition}`);
+            const orchestrator = yield* Orchestrator.OrchestratorV2;
+            yield* orchestrator.dispatch({
+              type: "thread.continuity.report",
+              commandId: CommandId.make(`${input.threadId}:report`),
+              threadId: input.threadId,
+              runId: input.run.id,
+              status: disposition,
+              reason: "Keep the existing disposition.",
+            });
+            const before = (yield* orchestrator.getThreadProjection(input.threadId)).thread
+              .continuity;
+            yield* sendHumanFollowup(input.threadId, "status");
+            assert.deepEqual(
+              (yield* orchestrator.getThreadProjection(input.threadId)).thread.continuity,
+              before,
+            );
+          }),
+        ),
+    );
+
+    it.effect.each(["server", "mcp", "provider"] as const)(
+      "human-shaped %s dispatch does not automatically enroll",
+      (source) =>
+        Effect.gen(function* () {
+          const input = yield* seedContinuity(`auto-source-${source}`, undefined, true);
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          yield* finishRun(input.threadId, input.run);
+          yield* withAutoEnrollment(
+            orchestrator.dispatch({
+              type: "message.dispatch",
+              commandId: CommandId.make(`${input.threadId}:synthetic`),
+              threadId: input.threadId,
+              messageId: MessageId.make(`${input.threadId}:synthetic`),
+              text: "Synthetic user-shaped message",
+              createdBy: "user",
+              creationSource: source,
+              attachments: [],
+              dispatchMode: { type: "start_immediately" },
+            }),
+          );
+          assert.isNull(
+            (yield* orchestrator.getThreadProjection(input.threadId)).thread.continuity ?? null,
+          );
+        }),
+    );
+    it.effect.each([
+      "plan",
+      "child",
+      "archive",
+      "snooze",
+      "paused-goal",
+      "scheduled",
+      "sender",
+    ] as const)("%s prevents automatic continuity enrollment", (exclusion) =>
+      Effect.gen(function* () {
+        const input = yield* seedContinuity(`auto-excluded-${exclusion}`, undefined, true);
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        yield* finishRun(input.threadId, input.run);
+        const projection = yield* orchestrator.getThreadProjection(input.threadId);
+        const events = yield* EventSink.EventSinkV2;
+        const now = yield* DateTime.now;
+        if (exclusion === "paused-goal") {
+          const providerThread = projection.providerThreads[0]!;
+          yield* events.write({
+            events: [
+              {
+                id: EventId.make(`${input.threadId}:guard`),
+                type: "provider-thread.updated",
+                threadId: input.threadId,
+                occurredAt: now,
+                payload: {
+                  ...providerThread,
+                  goal: { objective: "Existing native goal", status: "paused" },
+                },
+              },
+            ],
+          });
+        } else {
+          yield* events.write({
+            events: [
+              {
+                id: EventId.make(`${input.threadId}:guard`),
+                type: "thread.metadata-updated",
+                threadId: input.threadId,
+                occurredAt: now,
+                payload: {
+                  ...projection.thread,
+                  ...(exclusion === "plan" ? { interactionMode: "plan" as const } : {}),
+                  ...(exclusion === "child"
+                    ? {
+                        lineage: {
+                          ...projection.thread.lineage,
+                          parentThreadId: input.threadId,
+                          relationshipToParent: "subagent" as const,
+                        },
+                      }
+                    : {}),
+                  ...(exclusion === "archive" ? { archivedAt: now } : {}),
+                  ...(exclusion === "snooze"
+                    ? { snoozedUntil: DateTime.add(now, { hours: 1 }) }
+                    : {}),
+                },
+              },
+            ],
+          });
+        }
+        yield* withAutoEnrollment(
+          orchestrator.dispatch({
+            type: "message.dispatch",
+            commandId: CommandId.make(`${input.threadId}:followup`),
+            threadId: input.threadId,
+            messageId: MessageId.make(`${input.threadId}:followup`),
+            text: "Human-shaped follow-up",
+            createdBy: "user",
+            creationSource: "web",
+            attachments: [],
+            dispatchMode: { type: "start_immediately" },
+            ...(exclusion === "scheduled"
+              ? { scheduledTaskId: ScheduledTaskId.make("auto-scheduled-fixture") }
+              : {}),
+            ...(exclusion === "sender"
+              ? { senderThreadId: ThreadId.make("auto-sender-fixture") }
+              : {}),
+          }),
+        );
+        assert.isNull(
+          (yield* orchestrator.getThreadProjection(input.threadId)).thread.continuity ?? null,
+        );
+      }),
+    );
+
+    it.effect(
+      "explicit disable remains sticky across human messages and explicit enable clears it",
+      () =>
+        withAutoEnrollment(
+          Effect.gen(function* () {
+            const input = yield* seedContinuity("auto-sticky");
+            const orchestrator = yield* Orchestrator.OrchestratorV2;
+            yield* orchestrator.dispatch({
+              type: "thread.continuity.set",
+              creationSource: "web",
+              commandId: CommandId.make(`${input.threadId}:disable`),
+              threadId: input.threadId,
+              enabled: false,
+            });
+            yield* sendHumanFollowup(input.threadId, "status");
+            const disabled = yield* orchestrator.getThreadProjection(input.threadId);
+            assert.isNull(disabled.thread.continuity);
+            assert.isTrue(disabled.thread.continuityAutoEnrollDisabled);
+            assert.isTrue(
+              (yield* orchestrator.getThreadShell(input.threadId))?.continuityAutoEnrollDisabled,
+            );
+            const maintenance = yield* ProjectionMaintenance.ProjectionMaintenanceV2;
+            assert.isTrue((yield* maintenance.rebuild).valid);
+            const replayed = yield* orchestrator.getThreadProjection(input.threadId);
+            assert.isTrue(replayed.thread.continuityAutoEnrollDisabled);
+            assert.isNull(replayed.thread.continuity);
+            yield* sendHumanFollowup(input.threadId, "after-rebuild");
+            assert.isNull(
+              (yield* orchestrator.getThreadProjection(input.threadId)).thread.continuity,
+            );
+            yield* orchestrator.dispatch({
+              type: "thread.continuity.set",
+              creationSource: "web",
+              commandId: CommandId.make(`${input.threadId}:enable`),
+              threadId: input.threadId,
+              enabled: true,
+              authorityMessageId: input.authorityMessageId,
+            });
+            assert.isFalse(
+              (yield* orchestrator.getThreadProjection(input.threadId)).thread
+                .continuityAutoEnrollDisabled,
+            );
+          }),
+        ),
+    );
+
     it.effect(
       "persists one bounded continuation for an unreported completion despite duplicate delivery",
       () =>
@@ -5770,6 +6398,7 @@ it.layer(layerTest.pipe(Layer.provideMerge(SqlitePersistence.layerMemory)))(
         const refused = yield* orchestrator
           .dispatch({
             type: "thread.continuity.set",
+            creationSource: "web",
             commandId: CommandId.make("continuity:foreign-authority"),
             threadId: target.threadId,
             enabled: true,
@@ -5796,6 +6425,7 @@ it.layer(layerTest.pipe(Layer.provideMerge(SqlitePersistence.layerMemory)))(
         const agentAuthority = yield* orchestrator
           .dispatch({
             type: "thread.continuity.set",
+            creationSource: "web",
             commandId: CommandId.make(`${target.threadId}:agent-authority`),
             threadId: target.threadId,
             enabled: true,

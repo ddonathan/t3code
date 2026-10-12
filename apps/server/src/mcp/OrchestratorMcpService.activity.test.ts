@@ -289,6 +289,67 @@ it("MCP re-enrollment for the same authority cannot refill exhausted checks or r
   }).pipe(Effect.provide(layer), Effect.runPromise);
 });
 
+it.each(["enable", "disable"] as const)(
+  "MCP %s cannot change the human opt-out and uses authoritative agent provenance",
+  async (action) => {
+    const shell = {
+      ...liveThreadShell(parentThreadId, { activeRunId: null }),
+      continuity: null,
+      continuityAutoEnrollDisabled: true,
+    };
+    let dispatched = 0;
+    const layer = OrchestratorMcpService.layer.pipe(
+      Layer.provide(
+        Layer.mergeAll(
+          Layer.mock(ThreadManagementService.ThreadManagementService)({
+            getThreadRecords: () => Effect.succeed(idleThreadProjection(shell)),
+            dispatch: (command) =>
+              Effect.sync(() => {
+                dispatched += 1;
+                expect(command).toMatchObject({
+                  type: "thread.continuity.set",
+                  creationSource: "mcp",
+                  enabled: false,
+                });
+                return { sequence: 0, storedEvents: [] };
+              }),
+          }),
+          ServerSettings.layerTest(),
+          Layer.mock(ProviderRegistry.ProviderRegistry)({ getProviders: Effect.succeed([]) }),
+          Layer.mock(ProjectService.ProjectService)({}),
+          Layer.mock(SecretRequests.SecretRequests)({}),
+          Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
+          Layer.mock(ProviderAdapterRegistry.ProviderAdapterRegistryV2)({
+            list: () => Effect.succeed([]),
+          }),
+          NodeCrypto.layer,
+        ),
+      ),
+    );
+    await Effect.gen(function* () {
+      const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+      if (action === "enable") {
+        const refused = yield* service
+          .workContinuity(makeScope(), {
+            action: "enable",
+            authorityMessageId: MessageId.make("real-authority"),
+            clientRequestId: "optout-enable",
+          })
+          .pipe(Effect.flip);
+        expect(refused.code).toBe("invalid_request");
+        expect(dispatched).toBe(0);
+      } else {
+        yield* service.workContinuity(makeScope(), {
+          action: "disable",
+          clientRequestId: "optout-disable",
+        });
+        expect(dispatched).toBe(1);
+      }
+      expect(shell.continuityAutoEnrollDisabled).toBe(true);
+    }).pipe(Effect.provide(layer), Effect.runPromise);
+  },
+);
+
 it.each(["active", "paused", "blocked", "usage_limited", "budget_limited", "complete"] as const)(
   "thread tools preserve a %s native goal independently of execution and clear it on the next read",
   async (status) => {

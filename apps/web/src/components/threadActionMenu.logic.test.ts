@@ -249,14 +249,24 @@ it("continuity enrollment needs a loaded user request and remains hidden on olde
   expect(allIds(baseState)).not.toContain("continuity:enable");
   const unavailable = buildThreadActionMenuItems({
     ...baseState,
-    continuityControl: { canEnable: false, state: null },
+    continuityControl: {
+      canEnable: false,
+      canDisable: false,
+      autoEnrollDisabled: false,
+      state: null,
+    },
   });
   const menu = unavailable.find((item) => item.id === "continuity");
   expect(menu?.children?.find((item) => item.id === "continuity:enable")?.disabled).toBe(true);
   expect(menu?.children?.find((item) => item.id === "continuity:disable")?.disabled).toBe(true);
   const available = buildThreadActionMenuItems({
     ...baseState,
-    continuityControl: { canEnable: true, state: null },
+    continuityControl: {
+      canEnable: true,
+      canDisable: true,
+      autoEnrollDisabled: false,
+      state: null,
+    },
   });
   expect(
     available
@@ -266,7 +276,37 @@ it("continuity enrollment needs a loaded user request and remains hidden on olde
   const readOnly = buildThreadActionMenuItems({
     ...baseState,
     canOperate: false,
-    continuityControl: { canEnable: true, state: null },
+    continuityControl: {
+      canEnable: true,
+      canDisable: true,
+      autoEnrollDisabled: false,
+      state: null,
+    },
   });
   expect(readOnly.find((item) => item.id === "continuity")?.disabled).toBe(true);
+});
+
+it("lets an unenrolled thread opt out before automatic checks begin", () => {
+  const items = buildThreadActionMenuItems({
+    ...baseState,
+    continuityControl: {
+      canEnable: false,
+      canDisable: true,
+      autoEnrollDisabled: false,
+      state: null,
+    },
+  });
+  expect(
+    items
+      .find((item) => item.id === "continuity")
+      ?.children?.find((item) => item.id === "continuity:disable")?.disabled,
+  ).toBe(false);
+
+  const optedOut = buildThreadActionMenuItems({
+    ...baseState,
+    continuityControl: { canEnable: true, canDisable: true, autoEnrollDisabled: true, state: null },
+  }).find((item) => item.id === "continuity");
+  expect(optedOut?.label).toContain("disabled");
+  expect(optedOut?.children?.find((item) => item.id === "continuity:disable")?.disabled).toBe(true);
+  expect(optedOut?.children?.find((item) => item.id === "continuity:enable")?.disabled).toBe(false);
 });

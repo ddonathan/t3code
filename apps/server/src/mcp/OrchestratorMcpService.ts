@@ -2569,6 +2569,11 @@ const make = Effect.gen(function* () {
             "Work continuity changes must belong to the calling thread.",
           );
         }
+        if (input.action === "enable" && parent.thread.continuityAutoEnrollDisabled === true)
+          return yield* failure(
+            "invalid_request",
+            "The user disabled automatic continuation for this thread. Re-enable it in the client before agent enrollment.",
+          );
         if (
           input.action === "enable" &&
           parent.thread.continuity?.authorityMessageId === input.authorityMessageId
@@ -2595,6 +2600,7 @@ const make = Effect.gen(function* () {
                 }
               : {
                   type: "thread.continuity.set",
+                  creationSource: "mcp",
                   commandId,
                   threadId,
                   enabled: input.action === "enable",

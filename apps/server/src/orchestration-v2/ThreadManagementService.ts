@@ -64,6 +64,8 @@ export function withCreationProvenance(
   provenance: ThreadManagementProvenance,
 ): OrchestrationV2Command {
   switch (command.type) {
+    case "thread.continuity.set":
+      return { ...command, creationSource: provenance.creationSource };
     case "thread.create":
     case "message.dispatch":
     case "thread.fork":

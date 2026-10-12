@@ -24,7 +24,13 @@ export function ThreadWorkContinuityMenu({ thread }: { readonly thread: Environm
   const update = useAtomCommand(threadEnvironment.setWorkContinuity, { reportFailure: false });
   const authority = detail?.projection.messages.findLast(
     (message) =>
-      message.role === "user" && message.createdBy === "user" && message.threadId === thread.id,
+      message.role === "user" &&
+      message.createdBy === "user" &&
+      (message.creationSource === "web" || message.creationSource === "mobile") &&
+      message.scheduledTaskId === undefined &&
+      message.senderThreadId === undefined &&
+      message.notification === undefined &&
+      message.threadId === thread.id,
   );
   if (thread.continuity === undefined) return null;
   return (
@@ -33,7 +39,10 @@ export function ThreadWorkContinuityMenu({ thread }: { readonly thread: Environm
       actions={[
         {
           id: "state",
-          title: `Work continuity: ${thread.continuity?.status.replaceAll("_", " ") ?? "off"}`,
+          title: `Work continuity: ${
+            thread.continuity?.status.replaceAll("_", " ") ??
+            (thread.continuityAutoEnrollDisabled ? "disabled for this thread" : "off")
+          }`,
           attributes: { disabled: true },
         },
         {
@@ -44,7 +53,7 @@ export function ThreadWorkContinuityMenu({ thread }: { readonly thread: Environm
         {
           id: "disable",
           title: "Disable continuation checks",
-          attributes: { disabled: !permitted || thread.continuity == null },
+          attributes: { disabled: !permitted || thread.continuityAutoEnrollDisabled === true },
         },
         ...(thread.continuity?.reason
           ? [

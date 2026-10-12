@@ -482,6 +482,15 @@ export const SETTINGS_SEARCH_ITEMS = [
     ],
   },
   {
+    id: "work-continuity-auto-enroll",
+    title: "Automatic continuation checks",
+    to: "/settings/general",
+    scope: "environment-defaults",
+    searchTerms: [
+      "unfinished work keep going stopped agent bounded checks continuity automatically",
+    ],
+  },
+  {
     id: "background-activity",
     title: "Background activity",
     to: "/settings/general",

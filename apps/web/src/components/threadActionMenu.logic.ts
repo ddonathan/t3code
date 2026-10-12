@@ -77,6 +77,8 @@ export interface ThreadActionMenuState {
   readonly canOperate: boolean;
   readonly continuityControl?: {
     readonly canEnable: boolean;
+    readonly canDisable: boolean;
+    readonly autoEnrollDisabled: boolean;
     readonly state: import("@t3tools/contracts").OrchestrationV2WorkContinuity | null;
   };
   readonly branch: string | null;
@@ -183,7 +185,9 @@ export function buildThreadActionMenuItems(
             id: "continuity" as const,
             label:
               state.continuityControl.state == null
-                ? "Work continuity: off"
+                ? state.continuityControl.autoEnrollDisabled
+                  ? "Work continuity: disabled for this thread"
+                  : "Work continuity: off"
                 : `Work continuity: ${state.continuityControl.state.status.replaceAll("_", " ")}`,
             children: [
               {
@@ -194,7 +198,8 @@ export function buildThreadActionMenuItems(
               {
                 id: "continuity:disable" as const,
                 label: "Disable continuation checks",
-                disabled: state.continuityControl.state == null,
+                disabled:
+                  !state.continuityControl.canDisable || state.continuityControl.autoEnrollDisabled,
               },
               ...(state.continuityControl.state?.reason
                 ? [

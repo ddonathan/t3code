@@ -409,6 +409,7 @@ export const OrchestrationV2AppThread = Schema.Struct({
   linkedPullRequest: Schema.optional(Schema.NullOr(ThreadLinkedPullRequest)),
   pullRequests: Schema.optional(Schema.Array(ThreadPullRequestLink)),
   continuity: Schema.optional(Schema.NullOr(OrchestrationV2WorkContinuity)),
+  continuityAutoEnrollDisabled: Schema.optional(Schema.Boolean),
   /** Pull request discovered from the thread's current branch. */
   branchPullRequest: Schema.optional(Schema.NullOr(ThreadLinkedPullRequest)),
   activeProviderThreadId: Schema.NullOr(ProviderThreadId),
@@ -1972,6 +1973,7 @@ export const OrchestrationV2ThreadShell = Schema.Struct({
   linkedPullRequest: Schema.optional(Schema.NullOr(ThreadLinkedPullRequest)),
   pullRequests: Schema.optional(Schema.Array(ThreadPullRequestLink)),
   continuity: Schema.optional(Schema.NullOr(OrchestrationV2WorkContinuity)),
+  continuityAutoEnrollDisabled: Schema.optional(Schema.Boolean),
   /** Pull request discovered from the thread's current branch. */
   branchPullRequest: Schema.optional(Schema.NullOr(ThreadLinkedPullRequest)),
   lineage: OrchestrationV2AppThreadLineage,
@@ -2800,6 +2802,7 @@ export const OrchestrationV2Command = Schema.Union([
   }),
   Schema.Struct({
     type: Schema.Literal("thread.continuity.set"),
+    creationSource: Schema.optional(OrchestrationV2CreationSource),
     commandId: CommandId,
     threadId: ThreadId,
     enabled: Schema.Boolean,

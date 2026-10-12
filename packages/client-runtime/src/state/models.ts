@@ -118,6 +118,7 @@ export interface EnvironmentThreadShell {
   /** Native `/goal` on the active provider thread. */
   readonly goal: OrchestrationV2ProviderGoal | null;
   readonly continuity?: OrchestrationV2ThreadShell["continuity"];
+  readonly continuityAutoEnrollDisabled?: boolean;
   readonly itemCount: number;
   readonly visibleItemCount: number;
   readonly createdAt: string;
@@ -265,6 +266,9 @@ export function presentThreadShell(
     providerInstanceHistory: thread.providerInstanceHistory ?? [],
     goal: thread.goal ?? null,
     ...(thread.continuity === undefined ? {} : { continuity: thread.continuity }),
+    ...(thread.continuityAutoEnrollDisabled === undefined
+      ? {}
+      : { continuityAutoEnrollDisabled: thread.continuityAutoEnrollDisabled }),
     itemCount: thread.itemCount,
     visibleItemCount: thread.visibleItemCount,
     createdAt: iso(thread.createdAt),

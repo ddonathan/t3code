@@ -149,6 +149,10 @@ export function useThreadActionMenu(input: {
             (message) =>
               message.role === "user" &&
               message.createdBy === "user" &&
+              (message.creationSource === "web" || message.creationSource === "mobile") &&
+              message.scheduledTaskId === undefined &&
+              message.senderThreadId === undefined &&
+              message.notification === undefined &&
               message.threadId === threadRef.threadId,
           );
         const now = new Date();
@@ -174,6 +178,12 @@ export function useThreadActionMenu(input: {
                       }),
                     ),
                   state: thread.continuity ?? null,
+                  canDisable: appAtomRegistry.get(
+                    threadEnvironment.setWorkContinuity.permissionAtom(threadRef.environmentId, {
+                      type: "thread.continuity.set",
+                    }),
+                  ),
+                  autoEnrollDisabled: thread.continuityAutoEnrollDisabled === true,
                 },
               }),
           canOperate: readEnvironmentScope(threadRef.environmentId, AuthOrchestrationOperateScope),

@@ -1800,137 +1800,165 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           session.status !== "stopped" &&
           session.status !== "error",
       );
-      yield* writeSystemEvents(
-        [
-          ...(selectionChanged
-            ? [
-                {
-                  type:
-                    queuedRun.providerInstanceId === projection.thread.providerInstanceId
-                      ? ("thread.model-selection-updated" as const)
-                      : ("thread.provider-switched" as const),
-                  threadId,
+      const promotionEvents: Array<Omit<OrchestrationV2DomainEvent, "id">> = [
+        ...(selectionChanged
+          ? [
+              {
+                type:
+                  queuedRun.providerInstanceId === projection.thread.providerInstanceId
+                    ? ("thread.model-selection-updated" as const)
+                    : ("thread.provider-switched" as const),
+                threadId,
+                providerInstanceId: queuedRun.providerInstanceId,
+                occurredAt: now,
+                payload: {
+                  ...projection.thread,
                   providerInstanceId: queuedRun.providerInstanceId,
-                  occurredAt: now,
-                  payload: {
-                    ...projection.thread,
-                    providerInstanceId: queuedRun.providerInstanceId,
-                    modelSelection: queuedRun.modelSelection,
-                    updatedAt: now,
+                  modelSelection: queuedRun.modelSelection,
+                  updatedAt: now,
+                },
+              },
+            ]
+          : []),
+        ...(handoff === null || transferId === null || latestHandoffRun === undefined
+          ? []
+          : [
+              {
+                type: "context-transfer.created" as const,
+                threadId,
+                runId: queuedRun.id,
+                providerInstanceId: queuedRun.providerInstanceId,
+                occurredAt: now,
+                payload: {
+                  id: transferId,
+                  type: "provider_handoff" as const,
+                  sourceThreadId: threadId,
+                  targetThreadId: threadId,
+                  sourcePoint: contextSourcePointForRun(projection, latestHandoffRun),
+                  basePoint:
+                    needsFullContext || targetLastCompletedRun === undefined
+                      ? null
+                      : contextSourcePointForRun(projection, targetLastCompletedRun),
+                  sourceProviderInstanceId: latestHandoffRun.providerInstanceId,
+                  targetProviderInstanceId: queuedRun.providerInstanceId,
+                  targetRunId: queuedRun.id,
+                  status: "consumed" as const,
+                  resolution: {
+                    strategy: needsFullContext
+                      ? ("portable_context" as const)
+                      : ("delta_context" as const),
+                    contextHandoffId: handoff.id,
                   },
+                  createdBy: queuedMessage.createdBy,
+                  error: null,
+                  createdAt: now,
+                  updatedAt: now,
+                  consumedAt: now,
                 },
-              ]
-            : []),
-          ...(handoff === null || transferId === null || latestHandoffRun === undefined
-            ? []
-            : [
-                {
-                  type: "context-transfer.created" as const,
-                  threadId,
-                  runId: queuedRun.id,
-                  providerInstanceId: queuedRun.providerInstanceId,
-                  occurredAt: now,
-                  payload: {
-                    id: transferId,
-                    type: "provider_handoff" as const,
-                    sourceThreadId: threadId,
-                    targetThreadId: threadId,
-                    sourcePoint: contextSourcePointForRun(projection, latestHandoffRun),
-                    basePoint:
-                      needsFullContext || targetLastCompletedRun === undefined
-                        ? null
-                        : contextSourcePointForRun(projection, targetLastCompletedRun),
-                    sourceProviderInstanceId: latestHandoffRun.providerInstanceId,
-                    targetProviderInstanceId: queuedRun.providerInstanceId,
-                    targetRunId: queuedRun.id,
-                    status: "consumed" as const,
-                    resolution: {
-                      strategy: needsFullContext
-                        ? ("portable_context" as const)
-                        : ("delta_context" as const),
-                      contextHandoffId: handoff.id,
-                    },
-                    createdBy: queuedMessage.createdBy,
-                    error: null,
-                    createdAt: now,
-                    updatedAt: now,
-                    consumedAt: now,
-                  },
-                },
-                {
-                  type: "context-handoff.updated" as const,
-                  threadId,
-                  runId: queuedRun.id,
-                  providerInstanceId: queuedRun.providerInstanceId,
-                  occurredAt: now,
-                  payload: handoff,
-                },
-              ]),
-          ...(legacyImportRecoveryHandoff === null
-            ? []
-            : [
-                {
-                  type: "context-handoff.updated" as const,
-                  threadId,
-                  runId: queuedRun.id,
-                  providerInstanceId: queuedRun.providerInstanceId,
-                  occurredAt: now,
-                  payload: legacyImportRecoveryHandoff,
-                },
-              ]),
-          ...(handoffTurnItem === null
-            ? []
-            : [
-                {
-                  type: "turn-item.updated" as const,
-                  threadId,
-                  runId: queuedRun.id,
-                  nodeId: rootNodeId,
-                  providerInstanceId: queuedRun.providerInstanceId,
-                  occurredAt: now,
-                  payload: handoffTurnItem,
-                },
-              ]),
-          ...sessionsToDetach.map((session) => ({
-            type: "provider-session.detached" as const,
-            threadId,
-            driver: session.driver,
-            providerInstanceId: session.providerInstanceId,
-            occurredAt: now,
-            payload: {
-              providerSessionId: session.id,
-              detachedAt: now,
-              reason: "Provider or model selection changed.",
-            },
-          })),
-          ...checkpointEvents,
-          {
-            type: "provider-thread.updated",
-            threadId,
-            providerInstanceId: queuedRun.providerInstanceId,
-            occurredAt: now,
-            payload: providerThread,
+              },
+              {
+                type: "context-handoff.updated" as const,
+                threadId,
+                runId: queuedRun.id,
+                providerInstanceId: queuedRun.providerInstanceId,
+                occurredAt: now,
+                payload: handoff,
+              },
+            ]),
+        ...(legacyImportRecoveryHandoff === null
+          ? []
+          : [
+              {
+                type: "context-handoff.updated" as const,
+                threadId,
+                runId: queuedRun.id,
+                providerInstanceId: queuedRun.providerInstanceId,
+                occurredAt: now,
+                payload: legacyImportRecoveryHandoff,
+              },
+            ]),
+        ...(handoffTurnItem === null
+          ? []
+          : [
+              {
+                type: "turn-item.updated" as const,
+                threadId,
+                runId: queuedRun.id,
+                nodeId: rootNodeId,
+                providerInstanceId: queuedRun.providerInstanceId,
+                occurredAt: now,
+                payload: handoffTurnItem,
+              },
+            ]),
+        ...sessionsToDetach.map((session) => ({
+          type: "provider-session.detached" as const,
+          threadId,
+          driver: session.driver,
+          providerInstanceId: session.providerInstanceId,
+          occurredAt: now,
+          payload: {
+            providerSessionId: session.id,
+            detachedAt: now,
+            reason: "Provider or model selection changed.",
           },
-          {
-            type: "turn-item.updated",
-            threadId,
-            runId: queuedRun.id,
-            nodeId: rootNodeId,
-            providerInstanceId: queuedRun.providerInstanceId,
-            occurredAt: now,
-            payload: notificationTurnItem(userTurnItem, queuedMessage, projection.subagents),
-          },
-          {
-            type: "run.updated",
-            threadId,
-            runId: queuedRun.id,
-            nodeId: rootNodeId,
-            providerInstanceId: queuedRun.providerInstanceId,
-            occurredAt: now,
-            payload: startingRun,
-          },
-        ],
-        [
+        })),
+        ...checkpointEvents,
+        {
+          type: "provider-thread.updated",
+          threadId,
+          providerInstanceId: queuedRun.providerInstanceId,
+          occurredAt: now,
+          payload: providerThread,
+        },
+        {
+          type: "turn-item.updated",
+          threadId,
+          runId: queuedRun.id,
+          nodeId: rootNodeId,
+          providerInstanceId: queuedRun.providerInstanceId,
+          occurredAt: now,
+          payload: notificationTurnItem(userTurnItem, queuedMessage, projection.subagents),
+        },
+        {
+          type: "run.updated",
+          threadId,
+          runId: queuedRun.id,
+          nodeId: rootNodeId,
+          providerInstanceId: queuedRun.providerInstanceId,
+          occurredAt: now,
+          payload: startingRun,
+        },
+      ];
+      const enrollmentEvents = yield* Ref.make(
+        yield* Effect.forEach(promotionEvents, makeSystemEvent),
+      );
+      yield* autoEnrollWorkContinuity(
+        {
+          type: "message.dispatch",
+          commandId,
+          threadId,
+          messageId: queuedMessage.id,
+          text: queuedMessage.text,
+          attachments: queuedMessage.attachments,
+          createdBy: queuedMessage.createdBy,
+          creationSource: queuedMessage.creationSource,
+          ...(queuedMessage.scheduledTaskId === undefined
+            ? {}
+            : { scheduledTaskId: queuedMessage.scheduledTaskId }),
+          ...(queuedMessage.senderThreadId === undefined
+            ? {}
+            : { senderThreadId: queuedMessage.senderThreadId }),
+          ...(queuedMessage.notification === undefined
+            ? {}
+            : { notification: queuedMessage.notification }),
+          dispatchMode: { type: "start_immediately" },
+        },
+        enrollmentEvents,
+        projection.thread,
+      );
+      yield* eventSink.writeWithEffects({
+        events: yield* Ref.get(enrollmentEvents),
+        effects: [
           ...sessionsToDetach.map((session) => ({
             id: `effect:${commandId}:provider-session.detach:${session.id}`,
             commandId,
@@ -1948,7 +1976,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             request: { type: "provider-turn.start", runId: queuedRun.id },
           },
         ],
-      );
+      });
     }).pipe(Effect.catch((cause) => failQueuedRunStart(threadId, cause)));
 
   const resumeQueuedRuns = Effect.gen(function* () {
@@ -6598,6 +6626,90 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       yield* Ref.update(effects, (existing) => [...existing, pendingEffect]);
     });
 
+  const autoEnrollWorkContinuity = Effect.fn("orchestrationV2.autoEnrollWorkContinuity")(function* (
+    command: Extract<OrchestrationV2Command, { readonly type: "message.dispatch" }>,
+    events: Ref.Ref<Array<OrchestrationV2DomainEvent>>,
+    previousThread: OrchestrationV2AppThread,
+  ) {
+    // Server question answers and scheduled/MCP messages can also carry a user actor.
+    if (
+      command.createdBy !== "user" ||
+      (command.creationSource !== "web" && command.creationSource !== "mobile") ||
+      command.scheduledTaskId !== undefined ||
+      command.senderThreadId !== undefined ||
+      command.notification !== undefined ||
+      command.manualContinuationOfRunId !== undefined ||
+      command.usageLimitContinuationOfRunId !== undefined
+    )
+      return;
+    const enrollmentTime = yield* DateTime.now;
+    if (
+      (previousThread.continuity != null && previousThread.continuity.status !== "complete") ||
+      previousThread.continuityAutoEnrollDisabled === true ||
+      previousThread.lineage.parentThreadId !== null ||
+      previousThread.interactionMode === "plan" ||
+      previousThread.archivedAt !== null ||
+      previousThread.deletedAt !== null ||
+      previousThread.settledOverride === "settled" ||
+      (previousThread.snoozedUntil != null &&
+        DateTime.toEpochMillis(previousThread.snoozedUntil) >
+          DateTime.toEpochMillis(enrollmentTime))
+    )
+      return;
+    const settings = yield* serverSettings.getSettings.pipe(mapDispatchError(command));
+    if (!settings.workContinuityAutoEnroll) return;
+    const projection = yield* getProjectionWithPendingEvents(command.threadId, events);
+    const thread = projection.thread;
+    const message = projection.messages.find((candidate) => candidate.id === command.messageId);
+    const acceptedRun = projection.runs.find(
+      (run) => run.id === message?.runId && run.userMessageId === command.messageId,
+    );
+    const providerThread = projection.providerThreads.find(
+      (candidate) => candidate.id === thread.activeProviderThreadId,
+    );
+    const now = yield* DateTime.now;
+    if (
+      (thread.continuity != null && thread.continuity.status !== "complete") ||
+      thread.continuityAutoEnrollDisabled === true ||
+      thread.lineage.parentThreadId !== null ||
+      thread.interactionMode === "plan" ||
+      thread.archivedAt !== null ||
+      thread.deletedAt !== null ||
+      thread.settledOverride === "settled" ||
+      (thread.snoozedUntil != null &&
+        DateTime.toEpochMillis(thread.snoozedUntil) > DateTime.toEpochMillis(now)) ||
+      (providerThread?.goal != null && providerThread.goal.status !== "complete") ||
+      message === undefined ||
+      acceptedRun === undefined
+    )
+      return;
+    yield* emit(
+      events,
+      command,
+    )({
+      type: "thread.metadata-updated",
+      threadId: thread.id,
+      providerInstanceId: thread.providerInstanceId,
+      occurredAt: now,
+      payload: {
+        ...thread,
+        continuity: {
+          generation: command.commandId,
+          authorityMessageId: message.id,
+          maxChecks: 3,
+          checksRemaining: 3,
+          status: "active",
+          reason:
+            "Supervising the existing human request under this environment's continuation setting.",
+          lastReportedRunId: null,
+          lastAdvancedRunId: null,
+          wait: null,
+        },
+        updatedAt: now,
+      },
+    });
+  });
+
   const dispatchDelegatedTaskRequest = Effect.fn("orchestrationV2.dispatch.delegatedTaskRequest")(
     function* (
       command: Extract<OrchestrationV2Command, { readonly type: "delegated_task.request" }>,
@@ -10696,7 +10808,15 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           threadId: thread.id,
           providerInstanceId: thread.providerInstanceId,
           occurredAt: now,
-          payload: { ...thread, continuity, updatedAt: now },
+          payload: {
+            ...thread,
+            continuity,
+            ...(command.type === "thread.continuity.set" &&
+            (command.creationSource === "web" || command.creationSource === "mobile")
+              ? { continuityAutoEnrollDisabled: !command.enabled }
+              : {}),
+            updatedAt: now,
+          },
         });
       });
     const refuse = (cause: string) =>
@@ -10710,6 +10830,14 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         yield* write(null);
         return;
       }
+      if (
+        thread.continuityAutoEnrollDisabled === true &&
+        command.creationSource !== "web" &&
+        command.creationSource !== "mobile"
+      )
+        return yield* refuse(
+          "The user disabled automatic continuation for this thread. Re-enable it in the client before agent enrollment.",
+        );
       const authority = projection.messages.find(
         (message) => message.id === command.authorityMessageId,
       );
@@ -10720,7 +10848,11 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         thread.lineage.parentThreadId !== null ||
         thread.interactionMode === "plan" ||
         authority?.createdBy !== "user" ||
-        authority.role !== "user"
+        authority.role !== "user" ||
+        (authority.creationSource !== "web" && authority.creationSource !== "mobile") ||
+        authority.scheduledTaskId !== undefined ||
+        authority.senderThreadId !== undefined ||
+        authority.notification !== undefined
       )
         return yield* refuse(
           "Continuity requires an active root implementation thread and a user-authored request in that thread.",
@@ -10758,6 +10890,11 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         return yield* refuse(
           "The reporting run is no longer the live root turn, or continuity is disabled.",
         );
+      const authorityRun = projection.runs.find(
+        (run) => run.userMessageId === current.authorityMessageId,
+      );
+      if (authorityRun !== undefined && latest.ordinal < authorityRun.ordinal)
+        return yield* refuse("A run preceding the enrolled request cannot report its disposition.");
       if (["complete", "paused", "blocked"].includes(current.status))
         return yield* refuse(
           "Re-enable supervision explicitly before reopening a completed, paused, or blocked assignment.",
@@ -10932,7 +11069,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         commandId: command.commandId,
         threadId: thread.id,
         messageId: MessageId.make(`message:work-continuity:${current.generation}:${ended.id}`),
-        text: `T3 is checking the existing user request ${current.authorityMessageId} because the previous turn ended without a completion or verified wait. This grants no new scope. Verify the latest state, preserve active owners and retry limits, and continue ready authorized work. Before ending, use t3_work_continuity action=report with this run's activeRunId from t3_thread_read and a truthful disposition: complete with evidence, waiting with a live supported wake, needs_input, paused, or blocked with the reason. A continue report means keep executing ready work. No native goal is created or resumed.`,
+        text: `T3 is checking the existing user request ${current.authorityMessageId} because the previous turn ended without a completion or verified wait. This grants no new scope. Verify the latest state, preserve active owners and retry limits, and continue ready authorized work. Before ending, use t3_work_continuity action=report with this run's activeRunId from t3_thread_read and a truthful disposition: complete with evidence, waiting with a live supported wake, needs_input, paused, or blocked with the reason. If the original enrolled request only asked for an answer or report, answer it and report complete; a later status question does not replace an existing execution assignment. A continue report means keep executing ready work. No native goal is created or resumed.`,
         notification: {
           source: { kind: "system" },
           outcome: "updated",
@@ -11130,6 +11267,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           });
         }
         yield* dispatchMessage(command, events, effects);
+        yield* autoEnrollWorkContinuity(command, events, thread);
         yield* recordSubagentFollowup(command, events).pipe(mapDispatchError(command));
         break;
       }

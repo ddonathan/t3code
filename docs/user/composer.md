@@ -319,3 +319,9 @@ including filenames or folders containing `#` or `?`.
 
 On mobile, select a PDF attachment or link to open it. iOS uses the native viewer;
 Android opens a compatible installed file viewer.
+
+### Keep an assignment moving
+
+Work continuity checks help an unfinished assignment resume when an agent ends a turn. Enable them from the thread action menu on web or desktop, or the Continuity menu in the expanded mobile composer. Open the thread and load a user request first; that request binds the checks to the existing assignment. The default allows three continuation checks, then stops with a visible disposition rather than nudging indefinitely.
+
+The menu shows whether checks are off, active, waiting, complete, paused, blocked, or need your input, and includes the agent's reported reason. Disable checks from the same menu. Stop, snooze, settle, archive, switching providers, and Plan mode also clear them. Re-enable checks explicitly after reopening or unsnoozing an assignment; new user messages do not refill the allowance. Registered delegated-task and pull-request waits resume on their existing events; an unregistered wait cannot imply automatic resumption. These checks do not create a native goal or expand the assignment's scope, and an agent's completion report is not independent verification.

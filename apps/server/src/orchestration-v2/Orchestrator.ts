@@ -52,6 +52,7 @@ import {
   latestProviderTurnForAttempt,
   orchestrationV2RunWorkStartedAt,
   ProviderInstanceId,
+  resolveProviderInstanceEnabled,
   ProviderInteractionMode,
   type ProviderSessionId,
   RunId,
@@ -66,6 +67,7 @@ import {
   pendingBackgroundTurnItems,
 } from "@t3tools/shared/orchestrationV2PendingBackgroundWork";
 import * as Context from "effect/Context";
+import * as Cause from "effect/Cause";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
@@ -91,6 +93,7 @@ import { isRestartNoteSource } from "./RestartBackgroundNote.ts";
 import { isUndeliveredMailboxSteer } from "./NotificationMailbox.ts";
 import { EventSinkV2 } from "./EventSink.ts";
 import * as EffectOutbox from "./EffectOutbox.ts";
+import * as ServerSettings from "../serverSettings.ts";
 import type { OrchestrationEffectRequestV2, PendingOrchestrationEffectV2 } from "./EffectOutbox.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ThreadCommandExecutor from "./ThreadCommandExecutor.ts";
@@ -267,6 +270,7 @@ export const OrchestratorV2Error = Schema.Union([
   OrchestratorThreadAboveModeLimitError,
 ]);
 export type OrchestratorV2Error = typeof OrchestratorV2Error.Type;
+const isOrchestratorV2Error = Schema.is(OrchestratorV2Error);
 
 export interface OrchestratorV2DispatchResult {
   readonly sequence: number;
@@ -448,6 +452,9 @@ function commandThreadId(command: OrchestrationV2ServerCommand): ThreadId {
     case "thread.visit":
     case "thread.mark-unread":
     case "thread.metadata.update":
+    case "thread.continuity.set":
+    case "thread.continuity.report":
+    case "thread.continuity.advance":
     case "thread.pull-request.link":
     case "thread.pull-request.unlink":
     case "thread.pull-request-link.sync":
@@ -528,6 +535,27 @@ function isBlockingRun(run: OrchestrationV2Run): boolean {
   );
 }
 
+function latestWorkContinuityRun(
+  runs: ReadonlyArray<OrchestrationV2Run>,
+  continuity: NonNullable<OrchestrationV2AppThread["continuity"]>,
+) {
+  const executed = latestExecutedRun(runs);
+  const unstarted = runs
+    .filter(
+      (run) =>
+        run.startedAt === null &&
+        ["failed", "cancelled", "interrupted", "rolled_back"].includes(run.status) &&
+        (run.userMessageId === continuity.authorityMessageId ||
+          run.userMessageId.startsWith(`message:work-continuity:${continuity.generation}:`)),
+    )
+    .toSorted((a, b) => DateTime.Order(b.requestedAt, a.requestedAt))[0];
+  return unstarted !== undefined &&
+    (executed === null ||
+      DateTime.Order(unstarted.requestedAt, executed.startedAt ?? executed.requestedAt) > 0)
+    ? unstarted
+    : executed;
+}
+
 /**
  * A parent thread is "live" for wake purposes while a run is still producing
  * agent output. A run parked at "waiting" is post-terminal drain, so its agent
@@ -581,6 +609,22 @@ function isTerminalDelegatedTaskStatus(status: OrchestrationV2Subagent["status"]
     status === "failed" ||
     status === "cancelled" ||
     status === "interrupted"
+  );
+}
+
+/** A completed child still owns a wake while delivery is pending or claimed. */
+function hasDelegatedCompletionWake(
+  task: OrchestrationV2Subagent,
+  run: OrchestrationV2Run,
+): boolean {
+  return (
+    task.origin === "app_owned" &&
+    task.runId === run.id &&
+    (run.delegatedCompletion?.disposition ?? "open") === "open" &&
+    task.completionDelivery?.state !== "disposed" &&
+    (!isTerminalDelegatedTaskStatus(task.status) ||
+      task.completionDelivery?.state === "pending" ||
+      task.completionDelivery?.state === "claimed")
   );
 }
 
@@ -809,6 +853,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
   const idAllocator = yield* IdAllocator.IdAllocatorV2;
   const projects = yield* ProjectStore.ProjectStoreV2;
   const projectionStore = yield* ProjectionStoreV2;
+  const serverSettings = yield* ServerSettings.ServerSettingsService;
   const effectOutbox = yield* EffectOutbox.EffectOutboxV2;
   const nextTurnItemOrdinal = (
     projection: Pick<OrchestrationV2ThreadProjection, "thread"> &
@@ -2793,6 +2838,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           return {
             ...thread,
             archivedAt: now,
+            continuity: null,
             titleRegeneration: null,
             pullRequests: thread.pullRequests?.map((link) => withPullRequestWatch(link, undefined)),
             updatedAt: now,
@@ -2808,6 +2854,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           return {
             ...thread,
             settledOverride: "settled",
+            continuity: null,
             settledAt: alreadySettled ? thread.settledAt : (command.settledAt ?? now),
             pullRequests: thread.pullRequests?.map((link) => withPullRequestWatch(link, undefined)),
             unsettledAt: null,
@@ -2836,6 +2883,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           return {
             ...thread,
             snoozedUntil,
+            continuity: null,
             limitRecovery: thread.limitRecovery ? { ...thread.limitRecovery, snooze: false } : null,
             snoozedAt: existingSnoozedAt ?? now,
             updatedAt: existingSnoozedAt === null ? now : thread.updatedAt,
@@ -3186,12 +3234,20 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         case "thread.runtime-mode.set":
           return { ...thread, runtimeMode: command.runtimeMode, updatedAt: now };
         case "thread.interaction-mode.set":
-          return { ...thread, interactionMode: command.interactionMode, updatedAt: now };
+          return {
+            ...thread,
+            interactionMode: command.interactionMode,
+            ...(command.interactionMode === "plan" ? { continuity: null } : {}),
+            updatedAt: now,
+          };
         case "thread.model-selection.set":
         case "provider.switch":
           return {
             ...thread,
             providerInstanceId: command.modelSelection.instanceId,
+            ...(thread.providerInstanceId !== command.modelSelection.instanceId
+              ? { continuity: null }
+              : {}),
             modelSelection: command.modelSelection,
             updatedAt: now,
           };
@@ -7932,7 +7988,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     });
 
   const loadProjectionForCommand = <K extends ProjectionRecordField>(
-    command: OrchestrationV2Command,
+    command: OrchestrationV2ServerCommand,
     fields: ReadonlyArray<K>,
     filter?: ProjectionRecordFilter,
   ) =>
@@ -8736,6 +8792,15 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     Effect.gen(function* () {
       const emitEvent = emit(input.events, input.command);
       const { thread, runs, subagents } = input.projection;
+      if (thread.continuity != null) {
+        yield* emitEvent({
+          type: "thread.metadata-updated",
+          threadId: thread.id,
+          providerInstanceId: thread.providerInstanceId,
+          occurredAt: input.now,
+          payload: { ...thread, continuity: null },
+        });
+      }
       for (const run of runs) {
         // A resumed queue can have a lower ordinal than a pending continuation source.
         // Stop must reach those sources even when interrupting the resumed run succeeds.
@@ -8764,6 +8829,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           occurredAt: input.now,
           payload: {
             ...thread,
+            continuity: null,
             pullRequests: pullRequests.map((link) => withPullRequestWatch(link, undefined)),
           },
         });
@@ -10505,6 +10571,332 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       }),
     );
 
+  const dispatchWorkContinuity = Effect.fn("orchestrationV2.dispatch.workContinuity")(function* (
+    command: Extract<
+      OrchestrationV2ServerCommand,
+      {
+        readonly type:
+          | "thread.continuity.set"
+          | "thread.continuity.report"
+          | "thread.continuity.advance";
+      }
+    >,
+    events: Ref.Ref<Array<OrchestrationV2DomainEvent>>,
+    effects: Ref.Ref<Array<PendingOrchestrationEffectV2>>,
+  ): Effect.fn.Return<void, OrchestratorV2Error> {
+    const pendingEvents = yield* Ref.get(events);
+    const projection =
+      pendingEvents.length > 0
+        ? yield* getProjectionWithPendingEvents(command.threadId, events).pipe(
+            mapDispatchError(command),
+          )
+        : yield* loadProjectionForCommand(
+            command,
+            [
+              "runs",
+              "messages",
+              "subagents",
+              "providerThreads",
+              "providerSessions",
+              "runtimeRequests",
+            ],
+            {
+              messageIds:
+                command.type === "thread.continuity.set" && command.authorityMessageId !== undefined
+                  ? [command.authorityMessageId]
+                  : [],
+            },
+          );
+    const thread = projection.thread;
+    const current = thread.continuity;
+    const write = (continuity: OrchestrationV2AppThread["continuity"], targetEvents = events) =>
+      Effect.gen(function* () {
+        const now = yield* DateTime.now;
+        yield* emit(
+          targetEvents,
+          command,
+        )({
+          type: "thread.metadata-updated",
+          threadId: thread.id,
+          providerInstanceId: thread.providerInstanceId,
+          occurredAt: now,
+          payload: { ...thread, continuity, updatedAt: now },
+        });
+      });
+    const refuse = (cause: string) =>
+      new OrchestratorDispatchError({
+        commandId: command.commandId,
+        commandType: command.type,
+        cause,
+      });
+    if (command.type === "thread.continuity.set") {
+      if (!command.enabled) {
+        yield* write(null);
+        return;
+      }
+      const authority = projection.messages.find(
+        (message) => message.id === command.authorityMessageId,
+      );
+      if (
+        thread.archivedAt !== null ||
+        thread.deletedAt !== null ||
+        thread.settledOverride === "settled" ||
+        thread.lineage.parentThreadId !== null ||
+        thread.interactionMode === "plan" ||
+        authority?.createdBy !== "user" ||
+        authority.role !== "user"
+      )
+        return yield* refuse(
+          "Continuity requires an active root implementation thread and a user-authored request in that thread.",
+        );
+      yield* write({
+        generation: command.commandId,
+        authorityMessageId: authority.id,
+        maxChecks: command.maxChecks ?? 3,
+        checksRemaining: command.maxChecks ?? 3,
+        status: "active",
+        reason: "Supervising the existing user request.",
+        lastReportedRunId: null,
+        lastAdvancedRunId: null,
+        wait: null,
+      });
+      const ended = latestExecutedRun(projection.runs);
+      if (ended?.status === "completed") {
+        yield* dispatchWorkContinuity(
+          {
+            type: "thread.continuity.advance",
+            commandId: command.commandId,
+            threadId: thread.id,
+            endedRunId: ended.id,
+            generation: command.commandId,
+          },
+          events,
+          effects,
+        );
+      }
+      return;
+    }
+    if (command.type === "thread.continuity.report") {
+      const latest = latestExecutedRun(projection.runs);
+      if (current == null || latest?.id !== command.runId || !isBlockingRun(latest))
+        return yield* refuse(
+          "The reporting run is no longer the live root turn, or continuity is disabled.",
+        );
+      if (["complete", "paused", "blocked"].includes(current.status))
+        return yield* refuse(
+          "Re-enable supervision explicitly before reopening a completed, paused, or blocked assignment.",
+        );
+      if (command.status === "waiting") {
+        const wait = command.wait;
+        const live =
+          wait?.kind === "pull_request"
+            ? threadPullRequestsOf(thread).some(
+                (link) =>
+                  link.watch !== undefined &&
+                  threadPullRequestKeysEqual(link, normalizeThreadPullRequestKey(wait)),
+              )
+            : wait?.kind === "delegated_task" &&
+              projection.subagents.some(
+                (task) => task.id === wait.taskId && hasDelegatedCompletionWake(task, latest),
+              );
+        if (!live)
+          return yield* refuse(
+            "A waiting disposition requires a live pull request watch or owned delegated-task completion wake. Report an unsupported dependency as blocked.",
+          );
+      } else if (command.wait != null) {
+        return yield* refuse("Only a waiting disposition can carry a wake binding.");
+      }
+      yield* write({
+        ...current,
+        status: command.status === "continue" ? "active" : command.status,
+        reason: command.reason,
+        lastReportedRunId: latest.id,
+        wait: command.wait ?? null,
+      });
+      return;
+    }
+    if (
+      current == null ||
+      current.generation !== command.generation ||
+      current.lastAdvancedRunId === command.endedRunId ||
+      ["complete", "paused", "blocked"].includes(current.status)
+    )
+      return;
+    const ended = latestWorkContinuityRun(projection.runs, current);
+    if (ended?.id !== command.endedRunId) return;
+    if (projection.runs.some(isBlockingRun)) return;
+    if (
+      ended.status === "cancelled" &&
+      (yield* awaitsRestartContinuation(ended).pipe(mapDispatchError(command)))
+    )
+      return;
+    if (["failed", "cancelled", "interrupted", "rolled_back"].includes(ended.status)) {
+      yield* write({
+        ...current,
+        status: "blocked",
+        lastAdvancedRunId: ended.id,
+        wait: null,
+        reason: `The last run ${ended.status}; supervision will not blindly retry it. Inspect the failure or interruption before resuming.`,
+      });
+      return;
+    }
+    if (
+      ended.status !== "completed" ||
+      thread.archivedAt !== null ||
+      thread.deletedAt !== null ||
+      thread.settledOverride === "settled" ||
+      thread.lineage.parentThreadId !== null ||
+      thread.interactionMode === "plan" ||
+      (thread.snoozedUntil != null &&
+        DateTime.toEpochMillis(thread.snoozedUntil) >
+          DateTime.toEpochMillis(yield* DateTime.now)) ||
+      ended.providerInstanceId !== thread.providerInstanceId ||
+      projection.runs.some((run) => isBlockingRun(run) || run.status === "queued") ||
+      projection.runtimeRequests.some((request) => request.status === "pending") ||
+      (yield* stopReachedRun(command, thread.id, ended.id))
+    )
+      return;
+    const providerThread = projection.providerThreads.find(
+      (candidate) => candidate.id === thread.activeProviderThreadId,
+    );
+    if (providerThread?.goal != null && providerThread.goal.status !== "complete") {
+      yield* write({
+        ...current,
+        status: "paused",
+        reason: `The native goal is ${providerThread.goal.status}; independent checks are paused because the goal controls continuation.`,
+        wait: null,
+      });
+      return;
+    }
+    const settings = yield* serverSettings.getSettings.pipe(mapDispatchError(command));
+    const instance = settings.providerInstances[thread.providerInstanceId];
+    if (instance !== undefined && !resolveProviderInstanceEnabled(instance)) {
+      yield* write({
+        ...current,
+        status: "blocked",
+        reason:
+          "The selected provider is disabled. Enable it or select an available provider before resuming.",
+        wait: null,
+      });
+      return;
+    }
+    if (current.lastReportedRunId === ended.id && current.status === "waiting") {
+      const wait = current.wait;
+      const live =
+        wait?.kind === "pull_request"
+          ? threadPullRequestsOf(thread).some(
+              (link) =>
+                link.watch !== undefined &&
+                threadPullRequestKeysEqual(link, normalizeThreadPullRequestKey(wait)),
+            )
+          : wait?.kind === "delegated_task" &&
+            projection.subagents.some(
+              (task) => task.id === wait.taskId && hasDelegatedCompletionWake(task, ended),
+            );
+      if (live) return;
+      yield* write({
+        ...current,
+        status: "blocked",
+        reason:
+          "The recorded dependency wake is no longer registered. Review its current result before resuming.",
+        wait: null,
+      });
+      return;
+    }
+    if (current.lastReportedRunId === ended.id && current.status !== "active") return;
+    const liveChildren = projection.subagents.filter((task) =>
+      hasDelegatedCompletionWake(task, ended),
+    );
+    if (liveChildren.length > 0) {
+      yield* write({
+        ...current,
+        status: "waiting",
+        reason: "Waiting for an owned delegated task; its completion wakes this thread.",
+        lastReportedRunId: ended.id,
+        wait: { kind: "delegated_task", taskId: liveChildren[0]!.id },
+      });
+      return;
+    }
+    if (current.checksRemaining === 0) {
+      yield* write({
+        ...current,
+        status: "blocked",
+        lastAdvancedRunId: ended.id,
+        reason:
+          "The continuation-check allowance is exhausted. Work is not verified complete; review the latest progress before re-enabling supervision.",
+        wait: null,
+      });
+      return;
+    }
+    const candidateEvents = yield* Ref.make([...(yield* Ref.get(events))]);
+    const candidateEffects = yield* Ref.make([...(yield* Ref.get(effects))]);
+    yield* write(
+      {
+        ...current,
+        status: "active",
+        checksRemaining: current.checksRemaining - 1,
+        lastAdvancedRunId: ended.id,
+        wait: null,
+        reason:
+          "The previous turn ended without a current completion or verified wait; checking the unfinished request.",
+      },
+      candidateEvents,
+    );
+    const started = yield* dispatchMessage(
+      {
+        type: "message.dispatch",
+        commandId: command.commandId,
+        threadId: thread.id,
+        messageId: MessageId.make(`message:work-continuity:${current.generation}:${ended.id}`),
+        text: `T3 is checking the existing user request ${current.authorityMessageId} because the previous turn ended without a completion or verified wait. This grants no new scope. Verify the latest state, preserve active owners and retry limits, and continue ready authorized work. Before ending, use t3_work_continuity action=report with this run's activeRunId from t3_thread_read and a truthful disposition: complete with evidence, waiting with a live supported wake, needs_input, paused, or blocked with the reason. A continue report means keep executing ready work. No native goal is created or resumed.`,
+        notification: {
+          source: { kind: "system" },
+          outcome: "updated",
+          summary: "Checking unfinished work",
+          detail: "A supervised turn ended without a current completion or verified wait.",
+        },
+        attachments: [],
+        dispatchMode: { type: "queue_after_active" },
+        createdBy: "agent",
+        creationSource: "server",
+      },
+      candidateEvents,
+      candidateEffects,
+    ).pipe(
+      Effect.as(true),
+      Effect.catchCauseIf(
+        (cause) => !Cause.hasInterruptsOnly(cause),
+        (cause) =>
+          Effect.gen(function* () {
+            const failure = Cause.squash(cause);
+            yield* write({
+              ...current,
+              status: "blocked",
+              wait: null,
+              reason:
+                "The continuation could not start. No check allowance was spent; inspect provider capabilities, permissions, or context handoff before resuming.",
+            });
+            yield* Effect.logWarning("work-continuity.dispatch-refused", {
+              incident: "work_continuity_dispatch_refused",
+              action: "start continuation check",
+              observed: {
+                threadId: thread.id,
+                sourceRunId: ended.id,
+                providerInstanceId: thread.providerInstanceId,
+              },
+              guard: isOrchestratorV2Error(failure) ? failure._tag : "continuation_planning_defect",
+              next: "Inspect the selected provider and normal message dispatch prerequisites.",
+            });
+            return false;
+          }),
+      ),
+    );
+    if (started) {
+      yield* Ref.set(events, yield* Ref.get(candidateEvents));
+      yield* Ref.set(effects, yield* Ref.get(candidateEffects));
+    }
+  });
+
   const dispatchOnce = Effect.fn("orchestrationV2.dispatch.once")(function* (
     command: OrchestrationV2ServerCommand,
   ): Effect.fn.Return<
@@ -10600,6 +10992,11 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           }),
         );
       }
+      case "thread.continuity.set":
+      case "thread.continuity.report":
+      case "thread.continuity.advance":
+        yield* dispatchWorkContinuity(command, events, effects);
+        break;
       case "thread.archive":
       case "thread.unarchive":
       case "thread.settle":
@@ -10890,6 +11287,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         planned.events.length > 0 ||
         command.type === "thread.background-work.settle" ||
         command.type === "thread.stop" ||
+        command.type === "thread.continuity.advance" ||
         command.type === "subagent.stop"
           ? Effect.succeed(planned)
           : Effect.fail(
@@ -11036,6 +11434,44 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         : threadDispatch.withLock(parentThreadId, dispatch);
     });
 
+  const advanceWorkContinuity = (threadId: ThreadId, trigger?: string) =>
+    Effect.gen(function* () {
+      const thread = yield* projectionStore.getThread(threadId);
+      const continuity = thread.continuity;
+      if (continuity == null || ["complete", "paused", "blocked"].includes(continuity.status))
+        return;
+      const records = yield* projectionStore.getThreadRecords(threadId, ["runs"]);
+      const ended = latestWorkContinuityRun(records.runs, continuity);
+      if (
+        ended == null ||
+        !["completed", "failed", "cancelled", "interrupted", "rolled_back"].includes(
+          ended.status,
+        ) ||
+        continuity.lastAdvancedRunId === ended.id
+      )
+        return;
+      const commandId =
+        trigger === undefined
+          ? yield* idAllocator.allocate.command({
+              fixtureName: "work-continuity",
+              commandName: "recover",
+            })
+          : CommandId.make(
+              `command:work-continuity:${continuity.generation}:${ended.id}:${trigger}`,
+            );
+      yield* dispatchWithReceipt({
+        type: "thread.continuity.advance",
+        commandId,
+        threadId,
+        endedRunId: ended.id,
+        generation: continuity.generation,
+      });
+    }).pipe(
+      Effect.catchCause((cause) =>
+        Effect.logWarning("Failed to advance supervised work", { threadId, cause }),
+      ),
+    );
+
   const handleTerminalRun = (stored: OrchestrationV2StoredEvent) =>
     Effect.gen(function* () {
       const threadId = stored.event.threadId;
@@ -11066,6 +11502,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             Effect.logWarning("Failed to start the next queued V2 run", { threadId, cause }),
           ),
         );
+      if (stored.event.type === "run.updated") {
+        yield* advanceWorkContinuity(threadId, `terminal:${stored.sequence}`);
+      }
       // After the queue decision: a provider failure holds the child's queued
       // wakes, and only then is the failed run the task's result.
       const parentThreadId = yield* appOwnedSubagentParentThreadId(threadId);
@@ -11105,12 +11544,46 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       Effect.forkDetach,
     );
 
+  for (const eventType of [
+    "thread.metadata-updated",
+    "thread.pull-request-synced",
+    "thread.unsnoozed",
+    "runtime-request.updated",
+    "subagent.updated",
+  ] as const) {
+    yield* eventSink.stream({ afterSequence: terminalEventsAfterSequence, eventType }).pipe(
+      Stream.filter(
+        (stored) =>
+          !String(stored.commandId).startsWith("command:runtime-reconcile:") &&
+          (stored.event.type === "runtime-request.updated" ||
+            stored.event.type === "subagent.updated" ||
+            ("continuity" in stored.event.payload && stored.event.payload.continuity != null)),
+      ),
+      Stream.runForEach((stored) =>
+        advanceWorkContinuity(stored.event.threadId, `state:${stored.sequence}`),
+      ),
+      Effect.forkDetach,
+    );
+  }
+
   // Settles child results and completion deliveries whose runs ended without
   // the listener above: before this boot, or in runtime reconciliation, which
   // it skips. Startup runs this after reconciliation and before the effect
   // worker. Queue recovery instead holds unstarted runs until an explicit
   // queue.resume command arrives.
   const recoverDelegatedTasks = Effect.gen(function* () {
+    const continuityThreadIds = yield* projectionStore
+      .getRecoveryThreadIds("continuity")
+      .pipe(
+        Effect.catchCause((cause) =>
+          Effect.logWarning("Failed to inspect supervised work during recovery", { cause }).pipe(
+            Effect.as([]),
+          ),
+        ),
+      );
+    for (const threadId of continuityThreadIds) {
+      yield* advanceWorkContinuity(threadId);
+    }
     yield* projectionStore.getRecoveryThreadIds("subagent-results").pipe(
       Effect.flatMap((threadIds) =>
         Effect.forEach(
@@ -11225,6 +11698,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
 
   const recoverDelegatedTask = (threadId: ThreadId, sourceRunId: RunId) =>
     Effect.gen(function* () {
+      // Revalidate roots too, after the restart effect has durably settled.
+      yield* advanceWorkContinuity(threadId);
       const parentThreadId = yield* appOwnedSubagentParentThreadId(threadId);
       if (parentThreadId === undefined) return;
       yield* threadDispatch.withLock(
@@ -11377,6 +11852,7 @@ export const layer: Layer.Layer<
   | ProviderSwitchServiceV2
   | ProjectionStoreV2
   | RuntimePolicyV2
+  | ServerSettings.ServerSettingsService
   | ThreadForkServiceV2
 > = Layer.effect(OrchestratorV2, makeOrchestrator()).pipe(
   Layer.provide(ThreadCommandExecutor.layer),

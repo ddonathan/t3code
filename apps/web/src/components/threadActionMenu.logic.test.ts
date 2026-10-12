@@ -244,3 +244,29 @@ describe("buildDraftActionMenuItems", () => {
     expect(items.at(-1)).toMatchObject({ label: "Discard draft", destructive: true });
   });
 });
+
+it("continuity enrollment needs a loaded user request and remains hidden on older servers", () => {
+  expect(allIds(baseState)).not.toContain("continuity:enable");
+  const unavailable = buildThreadActionMenuItems({
+    ...baseState,
+    continuityControl: { canEnable: false, state: null },
+  });
+  const menu = unavailable.find((item) => item.id === "continuity");
+  expect(menu?.children?.find((item) => item.id === "continuity:enable")?.disabled).toBe(true);
+  expect(menu?.children?.find((item) => item.id === "continuity:disable")?.disabled).toBe(true);
+  const available = buildThreadActionMenuItems({
+    ...baseState,
+    continuityControl: { canEnable: true, state: null },
+  });
+  expect(
+    available
+      .find((item) => item.id === "continuity")
+      ?.children?.find((item) => item.id === "continuity:enable")?.disabled,
+  ).toBe(false);
+  const readOnly = buildThreadActionMenuItems({
+    ...baseState,
+    canOperate: false,
+    continuityControl: { canEnable: true, state: null },
+  });
+  expect(readOnly.find((item) => item.id === "continuity")?.disabled).toBe(true);
+});

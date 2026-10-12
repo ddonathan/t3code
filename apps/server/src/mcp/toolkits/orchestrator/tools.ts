@@ -1,5 +1,7 @@
 import {
   OrchestratorMcpCapabilitiesResult,
+  OrchestratorMcpWorkContinuityInput,
+  OrchestratorMcpWorkContinuityResult,
   OrchestratorMcpCreateThreadsInput,
   OrchestratorMcpCreateThreadsResult,
   OrchestratorMcpDelegateTaskInput,
@@ -256,6 +258,16 @@ const ThreadInterruptTool = Tool.make("t3_thread_interrupt", {
   .annotate(Tool.Title, "Interrupt a T3 thread")
   .annotate(Tool.Destructive, true);
 
+const WorkContinuityTool = Tool.make("t3_work_continuity", {
+  description:
+    "Enable or disable bounded, durable supervision of an existing user-authorized assignment in the calling thread, or report its current disposition. All actions are restricted to the calling thread; OAuth clients without a calling thread must use the client controls. Enable requires the id of a real user authority message, with maxChecks defaulting to 3 (1–20). It grants no new scope and does not create or resume a native goal. Report requires the active runId; reports for another thread or a stale run are rejected. Report continue while keeping authorized work moving; use waiting only with a registered delegated_task or pull_request dependency. Missing reports at completion trigger a bounded continuation check. Complete is the agent's judgment, not independent acceptance. Stop clears supervision. Use clientRequestId to retry safely. Read/list continuity exposes current disposition and remaining checks separately from execution status.",
+  parameters: OrchestratorMcpWorkContinuityInput,
+  success: OrchestratorMcpWorkContinuityResult,
+  failure: OrchestratorMcpFailure,
+  failureMode: "return",
+  dependencies,
+}).annotate(Tool.Title, "Manage work continuity");
+
 export const OrchestratorToolkit = Toolkit.make(
   OrchestratorCapabilitiesTool,
   DelegateTaskTool,
@@ -273,4 +285,5 @@ export const OrchestratorToolkit = Toolkit.make(
   ThreadSendTool,
   ThreadWaitTool,
   ThreadInterruptTool,
+  WorkContinuityTool,
 );

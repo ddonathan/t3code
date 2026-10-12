@@ -5,6 +5,7 @@ import * as Option from "effect/Option";
 import { Atom } from "effect/reactivity";
 import {
   WS_METHODS,
+  ORCHESTRATION_V2_WS_METHODS,
   type EnvironmentId,
   type OrchestrationV2ShellSnapshot,
 } from "@t3tools/contracts";
@@ -42,6 +43,8 @@ import {
   type ReorderPinnedThreadInput,
   type ReorderActiveThreadInput,
   type SetThreadAutoSettleInput,
+  type SetThreadWorkContinuityInput,
+  setThreadWorkContinuity,
   type SettleThreadInput,
   type SnoozeThreadInput,
   type StartThreadTurnInput,
@@ -212,6 +215,13 @@ export function createThreadEnvironmentAtoms<R, E>(
     reorderPin: createEnvironmentCommand(runtime, {
       label: "environment-data:commands:thread:reorder-pin",
       execute: (input: ReorderPinnedThreadInput) => reorderPinnedThread(input),
+      scheduler,
+      concurrency,
+    }),
+    setWorkContinuity: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:commands:thread:set-work-continuity",
+      tag: ORCHESTRATION_V2_WS_METHODS.dispatchCommand,
+      execute: (input: SetThreadWorkContinuityInput) => setThreadWorkContinuity(input),
       scheduler,
       concurrency,
     }),

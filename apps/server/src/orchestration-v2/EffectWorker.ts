@@ -71,6 +71,8 @@ export interface OrchestrationEffectExecutorV2Shape {
     effect: EffectOutbox.OrchestrationEffectV2,
     options?: { readonly willRetry: boolean },
   ) => Effect.Effect<void, OrchestrationEffectExecutionError>;
+  /** Runs after durable terminal settlement, never while an execution retry is pending. */
+  readonly afterSettled?: (effect: EffectOutbox.OrchestrationEffectV2) => Effect.Effect<void>;
 }
 
 export class OrchestrationEffectExecutorV2 extends Context.Service<
@@ -105,6 +107,10 @@ export const layerExecutor: Layer.Layer<
     const threads = yield* ThreadManagementService.ThreadManagementService;
     const settings = yield* ServerSettings.ServerSettingsService;
     return OrchestrationEffectExecutorV2.of({
+      afterSettled: (effect) =>
+        effect.request.type === "provider-runtime.continue"
+          ? threads.recoverDelegatedTask(effect.threadId, effect.request.sourceRunId)
+          : Effect.void,
       execute: (effect, options) => {
         const willRetry = options?.willRetry ?? false;
         switch (effect.request.type) {
@@ -596,6 +602,16 @@ export const layerWithOptions = (
                   }),
                 ),
               );
+      const afterSettled = (effect: EffectOutbox.OrchestrationEffectV2) =>
+        Effect.suspend(() => executor.afterSettled?.(effect) ?? Effect.void).pipe(
+          Effect.catchCause((cause) =>
+            Effect.logWarning("Failed to recover thread after effect settlement", {
+              effectId: effect.id,
+              effectType: effect.request.type,
+              cause,
+            }),
+          ),
+        );
       const terminalizeClaim = (
         effect: EffectOutbox.OrchestrationEffectV2,
         cause: Cause.Cause<unknown>,
@@ -610,10 +626,17 @@ export const layerWithOptions = (
           .pipe(
             Effect.flatMap((failed) =>
               failed
-                ? Effect.logError("Terminalized process-bound effect after settlement failure", {
-                    effectId: effect.id,
-                    effectType: effect.request.type,
-                  })
+                ? afterSettled(effect).pipe(
+                    Effect.andThen(
+                      Effect.logError(
+                        "Terminalized process-bound effect after settlement failure",
+                        {
+                          effectId: effect.id,
+                          effectType: effect.request.type,
+                        },
+                      ),
+                    ),
+                  )
                 : Effect.logWarning(
                     "Could not terminalize process-bound effect after worker lost its lease",
                     {
@@ -714,6 +737,7 @@ export const layerWithOptions = (
                   cause: "The worker no longer owns the effect lease.",
                 });
               }
+              yield* afterSettled(effect);
               return true;
             }).pipe(Effect.onError((cause) => recoverPostSuccessSettlement(effect, cause)));
           }
@@ -752,6 +776,9 @@ export const layerWithOptions = (
               effectId: effect.id,
               cause: "The worker no longer owns the effect lease.",
             });
+          }
+          if (nonRetryable || effect.attemptCount >= maxAttempts) {
+            yield* afterSettled(effect);
           }
           return true;
         }).pipe(

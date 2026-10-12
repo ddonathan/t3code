@@ -1081,7 +1081,7 @@ export const StorageCleanupSettings = Schema.Struct({
 export type StorageCleanupSettings = typeof StorageCleanupSettings.Type;
 
 export const ServerSettings = Schema.Struct({
-  workContinuityAutoEnroll: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
+  workContinuityAutoEnroll: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(true))),
   // Null means no client has migrated this preference yet; an empty value is
   // authoritative so another device cannot resurrect cleared preferences.
   favorites: Schema.NullOr(ModelFavorites).pipe(Schema.withDecodingDefault(Effect.succeed(null))),

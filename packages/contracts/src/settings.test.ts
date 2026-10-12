@@ -24,8 +24,8 @@ const encodeServerSettings = Schema.encodeSync(ServerSettings);
 const decodeClaudeSettings = Schema.decodeUnknownSync(ClaudeSettings);
 
 describe("work continuity auto enrollment", () => {
-  it("keeps automatic enrollment disabled when decoding old settings", () => {
-    expect(decodeServerSettings({}).workContinuityAutoEnroll).toBe(false);
+  it("enables automatic enrollment when decoding old settings without the key", () => {
+    expect(decodeServerSettings({}).workContinuityAutoEnroll).toBe(true);
   });
   it("round-trips the environment enrollment toggle without changing other settings", () => {
     expect(decodeServerSettingsPatch({ workContinuityAutoEnroll: true })).toEqual({

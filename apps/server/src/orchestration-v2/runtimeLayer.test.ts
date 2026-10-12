@@ -844,6 +844,8 @@ it.layer(layerTest)("OrchestrationV2LayerLive", (it) => {
 
   it.effect("resolves delivery intent against the active run and starts after it completes", () =>
     Effect.gen(function* () {
+      const settings = yield* ServerSettings.ServerSettingsService;
+      yield* settings.updateSettings({ workContinuityAutoEnroll: false });
       const orchestrator = yield* Orchestrator.OrchestratorV2;
       const eventSink = yield* EventSink.EventSinkV2;
       const outbox = yield* EffectOutbox.EffectOutboxV2;
@@ -3256,6 +3258,8 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
     "does not admit a restart continuation of a %s run with only lost background work",
     (status) =>
       Effect.gen(function* () {
+        const settings = yield* ServerSettings.ServerSettingsService;
+        yield* settings.updateSettings({ workContinuityAutoEnroll: false });
         const orchestrator = yield* Orchestrator.OrchestratorV2;
         const eventSink = yield* EventSink.EventSinkV2;
         const threadId = ThreadId.make(`runtime-layer-restart-${status}-source`);
@@ -5725,7 +5729,17 @@ it.layer(layerTest.pipe(Layer.provideMerge(SqlitePersistence.layerMemory)))(
         yield* settings.updateSettings({ workContinuityAutoEnroll: true });
         return yield* program.pipe(
           Effect.ensuring(
-            settings.updateSettings({ workContinuityAutoEnroll: false }).pipe(Effect.orDie),
+            settings.updateSettings({ workContinuityAutoEnroll: true }).pipe(Effect.orDie),
+          ),
+        );
+      });
+    const withoutAutoEnrollment = <A, E, R>(program: Effect.Effect<A, E, R>) =>
+      Effect.gen(function* () {
+        const settings = yield* ServerSettings.ServerSettingsService;
+        yield* settings.updateSettings({ workContinuityAutoEnroll: false });
+        return yield* program.pipe(
+          Effect.ensuring(
+            settings.updateSettings({ workContinuityAutoEnroll: true }).pipe(Effect.orDie),
           ),
         );
       });
@@ -5745,13 +5759,42 @@ it.layer(layerTest.pipe(Layer.provideMerge(SqlitePersistence.layerMemory)))(
       );
 
     it.effect("disabled auto enrollment leaves accepted human messages unenrolled", () =>
-      Effect.gen(function* () {
-        const input = yield* seedContinuity("auto-off", undefined, true);
-        const orchestrator = yield* Orchestrator.OrchestratorV2;
-        assert.isNull(
-          (yield* orchestrator.getThreadProjection(input.threadId)).thread.continuity ?? null,
-        );
-      }),
+      withoutAutoEnrollment(
+        Effect.gen(function* () {
+          const input = yield* seedContinuity("auto-off", undefined, true);
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          assert.isNull(
+            (yield* orchestrator.getThreadProjection(input.threadId)).thread.continuity ?? null,
+          );
+        }),
+      ),
+    );
+
+    it.effect(
+      "auto enrollment is on by default and spends exactly one check after a missing terminal report",
+      () =>
+        Effect.gen(function* () {
+          const input = yield* seedContinuity("auto-default", undefined, true);
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const before = (yield* orchestrator.getThreadProjection(input.threadId)).thread
+            .continuity;
+          assert.equal(before?.authorityMessageId, input.authorityMessageId);
+          assert.equal(before?.checksRemaining, 3);
+          const events = yield* EventSink.EventSinkV2;
+          const started = yield* events
+            .stream({ afterSequence: yield* events.latestSequence(), eventType: "run.created" })
+            .pipe(
+              Stream.filter((stored) => stored.event.threadId === input.threadId),
+              Stream.take(1),
+              Stream.runCollect,
+              Effect.forkChild({ startImmediately: true }),
+            );
+          yield* finishRun(input.threadId, input.run);
+          yield* Fiber.join(started);
+          const after = yield* orchestrator.getThreadProjection(input.threadId);
+          assert.lengthOf(after.runs, 2);
+          assert.equal(after.thread.continuity?.checksRemaining, 2);
+        }),
     );
 
     it.effect(
@@ -5803,7 +5846,7 @@ it.layer(layerTest.pipe(Layer.provideMerge(SqlitePersistence.layerMemory)))(
       "enabling the setting alone does not enroll or wake existing work, but a queued human turn does",
       () =>
         Effect.gen(function* () {
-          const input = yield* seedContinuity("auto-queued", undefined, true);
+          const input = yield* withoutAutoEnrollment(seedContinuity("auto-queued", undefined, true));
           const orchestrator = yield* Orchestrator.OrchestratorV2;
           yield* withAutoEnrollment(
             Effect.gen(function* () {
@@ -5962,7 +6005,7 @@ it.layer(layerTest.pipe(Layer.provideMerge(SqlitePersistence.layerMemory)))(
       "cancelling the queued authority blocks supervision without spending or replacing its allowance",
       () =>
         Effect.gen(function* () {
-          const input = yield* seedContinuity("auto-queued-cancel", undefined, true);
+          const input = yield* withoutAutoEnrollment(seedContinuity("auto-queued-cancel", undefined, true));
           const orchestrator = yield* Orchestrator.OrchestratorV2;
           yield* withAutoEnrollment(
             Effect.gen(function* () {
@@ -6190,6 +6233,7 @@ it.layer(layerTest.pipe(Layer.provideMerge(SqlitePersistence.layerMemory)))(
     it.effect.each(["server", "mcp", "provider"] as const)(
       "human-shaped %s dispatch does not automatically enroll",
       (source) =>
+        withoutAutoEnrollment(
         Effect.gen(function* () {
           const input = yield* seedContinuity(`auto-source-${source}`, undefined, true);
           const orchestrator = yield* Orchestrator.OrchestratorV2;
@@ -6211,6 +6255,7 @@ it.layer(layerTest.pipe(Layer.provideMerge(SqlitePersistence.layerMemory)))(
             (yield* orchestrator.getThreadProjection(input.threadId)).thread.continuity ?? null,
           );
         }),
+        ),
     );
     it.effect.each([
       "plan",
@@ -6221,6 +6266,7 @@ it.layer(layerTest.pipe(Layer.provideMerge(SqlitePersistence.layerMemory)))(
       "scheduled",
       "sender",
     ] as const)("%s prevents automatic continuity enrollment", (exclusion) =>
+      withoutAutoEnrollment(
       Effect.gen(function* () {
         const input = yield* seedContinuity(`auto-excluded-${exclusion}`, undefined, true);
         const orchestrator = yield* Orchestrator.OrchestratorV2;
@@ -6296,6 +6342,7 @@ it.layer(layerTest.pipe(Layer.provideMerge(SqlitePersistence.layerMemory)))(
           (yield* orchestrator.getThreadProjection(input.threadId)).thread.continuity ?? null,
         );
       }),
+      ),
     );
 
     it.effect(
@@ -6479,10 +6526,10 @@ it.layer(layerTest.pipe(Layer.provideMerge(SqlitePersistence.layerMemory)))(
             })
             .pipe(Effect.flip);
           assert.instanceOf(refused, Orchestrator.OrchestratorDispatchError);
-          assert.equal(
-            (yield* orchestrator.getThreadProjection(input.threadId)).thread.continuity?.status,
-            "complete",
-          );
+          const reenrolled = (yield* orchestrator.getThreadProjection(input.threadId)).thread
+            .continuity;
+          assert.equal(reenrolled?.status, "active");
+          assert.equal(reenrolled?.authorityMessageId, MessageId.make(`${input.threadId}:new-request`));
         }),
     );
 

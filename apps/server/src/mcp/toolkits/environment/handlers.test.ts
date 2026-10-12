@@ -51,6 +51,8 @@ const layerEnvironment = Layer.mock(Environment.ServerEnvironment)({
 
 it.effect("updates allowed MCP preferences without enabling automatic continuity", () =>
   Effect.gen(function* () {
+    const seedSettings = yield* Settings.ServerSettingsService;
+    yield* seedSettings.updateSettings({ workContinuityAutoEnroll: false });
     const server = yield* McpServer.McpServer;
     const result = yield* server
       .callTool({

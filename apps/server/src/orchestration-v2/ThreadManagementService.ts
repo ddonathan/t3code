@@ -925,6 +925,14 @@ const make = Effect.gen(function* () {
   )(function* (input) {
     const shell = input.byOwnAgent ? yield* orchestrator.getThreadShell(input.threadId) : null;
     if (shell != null && shell.activeRunId !== null) {
+      // A pending own-agent settle is a deliberate end: supervision must not
+      // spend a continuation check on the turn that is about to settle.
+      yield* dispatch({
+        type: "thread.continuity.set",
+        commandId: CommandId.make(`${input.commandId}:continuity-off`),
+        threadId: input.threadId,
+        enabled: false,
+      }).pipe(Effect.ignoreCause({ log: true }));
       yield* settleAfterRun({
         projectId: shell.projectId,
         threadId: shell.id,

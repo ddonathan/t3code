@@ -8,6 +8,7 @@ import {
   type OrchestrationV2ThreadShell,
   type OrchestrationV2ProviderGoal,
   OrchestratorMcpThreadListResult,
+  OrchestratorMcpWorkContinuityInput,
   OrchestratorMcpThreadReadResult,
   ProjectId,
   ProviderDriverKind,
@@ -16,6 +17,8 @@ import {
   ScheduledTaskId,
   ThreadId,
 } from "@t3tools/contracts";
+import { McpServer } from "effect/ai";
+import * as McpHttpServer from "./McpHttpServer.ts";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -49,6 +52,7 @@ const customCodexInstanceId = ProviderInstanceId.make("codex-custom-workspace");
 const parentInstanceId = ProviderInstanceId.make("codex");
 const encodeThreadRead = Schema.encodeEffect(OrchestratorMcpThreadReadResult);
 const encodeThreadList = Schema.encodeEffect(OrchestratorMcpThreadListResult);
+const decodeContinuityInput = Schema.decodeUnknownEffect(OrchestratorMcpWorkContinuityInput);
 const decodeThreadRead = Schema.decodeEffect(OrchestratorMcpThreadReadResult);
 
 const makeScope = (): McpInvocationContext.McpInvocationScope => ({
@@ -117,6 +121,59 @@ function makeRun(input: {
     completedAt: input.status === "cancelled" || input.status === "completed" ? now : null,
   };
 }
+
+it("the actual orchestrator MCP toolkit registers continuity with an object wire schema", async () => {
+  const layer = McpHttpServer.layerOrchestratorToolkit.pipe(
+    Layer.provideMerge(McpServer.McpServer.layer),
+    Layer.provide(
+      Layer.mergeAll(
+        Layer.mock(ThreadManagementService.ThreadManagementService)({}),
+        ServerSettings.layerTest(),
+        Layer.mock(ProviderRegistry.ProviderRegistry)({}),
+        Layer.mock(ProjectService.ProjectService)({}),
+        Layer.mock(SecretRequests.SecretRequests)({}),
+        Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
+        Layer.mock(ProviderAdapterRegistry.ProviderAdapterRegistryV2)({}),
+        NodeCrypto.layer,
+      ),
+    ),
+  );
+  await Effect.gen(function* () {
+    const server = yield* McpServer.McpServer;
+    const continuity = server.tools.find(({ tool }) => tool.name === "t3_work_continuity");
+    expect(continuity?.tool.inputSchema.type).toBe("object");
+  }).pipe(Effect.provide(layer), Effect.scoped, Effect.runPromise);
+});
+
+it("the continuity object codec still rejects missing action authority and malformed reports", async () => {
+  await Effect.gen(function* () {
+    for (const input of [
+      { action: "enable" },
+      { action: "report", status: "complete", reason: "Done" },
+      { action: "report", runId: activeRunId, status: "complete", reason: "   " },
+    ]) {
+      const refused = yield* decodeContinuityInput(input).pipe(Effect.flip);
+      expect(refused._tag).toBe("SchemaError");
+    }
+    const enable = yield* decodeContinuityInput({
+      action: "enable",
+      authorityMessageId: "authority-message",
+    });
+    expect(enable).toEqual({ action: "enable", authorityMessageId: "authority-message" });
+    const report = yield* decodeContinuityInput({
+      action: "report",
+      runId: activeRunId,
+      status: "complete",
+      reason: " Done ",
+    });
+    expect(report).toEqual({
+      action: "report",
+      runId: activeRunId,
+      status: "complete",
+      reason: "Done",
+    });
+  }).pipe(Effect.runPromise);
+});
 
 it("continuity mutations cannot target a different thread and read/list preserve the durable disposition", async () => {
   const continuity: OrchestrationV2WorkContinuity = {

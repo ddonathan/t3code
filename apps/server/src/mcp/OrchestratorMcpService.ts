@@ -35,6 +35,8 @@ import {
   type OrchestratorMcpListScheduledTasksInput,
   type ProjectId,
   type OrchestratorMcpThreadDetail,
+  type OrchestratorMcpWorkContinuityInput,
+  type OrchestratorMcpWorkContinuityResult,
   type OrchestratorMcpThreadInterruptInput,
   type OrchestratorMcpThreadInterruptResult,
   type OrchestratorMcpThreadListInput,
@@ -170,6 +172,10 @@ export interface OrchestratorMcpServiceShape {
     scope: McpInvocationScope,
     input: OrchestratorMcpThreadListInput,
   ) => Effect.Effect<OrchestratorMcpThreadListResult, OrchestratorMcpFailure>;
+  readonly workContinuity: (
+    scope: McpInvocationScope,
+    input: OrchestratorMcpWorkContinuityInput,
+  ) => Effect.Effect<OrchestratorMcpWorkContinuityResult, OrchestratorMcpFailure>;
   readonly readThread: (
     scope: McpInvocationScope,
     input: OrchestratorMcpThreadReadInput,
@@ -712,6 +718,7 @@ function listItemFromShell(
     creationSource: shell.creationSource,
     status: shell.activityRunStatus ?? shell.status,
     ...listGoal(shell.goal),
+    continuity: shell.continuity ?? null,
     latestRunId: shell.latestRunId,
     providerInstanceId: shell.modelSelection.instanceId,
     model: shell.modelSelection.model,
@@ -754,6 +761,7 @@ function threadDetail(
     creationSource: projection.thread.creationSource,
     status: active?.status ?? latest?.status ?? "idle",
     goal: shell.goal ?? null,
+    continuity: shell.continuity ?? null,
     latestRunId: latest?.id ?? null,
     activeRunId: active?.id ?? null,
     providerInstanceId: projection.thread.modelSelection.instanceId,
@@ -2547,6 +2555,60 @@ const make = Effect.gen(function* () {
           nextPosition: page.at(-1)?.position ?? null,
           hasMore: timeline.hasMore,
         } satisfies OrchestratorMcpThreadReadResult;
+      }),
+    workContinuity: (scope, input) =>
+      Effect.gen(function* () {
+        const { parent } = yield* loadCaller(scope);
+        const threadId = input.threadId ?? parent?.thread.id;
+        if (threadId === undefined) {
+          return yield* failure("target_required", "Pass threadId when no calling thread exists.");
+        }
+        if (parent?.thread.id !== threadId) {
+          return yield* failure(
+            "invalid_request",
+            "Work continuity changes must belong to the calling thread.",
+          );
+        }
+        if (
+          input.action === "enable" &&
+          parent.thread.continuity?.authorityMessageId === input.authorityMessageId
+        ) {
+          return { threadId, continuity: parent.thread.continuity };
+        }
+        const key = yield* requestKey(input.clientRequestId);
+        const commandId = stableCommandId({
+          scope,
+          requestKey: key,
+          operation: `continuity-${input.action}`,
+        });
+        yield* threadManagement
+          .dispatch(
+            input.action === "report"
+              ? {
+                  type: "thread.continuity.report",
+                  commandId,
+                  threadId,
+                  runId: input.runId,
+                  status: input.status,
+                  reason: input.reason,
+                  ...(input.wait === undefined ? {} : { wait: input.wait }),
+                }
+              : {
+                  type: "thread.continuity.set",
+                  commandId,
+                  threadId,
+                  enabled: input.action === "enable",
+                  ...(input.action === "enable"
+                    ? {
+                        authorityMessageId: input.authorityMessageId,
+                        ...(input.maxChecks === undefined ? {} : { maxChecks: input.maxChecks }),
+                      }
+                    : {}),
+                },
+          )
+          .pipe(Effect.mapError(threadManagementFailure));
+        const updated = yield* loadProjection(threadId);
+        return { threadId, continuity: updated.thread.continuity ?? null };
       }),
     sendToThread: (scope, input) =>
       Effect.gen(function* () {

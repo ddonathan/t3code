@@ -361,6 +361,38 @@ export const OrchestrationV2LimitRecoveryUpdate = Schema.Struct({
 );
 export type OrchestrationV2LimitRecoveryUpdate = typeof OrchestrationV2LimitRecoveryUpdate.Type;
 
+export const OrchestrationV2WorkContinuityMaxChecks = PositiveInt.check(
+  Schema.isLessThanOrEqualTo(20),
+);
+export const OrchestrationV2WorkContinuityReason = TrimmedNonEmptyString.check(
+  Schema.isMaxLength(2_000),
+);
+export const OrchestrationV2WorkContinuityWait = Schema.Union([
+  Schema.Struct({ kind: Schema.Literal("delegated_task"), taskId: NodeId }),
+  Schema.Struct({ kind: Schema.Literal("pull_request"), ...ThreadPullRequestKey.fields }),
+]);
+export type OrchestrationV2WorkContinuityWait = typeof OrchestrationV2WorkContinuityWait.Type;
+export const OrchestrationV2WorkContinuityReportStatus = Schema.Literals([
+  "continue",
+  "waiting",
+  "needs_input",
+  "complete",
+  "paused",
+  "blocked",
+]);
+export const OrchestrationV2WorkContinuity = Schema.Struct({
+  generation: CommandId,
+  authorityMessageId: MessageId,
+  checksRemaining: NonNegativeInt,
+  maxChecks: OrchestrationV2WorkContinuityMaxChecks,
+  status: Schema.Literals(["active", "waiting", "needs_input", "complete", "paused", "blocked"]),
+  reason: Schema.String.check(Schema.isMaxLength(2_000)),
+  lastReportedRunId: Schema.NullOr(RunId),
+  lastAdvancedRunId: Schema.NullOr(RunId),
+  wait: Schema.optional(Schema.NullOr(OrchestrationV2WorkContinuityWait)),
+});
+export type OrchestrationV2WorkContinuity = typeof OrchestrationV2WorkContinuity.Type;
+
 export const OrchestrationV2AppThread = Schema.Struct({
   ...OrchestrationV2CreationFields,
   id: ThreadId,
@@ -376,6 +408,7 @@ export const OrchestrationV2AppThread = Schema.Struct({
       pre-linking servers still decode. */
   linkedPullRequest: Schema.optional(Schema.NullOr(ThreadLinkedPullRequest)),
   pullRequests: Schema.optional(Schema.Array(ThreadPullRequestLink)),
+  continuity: Schema.optional(Schema.NullOr(OrchestrationV2WorkContinuity)),
   /** Pull request discovered from the thread's current branch. */
   branchPullRequest: Schema.optional(Schema.NullOr(ThreadLinkedPullRequest)),
   activeProviderThreadId: Schema.NullOr(ProviderThreadId),
@@ -1938,6 +1971,7 @@ export const OrchestrationV2ThreadShell = Schema.Struct({
   /** Pull request the user linked to this thread (#8160). */
   linkedPullRequest: Schema.optional(Schema.NullOr(ThreadLinkedPullRequest)),
   pullRequests: Schema.optional(Schema.Array(ThreadPullRequestLink)),
+  continuity: Schema.optional(Schema.NullOr(OrchestrationV2WorkContinuity)),
   /** Pull request discovered from the thread's current branch. */
   branchPullRequest: Schema.optional(Schema.NullOr(ThreadLinkedPullRequest)),
   lineage: OrchestrationV2AppThreadLineage,
@@ -2765,6 +2799,30 @@ export const OrchestrationV2Command = Schema.Union([
     reason: Schema.Literal("user"),
   }),
   Schema.Struct({
+    type: Schema.Literal("thread.continuity.set"),
+    commandId: CommandId,
+    threadId: ThreadId,
+    enabled: Schema.Boolean,
+    authorityMessageId: Schema.optional(MessageId),
+    maxChecks: Schema.optional(OrchestrationV2WorkContinuityMaxChecks),
+  }).check(
+    Schema.makeFilter(
+      (command) =>
+        !command.enabled ||
+        command.authorityMessageId !== undefined ||
+        "Enabling continuity requires authorityMessageId.",
+    ),
+  ),
+  Schema.Struct({
+    type: Schema.Literal("thread.continuity.report"),
+    commandId: CommandId,
+    threadId: ThreadId,
+    runId: RunId,
+    status: OrchestrationV2WorkContinuityReportStatus,
+    reason: OrchestrationV2WorkContinuityReason,
+    wait: Schema.optional(Schema.NullOr(OrchestrationV2WorkContinuityWait)),
+  }),
+  Schema.Struct({
     type: Schema.Literal("thread.snooze"),
     commandId: CommandId,
     threadId: ThreadId,
@@ -3160,6 +3218,13 @@ export type OrchestrationV2Command = typeof OrchestrationV2Command.Type;
  * send them.
  */
 const OrchestrationV2InternalCommand = Schema.Union([
+  Schema.Struct({
+    type: Schema.Literal("thread.continuity.advance"),
+    commandId: CommandId,
+    threadId: ThreadId,
+    endedRunId: RunId,
+    generation: CommandId,
+  }),
   /**
    * Records what a pull request watch saw, and wakes the agent in the same transaction when
    * `wake` is set. Rejected once the watch started at `startedAt` has ended, and a wake is

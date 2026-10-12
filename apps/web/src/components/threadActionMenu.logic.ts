@@ -14,6 +14,10 @@ export type ThreadActionMenuId =
   | "unpin"
   | "settle"
   | "unsettle"
+  | "continuity"
+  | "continuity:enable"
+  | "continuity:disable"
+  | "continuity:reason"
   | "auto-settle"
   | "auto-settle:enabled"
   | "auto-settle:disabled"
@@ -71,6 +75,10 @@ export function buildDraftActionMenuItems(options: {
 
 export interface ThreadActionMenuState {
   readonly canOperate: boolean;
+  readonly continuityControl?: {
+    readonly canEnable: boolean;
+    readonly state: import("@t3tools/contracts").OrchestrationV2WorkContinuity | null;
+  };
   readonly branch: string | null;
   /**
    * Project scoping for the thread list. Null on surfaces with no scoped
@@ -168,6 +176,38 @@ export function buildThreadActionMenuItems(
               },
         ]
       : []),
+    ...(state.continuityControl === undefined
+      ? []
+      : [
+          {
+            id: "continuity" as const,
+            label:
+              state.continuityControl.state == null
+                ? "Work continuity: off"
+                : `Work continuity: ${state.continuityControl.state.status.replaceAll("_", " ")}`,
+            children: [
+              {
+                id: "continuity:enable" as const,
+                label: "Enable continuation checks",
+                disabled: !state.continuityControl.canEnable,
+              },
+              {
+                id: "continuity:disable" as const,
+                label: "Disable continuation checks",
+                disabled: state.continuityControl.state == null,
+              },
+              ...(state.continuityControl.state?.reason
+                ? [
+                    {
+                      id: "continuity:reason" as const,
+                      label: state.continuityControl.state.reason.slice(0, 200),
+                      disabled: true,
+                    },
+                  ]
+                : []),
+            ],
+          },
+        ]),
     { id: "rename", label: "Rename thread", icon: "pencil", separatorBefore: true },
     ...(state.supports.titleRegeneration
       ? [

@@ -149,7 +149,8 @@ export type ProjectionRecoveryKind =
   | "queued-runs"
   | "runtime"
   | "subagent-results"
-  | "delegated-completions";
+  | "delegated-completions"
+  | "continuity";
 
 /** Persisted state needed for limit recovery, without transcript or fork history. */
 export type ProjectionLimitRecoveryCandidate = Pick<
@@ -547,6 +548,12 @@ function needsRecovery(
 ): boolean {
   if (projection.thread.deletedAt !== null) return false;
   switch (kind) {
+    case "continuity":
+      return (
+        projection.thread.archivedAt === null &&
+        projection.thread.continuity != null &&
+        ["active", "waiting", "needs_input"].includes(projection.thread.continuity.status)
+      );
     case "queued-runs":
       return (
         projection.thread.archivedAt === null &&
@@ -1542,6 +1549,7 @@ export function threadShellFromProjection(
     lastVisitedAt: projection.thread.lastVisitedAt,
     titleRegeneration: projection.thread.titleRegeneration ?? null,
     limitRecovery: projection.thread.limitRecovery ?? null,
+    continuity: projection.thread.continuity ?? null,
     deletedAt: projection.thread.deletedAt,
   };
 }
@@ -1797,6 +1805,7 @@ function shellFromState(input: {
     lastVisitedAt: input.state.thread.lastVisitedAt,
     titleRegeneration: input.state.thread.titleRegeneration ?? null,
     limitRecovery: input.state.thread.limitRecovery ?? null,
+    continuity: input.state.thread.continuity ?? null,
     deletedAt: input.state.thread.deletedAt,
   };
 }
@@ -3578,6 +3587,14 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       function* (kind: ProjectionRecoveryKind) {
         const candidates = (() => {
           switch (kind) {
+            case "continuity":
+              return sql`
+                SELECT thread_id FROM orchestration_v2_projection_threads
+                WHERE archived_at IS NULL AND deleted_at IS NULL
+                  AND CASE WHEN json_valid(payload_json) THEN
+                    json_extract(payload_json, '$.continuity.status') IN ('active', 'waiting', 'needs_input')
+                    ELSE 0 END
+              `;
             case "queued-runs":
               return sql`
                 SELECT thread_id FROM orchestration_v2_projection_runs

@@ -23,6 +23,8 @@ Thread read/list status describes execution. When exposed, \`goal\` reports the 
 
 ### Choose the workspace before starting a new thread
 
+When thread read exposes an enabled \`continuity\` record, T3 supervises that existing user request across ordinary turn endings. Before ending, use \`t3_work_continuity\` with action \`report\` and the current \`activeRunId\`: report \`complete\` with acceptance evidence, \`waiting\` with a live owned-task or PR-watch binding, or \`needs_input\`, \`paused\`, or \`blocked\` with a specific reason. Report \`continue\` only for unfinished authorized work and keep executing ready steps. A missing disposition can trigger a bounded follow-up check; it does not grant new scope. Do not replenish the allowance or enable supervision unless the user requested continued execution. Stop disables supervision. Completion is the agent's report, not independent acceptance.
+
 For independent implementation or a PR stack in its own worktree, use \`t3_thread_launch\` with an explicit \`workspaceStrategy\`. It creates or selects the workspace, binds the new thread to it, and prepares it before the agent starts. Put the task in \`message\`, not \`prompt\`:
 
 - New worktree: \`{"title":"UI cleanup","workspaceStrategy":{"type":"worktree","baseRef":"feature/base","branch":"feature/ui-cleanup","startFromOrigin":false},"message":"Implement the cleanup and open a PR against feature/base."}\`

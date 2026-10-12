@@ -56,6 +56,7 @@ import { CodexOrchestratorReplayHarness } from "../orchestration-v2/Adapters/Cod
 import { threadShellFromProjection } from "../orchestration-v2/ProjectionStore.ts";
 import * as EventSink from "../orchestration-v2/EventSink.ts";
 import * as Orchestrator from "../orchestration-v2/Orchestrator.ts";
+import * as ServerSettings from "../serverSettings.ts";
 import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
 import * as ThreadSearch from "../orchestration-v2/ThreadSearch.ts";
 import * as ProviderAdapterRegistry from "../orchestration-v2/ProviderAdapterRegistry.ts";
@@ -612,7 +613,7 @@ describe("orchestrator MCP toolkit", () => {
           const layerOrchestration = Layer.merge(
             layerOrchestrator,
             ThreadManagementService.layer.pipe(Layer.provide(layerOrchestrator)),
-          );
+          ).pipe(Layer.provide(ServerSettings.layerTest()));
           const layerProviderRegistry = ProviderRegistryMock.layer([
             makeProviderSnapshot({
               instanceId: codexInstanceId,
@@ -3808,7 +3809,7 @@ describe("orchestrator MCP toolkit", () => {
         const layerOrchestration = Layer.merge(
           layerOrchestrator,
           ThreadManagementService.layer.pipe(Layer.provide(layerOrchestrator)),
-        );
+        ).pipe(Layer.provide(ServerSettings.layerTest()));
         const layerProviderRegistry = ProviderRegistryMock.layer([
           makeProviderSnapshot({
             instanceId: codexInstanceId,

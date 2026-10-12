@@ -28,6 +28,7 @@ import { ThreadTitleRegeneration } from "./threadTitle.ts";
 import {
   OrchestrationV2Actor,
   OrchestrationV2CreationSource,
+  OrchestrationV2ProviderGoal,
   OrchestrationV2RunStatus,
   OrchestrationV2TurnItemStatus,
 } from "./orchestrationV2.ts";
@@ -308,6 +309,10 @@ export const OrchestratorMcpThreadListItem = Schema.Struct({
   createdBy: OrchestrationV2Actor,
   creationSource: OrchestrationV2CreationSource,
   status: OrchestratorMcpThreadStatus,
+  /** Provider-reported objective state, separate from run status; absent on older servers. */
+  goal: Schema.optional(Schema.NullOr(OrchestrationV2ProviderGoal)),
+  /** Read the thread for full goal text when a list summary was clipped. */
+  goalTextTruncated: Schema.optional(Schema.Boolean),
   latestRunId: Schema.NullOr(RunId),
   providerInstanceId: ProviderInstanceId,
   model: Schema.String,
@@ -356,6 +361,8 @@ export const OrchestratorMcpThreadDetail = Schema.Struct({
   createdBy: OrchestrationV2Actor,
   creationSource: OrchestrationV2CreationSource,
   status: OrchestratorMcpThreadStatus,
+  /** Provider-reported objective state, separate from run status; absent on older servers. */
+  goal: Schema.optional(Schema.NullOr(OrchestrationV2ProviderGoal)),
   latestRunId: Schema.NullOr(RunId),
   activeRunId: Schema.NullOr(RunId),
   providerInstanceId: ProviderInstanceId,

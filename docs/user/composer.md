@@ -224,6 +224,9 @@ With Codex and Claude, send `/goal` followed by what "done" means, for example
 until it judges the goal met. The thread shows **Goal** while it works, and a
 row above the composer shows the goal and its progress.
 
+For Codex, send the goal command as its own message without attachments. If a
+turn is running, queue the command rather than steering it into that turn.
+
 - `/goal` alone shows the current goal. `/goal clear` removes it.
 - Codex also supports `/goal pause` and `/goal resume`. Stopping a Codex goal
   pauses it.

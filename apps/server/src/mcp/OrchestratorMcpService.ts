@@ -711,6 +711,7 @@ function listItemFromShell(
     createdBy: shell.createdBy,
     creationSource: shell.creationSource,
     status: shell.activityRunStatus ?? shell.status,
+    ...listGoal(shell.goal),
     latestRunId: shell.latestRunId,
     providerInstanceId: shell.modelSelection.instanceId,
     model: shell.modelSelection.model,
@@ -724,6 +725,16 @@ function listItemFromShell(
     itemCount: shell.visibleItemCount,
     createdAt: DateTime.formatIso(shell.createdAt),
     updatedAt: DateTime.formatIso(shell.updatedAt),
+  };
+}
+
+function listGoal(goal: OrchestrationV2ThreadShell["goal"]) {
+  if (goal == null) return { goal: null, goalTextTruncated: false };
+  const objective = goal.objective.slice(0, 1_000);
+  const lastCheck = goal.lastCheck?.slice(0, 2_000);
+  return {
+    goal: { ...goal, objective, ...(lastCheck === undefined ? {} : { lastCheck }) },
+    goalTextTruncated: objective !== goal.objective || lastCheck !== goal.lastCheck,
   };
 }
 
@@ -742,6 +753,7 @@ function threadDetail(
     createdBy: projection.thread.createdBy,
     creationSource: projection.thread.creationSource,
     status: active?.status ?? latest?.status ?? "idle",
+    goal: shell.goal ?? null,
     latestRunId: latest?.id ?? null,
     activeRunId: active?.id ?? null,
     providerInstanceId: projection.thread.modelSelection.instanceId,

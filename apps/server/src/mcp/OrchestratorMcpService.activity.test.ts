@@ -3,6 +3,9 @@ import {
   NodeId,
   type OrchestrationV2ThreadProjection,
   type OrchestrationV2ThreadShell,
+  type OrchestrationV2ProviderGoal,
+  OrchestratorMcpThreadListResult,
+  OrchestratorMcpThreadReadResult,
   ProjectId,
   ProviderDriverKind,
   ProviderInstanceId,
@@ -13,6 +16,7 @@ import {
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Schema from "effect/Schema";
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import { expect, it } from "vite-plus/test";
 
@@ -25,6 +29,7 @@ import * as SecretRequests from "../secrets/SecretRequests.ts";
 import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
 import type * as McpInvocationContext from "./McpInvocationContext.ts";
 import * as OrchestratorMcpService from "./OrchestratorMcpService.ts";
+import { idleThreadProjection, liveThreadShell } from "./McpToolAccess.testkit.ts";
 
 const environmentId = EnvironmentId.make("environment-mcp-orchestrator-detail");
 const projectId = ProjectId.make("project-mcp-orchestrator-detail");
@@ -39,6 +44,9 @@ const codexDriver = ProviderDriverKind.make("codex");
 // Distinct from driver kind so a regression that re-derives from driver fails.
 const customCodexInstanceId = ProviderInstanceId.make("codex-custom-workspace");
 const parentInstanceId = ProviderInstanceId.make("codex");
+const encodeThreadRead = Schema.encodeEffect(OrchestratorMcpThreadReadResult);
+const encodeThreadList = Schema.encodeEffect(OrchestratorMcpThreadListResult);
+const decodeThreadRead = Schema.decodeEffect(OrchestratorMcpThreadReadResult);
 
 const makeScope = (): McpInvocationContext.McpInvocationScope => ({
   environmentId,
@@ -106,6 +114,88 @@ function makeRun(input: {
     completedAt: input.status === "cancelled" || input.status === "completed" ? now : null,
   };
 }
+
+it.each(["active", "paused", "blocked", "usage_limited", "budget_limited", "complete"] as const)(
+  "thread tools preserve a %s native goal independently of execution and clear it on the next read",
+  async (status) => {
+    const oversized = status === "blocked";
+    let goal: OrchestrationV2ProviderGoal | null = {
+      objective: oversized
+        ? "Complete the assigned work. ".repeat(1_000).trim()
+        : "Convert all eligible workers and verify their cutover",
+      status,
+      tokensUsed: 123,
+      tokenBudget: 1000,
+      checks: 2,
+      lastCheck: oversized
+        ? "The dependency remains unavailable. ".repeat(1_000)
+        : "Availability remains unfinished",
+    };
+    const shell = (): OrchestrationV2ThreadShell => ({
+      ...liveThreadShell(parentThreadId, { activeRunId: null }),
+      status: "idle",
+      goal,
+    });
+    const layer = OrchestratorMcpService.layer.pipe(
+      Layer.provide(
+        Layer.mergeAll(
+          Layer.mock(ThreadManagementService.ThreadManagementService)({
+            getTimelinePage: () => Effect.succeed({ items: [], totalItems: 0, hasMore: false }),
+            getThreadRecords: () => Effect.succeed(idleThreadProjection(shell())),
+            getThreadShell: () => Effect.succeed(shell()),
+            getProjectThreadRecords: () => Effect.succeed(idleThreadProjection(shell())),
+            listProjectThreads: () => Effect.succeed([shell()]),
+          }),
+          ServerSettings.layerTest(),
+          Layer.mock(ProviderRegistry.ProviderRegistry)({ getProviders: Effect.succeed([]) }),
+          Layer.mock(ProjectService.ProjectService)({}),
+          Layer.mock(SecretRequests.SecretRequests)({}),
+          Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
+          Layer.mock(ProviderAdapterRegistry.ProviderAdapterRegistryV2)({
+            list: () => Effect.succeed([]),
+          }),
+          NodeCrypto.layer,
+        ),
+      ),
+    );
+    await Effect.gen(function* () {
+      const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+      const read = yield* service.readThread(makeScope(), { threadId: parentThreadId });
+      const listed = yield* service.listThreads(makeScope(), {});
+      // Exercise the tool's wire schema too: an unrecognized field would be lost on encoding.
+      const readWire = yield* encodeThreadRead(read);
+      const listWire = yield* encodeThreadList(listed);
+      expect(readWire.thread.goal).toEqual(goal);
+      const listedThread = listWire.threads[0]!;
+      expect(listedThread.goal?.status).toBe(status);
+      expect(listedThread.goalTextTruncated).toBe(oversized);
+      if (oversized) {
+        expect(listedThread.goal!.objective.length).toBeLessThanOrEqual(1_000);
+        expect(listedThread.goal!.lastCheck!.length).toBeLessThanOrEqual(2_000);
+      } else {
+        expect(listedThread.goal).toEqual(goal);
+      }
+      expect(readWire.thread.status).toBe("idle");
+      expect(readWire.thread.activeRunId).toBeNull();
+      expect(listWire.threads[0]?.status).toBe("idle");
+
+      goal = null;
+      const cleared = yield* service.readThread(makeScope(), { threadId: parentThreadId });
+      const clearedList = yield* service.listThreads(makeScope(), {});
+      expect(cleared.thread.goal).toBeNull();
+      expect(clearedList.threads[0]?.goal).toBeNull();
+      expect(clearedList.threads[0]?.goalTextTruncated).toBe(false);
+
+      // Old servers omitted goals; do not reinterpret that omission as a completed objective.
+      const { goal: _goal, ...legacyThread } = readWire.thread;
+      const legacy = yield* decodeThreadRead({
+        ...readWire,
+        thread: legacyThread,
+      });
+      expect(legacy.thread.goal).toBeUndefined();
+    }).pipe(Effect.provide(layer), Effect.runPromise);
+  },
+);
 
 it("readThread prefers activity-run status over a newer cancelled queued run", async () => {
   const projection = {

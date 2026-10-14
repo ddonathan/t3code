@@ -8529,6 +8529,64 @@ describe("CodexAdapterV2 post-settle continuation", () => {
         event.type === "provider_thread.updated" ? [event.providerThread.goal?.status ?? null] : [],
       );
 
+    it.effect.each(["paused", "blocked", "budgetLimited", "usageLimited"] as const)(
+      "R89 native %s goal notification before turn completion leaves the current turn running",
+      (status) =>
+        Effect.gen(function* () {
+          const updated = yield* Deferred.make<void>();
+          const nativeTurnId = `r89-${status}-turn`;
+          const prompt = "Finish already authorized interrupted work";
+          const transcript = makeCodexReplayTranscript({
+            scenario: `r89-goal-cut-${status}`,
+            entries: [
+              ...codexReplayPreamble({ nativeThreadId, nativeTurnId, prompt }),
+              notification("goal stops before native turn completes", "thread/goal/updated", {
+                threadId: nativeThreadId,
+                turnId: nativeTurnId,
+                goal: { ...codexGoal(status, 100), tokenBudget: 100 },
+              }),
+            ],
+          });
+          const harness = yield* makeCodexReplayHarness(transcript, (event) =>
+            event.type === "provider_thread.updated" &&
+            event.providerThread.goal?.status ===
+              (
+                {
+                  paused: "paused",
+                  blocked: "blocked",
+                  budgetLimited: "budget_limited",
+                  usageLimited: "usage_limited",
+                } as const
+              )[status]
+              ? Deferred.succeed(updated, undefined)
+              : Effect.void,
+          );
+          yield* harness.runtime.startTurn(yield* goalTurnInput(harness, prompt));
+          yield* Deferred.await(updated);
+          assert.deepEqual(harness.terminalEvents(), []);
+          const turns = harness.events.flatMap((event) =>
+            event.type === "provider_turn.updated" ? [event.providerTurn] : [],
+          );
+          assert.equal(turns.at(-1)?.status, "running");
+          assert.equal(
+            providerGoals(harness.events).at(-1),
+            (
+              {
+                paused: "paused",
+                blocked: "blocked",
+                budgetLimited: "budget_limited",
+                usageLimited: "usage_limited",
+              } as const
+            )[status],
+          );
+        }).pipe(
+          Effect.scoped,
+          Effect.provide(
+            Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+          ),
+        ),
+    );
+
     it("parses /goal like the Codex TUI", () => {
       assert.deepEqual(CodexAdapterV2.parseCodexGoalCommand("/goal"), { type: "show" });
       assert.deepEqual(CodexAdapterV2.parseCodexGoalCommand(" /goal Pause "), { type: "pause" });

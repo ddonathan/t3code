@@ -27,6 +27,7 @@ import {
   ProviderDriverKind,
   ProviderInstanceId,
   ProviderThreadId,
+  ProviderSessionId,
   ProviderTurnId,
   RunId,
   ScheduledTaskId,
@@ -5793,6 +5794,398 @@ it.layer(
       const run = (yield* orchestrator.getThreadProjection(threadId)).runs[0]!;
       return { threadId, authorityMessageId, generation, run };
     });
+
+  const seedR89Cut = (name: string, maxChecks = 2) =>
+    Effect.gen(function* () {
+      const input = yield* seedContinuity(`r89-${name}`, maxChecks);
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const events = yield* EventSink.EventSinkV2;
+      const projection = yield* orchestrator.getThreadProjection(input.threadId);
+      const providerThread = projection.providerThreads[0]!;
+      const sessionId = ProviderSessionId.make(`${input.threadId}:session`);
+      const now = yield* DateTime.now;
+      const running = { ...input.run, status: "running" as const, startedAt: now };
+      const turn = {
+        id: ProviderTurnId.make(`${input.threadId}:turn`),
+        providerThreadId: providerThread.id,
+        nodeId: input.run.rootNodeId!,
+        runAttemptId: input.run.activeAttemptId,
+        nativeTurnRef: {
+          driver,
+          nativeId: `${input.threadId}:native-turn`,
+          strength: "strong" as const,
+        },
+        ordinal: 1,
+        status: "running" as const,
+        startedAt: now,
+        completedAt: null,
+      };
+      yield* events.write({
+        events: [
+          {
+            id: EventId.make(`${input.threadId}:running`),
+            type: "run.updated",
+            threadId: input.threadId,
+            runId: running.id,
+            occurredAt: now,
+            payload: running,
+          },
+          {
+            id: EventId.make(`${input.threadId}:session`),
+            type: "provider-session.attached",
+            threadId: input.threadId,
+            occurredAt: now,
+            payload: {
+              id: sessionId,
+              driver,
+              providerInstanceId: modelSelection.instanceId,
+              status: "running",
+              cwd: process.cwd(),
+              model: modelSelection.model,
+              capabilities: CodexProviderCapabilitiesV2,
+              createdAt: now,
+              updatedAt: now,
+              lastError: null,
+            },
+          },
+          {
+            id: EventId.make(`${input.threadId}:native`),
+            type: "provider-thread.updated",
+            threadId: input.threadId,
+            occurredAt: now,
+            payload: {
+              ...providerThread,
+              providerSessionId: sessionId,
+              status: "active",
+              nativeThreadRef: {
+                driver,
+                nativeId: `${input.threadId}:native-thread`,
+                strength: "strong",
+              },
+            },
+          },
+          {
+            id: EventId.make(`${input.threadId}:turn`),
+            type: "provider-turn.updated",
+            threadId: input.threadId,
+            runId: running.id,
+            occurredAt: now,
+            payload: turn,
+          },
+        ],
+      });
+      yield* (yield* ServerSettings.ServerSettingsService).updateSettings({
+        continueThreadsAfterServerUpdate: true,
+      });
+      return { ...input, run: running, turn, sessionId };
+    });
+
+  const cutR89 = (input: { threadId: ThreadId }) =>
+    Effect.gen(function* () {
+      const recovery = yield* ProviderRuntimeRecoveryService.make;
+      yield* recovery.prepareForShutdown;
+      yield* recovery.reconcile("shutdown");
+      const sql = yield* SqlClient.SqlClient;
+      return yield* sql<{
+        effect_type: string;
+        payload_json: string;
+      }>`SELECT effect_type, payload_json
+        FROM orchestration_v2_effect_outbox WHERE thread_id = ${input.threadId}
+          AND effect_type = ${"provider-runtime.continue"}`;
+    });
+
+  it.effect.each([
+    "blocked",
+    "complete",
+    "paused",
+    "null",
+    "optout",
+    "needs_input",
+    "active-zero",
+  ] as const)(
+    "R89 restart restores the cut turn with %s continuity without changing authority or allowance",
+    (status) =>
+      Effect.gen(function* () {
+        const input = yield* seedR89Cut(status);
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const events = yield* EventSink.EventSinkV2;
+        const before = yield* orchestrator.getThreadProjection(input.threadId);
+        const continuity =
+          status === "null" || status === "optout"
+            ? null
+            : {
+                ...before.thread.continuity!,
+                status: status === "active-zero" ? ("active" as const) : status,
+                ...(status === "active-zero" ? { checksRemaining: 0 } : {}),
+              };
+        yield* events.write({
+          events: [
+            {
+              id: EventId.make(`${input.threadId}:disposition`),
+              type: "thread.metadata-updated",
+              threadId: input.threadId,
+              occurredAt: yield* DateTime.now,
+              payload: {
+                ...before.thread,
+                continuity,
+                continuityAutoEnrollDisabled: status === "optout",
+              },
+            },
+          ],
+        });
+        assert.lengthOf(yield* cutR89(input), 1);
+        yield* continueRestartedRun({ threadId: input.threadId, sourceRunId: input.run.id });
+        yield* continueRestartedRun({ threadId: input.threadId, sourceRunId: input.run.id });
+        const after = yield* orchestrator.getThreadProjection(input.threadId);
+        assert.lengthOf(after.runs, 2);
+        assert.equal(after.runs[1]?.restartContinuationOfRunId, input.run.id);
+        assert.deepEqual(after.thread.continuity, continuity);
+        assert.equal(after.thread.continuityAutoEnrollDisabled, status === "optout");
+        assert.deepEqual(
+          after.messages.find((message) => message.id === input.authorityMessageId),
+          before.messages.find((message) => message.id === input.authorityMessageId),
+        );
+        assert.isNull(after.providerThreads[0]?.goal);
+      }),
+  );
+
+  it.effect(
+    "R89 pending runtime approval survives the cut unanswered and admits no continuation",
+    () =>
+      Effect.gen(function* () {
+        const input = yield* seedR89Cut("approval");
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const events = yield* EventSink.EventSinkV2;
+        const request = {
+          id: RuntimeRequestId.make(`${input.threadId}:approval`),
+          nodeId: input.run.rootNodeId!,
+          providerTurnId: input.turn.id,
+          nativeRequestRef: null,
+          kind: "command" as const,
+          status: "pending" as const,
+          responseCapability: { type: "live" as const, providerSessionId: input.sessionId },
+          createdAt: yield* DateTime.now,
+          resolvedAt: null,
+        };
+        yield* events.write({
+          events: [
+            {
+              id: EventId.make(`${input.threadId}:approval`),
+              type: "runtime-request.updated",
+              threadId: input.threadId,
+              nodeId: request.nodeId,
+              occurredAt: request.createdAt,
+              payload: request,
+            },
+          ],
+        });
+        assert.lengthOf(yield* cutR89(input), 0);
+        yield* continueRestartedRun({ threadId: input.threadId, sourceRunId: input.run.id });
+        const after = yield* orchestrator.getThreadProjection(input.threadId);
+        assert.lengthOf(after.runs, 1);
+        assert.equal(after.runtimeRequests[0]?.id, request.id);
+        assert.equal(after.runtimeRequests[0]?.status, "cancelled");
+        assert.equal(after.runtimeRequests[0]?.responseCapability.type, "not_resumable");
+        assert.isUndefined(after.runtimeRequests[0]?.decision);
+        assert.isUndefined(after.runtimeRequests[0]?.answers);
+      }),
+  );
+
+  it.effect("R89 TRUE to FALSE after durable shutdown intent prevents delivery admission", () =>
+    Effect.gen(function* () {
+      const input = yield* seedR89Cut("flag-flip");
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      assert.lengthOf(yield* cutR89(input), 1);
+      yield* (yield* ServerSettings.ServerSettingsService).updateSettings({
+        continueThreadsAfterServerUpdate: false,
+      });
+      yield* continueRestartedRun({ threadId: input.threadId, sourceRunId: input.run.id });
+      assert.lengthOf((yield* orchestrator.getThreadProjection(input.threadId)).runs, 1);
+    }),
+  );
+
+  it.effect.each([false, true])(
+    "R89 human accepted after reconciliation invalidates stale restart with earlier held queue %s",
+    (withQueue) =>
+      Effect.gen(function* () {
+        const input = yield* seedR89Cut(`human-${withQueue}`);
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        if (withQueue)
+          yield* orchestrator.dispatch({
+            type: "message.dispatch",
+            commandId: CommandId.make(`${input.threadId}:queue`),
+            threadId: input.threadId,
+            messageId: MessageId.make(`${input.threadId}:queued`),
+            text: "Earlier queued requirement",
+            createdBy: "user",
+            creationSource: "web",
+            attachments: [],
+            dispatchMode: { type: "queue_after_active" },
+          });
+        assert.lengthOf(yield* cutR89(input), 1);
+        const reconciled = yield* orchestrator.getThreadProjection(input.threadId);
+        const held = reconciled.runs.find((run) => run.status === "queued");
+        if (withQueue) assert.isTrue(held?.queueHeld);
+        yield* TestClock.adjust("1 millis");
+        const humanId = MessageId.make(`${input.threadId}:new-human`);
+        yield* orchestrator.dispatch({
+          type: "message.dispatch",
+          commandId: CommandId.make(`${input.threadId}:new-human`),
+          threadId: input.threadId,
+          messageId: humanId,
+          text: "New accepted human requirement",
+          createdBy: "user",
+          creationSource: "web",
+          attachments: [],
+          dispatchMode: { type: "start_immediately" },
+        });
+        const human = yield* orchestrator.getThreadProjection(input.threadId);
+        yield* continueRestartedRun({ threadId: input.threadId, sourceRunId: input.run.id });
+        const after = yield* orchestrator.getThreadProjection(input.threadId);
+        assert.deepEqual(after.runs, human.runs);
+        assert.deepEqual(after.messages, human.messages);
+        assert.isTrue(
+          after.runs.some((run) => run.userMessageId === humanId && run.status !== "queued"),
+        );
+        assert.isFalse(after.runs.some((run) => run.restartContinuationOfRunId === input.run.id));
+        if (withQueue)
+          assert.deepEqual(
+            after.runs.find((run) => run.id === held?.id),
+            held,
+          );
+      }),
+  );
+
+  it.effect.each(["active", "complete", "blocked", "paused"] as const)(
+    "R89 completed restart consumes one check only for active continuity; %s preserved",
+    (status) =>
+      Effect.gen(function* () {
+        const input = yield* seedR89Cut(`consume-${status}`, 2);
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const events = yield* EventSink.EventSinkV2;
+        if (status !== "active") {
+          const before = yield* orchestrator.getThreadProjection(input.threadId);
+          yield* events.write({
+            events: [
+              {
+                id: EventId.make(`${input.threadId}:closed`),
+                type: "thread.metadata-updated",
+                threadId: input.threadId,
+                occurredAt: yield* DateTime.now,
+                payload: { ...before.thread, continuity: { ...before.thread.continuity!, status } },
+              },
+            ],
+          });
+        }
+        const before = (yield* orchestrator.getThreadProjection(input.threadId)).thread.continuity!;
+        assert.lengthOf(yield* cutR89(input), 1);
+        yield* continueRestartedRun({ threadId: input.threadId, sourceRunId: input.run.id });
+        const resumed = (yield* orchestrator.getThreadProjection(input.threadId)).runs[1]!;
+        assert.equal(
+          (yield* orchestrator.getThreadProjection(input.threadId)).thread.continuity
+            ?.checksRemaining,
+          2,
+        );
+        const advanced =
+          status === "active"
+            ? yield* events
+                .stream({
+                  afterSequence: yield* events.latestSequence(),
+                  eventType: "thread.metadata-updated",
+                })
+                .pipe(
+                  Stream.filter(
+                    (stored) =>
+                      stored.event.type === "thread.metadata-updated" &&
+                      stored.event.threadId === input.threadId &&
+                      stored.event.payload.continuity?.lastAdvancedRunId === resumed.id,
+                  ),
+                  Stream.take(1),
+                  Stream.runDrain,
+                  Effect.forkScoped,
+                )
+            : undefined;
+        yield* finishRun(input.threadId, resumed);
+        yield* advance({ ...input, run: resumed }, "first");
+        if (advanced !== undefined) yield* Fiber.join(advanced);
+        yield* advance({ ...input, run: resumed }, "repeat");
+        yield* orchestrator.recoverDelegatedTasks;
+        const after = yield* orchestrator.getThreadProjection(input.threadId);
+        assert.lengthOf(after.runs, status === "active" ? 3 : 2);
+        if (status === "active") {
+          assert.equal(after.thread.continuity?.checksRemaining, 1);
+          assert.equal(after.thread.continuity?.generation, before.generation);
+          assert.equal(after.thread.continuity?.authorityMessageId, before.authorityMessageId);
+          assert.equal(after.thread.continuity?.lastAdvancedRunId, resumed.id);
+          assert.equal(
+            after.runs[2]?.userMessageId,
+            MessageId.make(`message:work-continuity:${before.generation}:${resumed.id}`),
+          );
+        } else assert.deepEqual(after.thread.continuity, before);
+      }),
+  );
+
+  it.effect.each(["paused", "blocked", "budget_limited", "usage_limited"] as const)(
+    "R89 restart must respect a persisted %s native goal pause or limit",
+    (status) =>
+      Effect.gen(function* () {
+        const input = yield* seedR89Cut(`goal-${status}`);
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const events = yield* EventSink.EventSinkV2;
+        const projection = yield* orchestrator.getThreadProjection(input.threadId);
+        const goal = {
+          objective: "Previously authorized native objective",
+          status,
+          tokensUsed: 100,
+          tokenBudget: 100,
+          timeUsedSeconds: 3,
+        };
+        yield* events.write({
+          events: [
+            {
+              id: EventId.make(`${input.threadId}:goal-notification`),
+              type: "provider-thread.updated",
+              threadId: input.threadId,
+              occurredAt: yield* DateTime.now,
+              payload: { ...projection.providerThreads[0]!, goal },
+            },
+          ],
+        });
+        const persisted = yield* orchestrator.getThreadProjection(input.threadId);
+        assert.equal(persisted.runs[0]?.status, "running");
+        assert.equal(persisted.providerTurns[0]?.status, "running");
+        assert.deepEqual(persisted.providerThreads[0]?.goal, goal);
+        assert.isAtMost((yield* cutR89(input)).length, 1);
+        yield* continueRestartedRun({ threadId: input.threadId, sourceRunId: input.run.id });
+        const after = yield* orchestrator.getThreadProjection(input.threadId);
+        assert.deepEqual(after.providerThreads[0]?.goal, goal);
+        assert.equal(after.thread.continuity?.checksRemaining, 2);
+        const continuations = after.runs.filter(
+          (run) => run.restartContinuationOfRunId === input.run.id,
+        );
+        assert.lengthOf(
+          continuations,
+          0,
+          JSON.stringify({
+            incident: "R89NativeGoalRestartAdmission",
+            action: "deliver durable restart continuation",
+            observed: {
+              goalStatus: status,
+              sourceRunId: input.run.id,
+              admittedRunIds: continuations.map((run) => run.id),
+              expectedAdmissions: 0,
+            },
+            guard: "restart must preserve the native goal pause or limit",
+            eliminated: [
+              "flag false",
+              "unbound native session",
+              "goal only in an unreachable object",
+            ],
+            next: "Root must repair native-goal eligibility at restart intent and dispatch; product source is frozen.",
+          }),
+        );
+      }),
+  );
 
   const seedLiveChild = (input: { threadId: ThreadId; run: OrchestrationV2Run }) =>
     Effect.gen(function* () {

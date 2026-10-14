@@ -106,6 +106,79 @@ describe("v2 thread shell lists", () => {
     registry.dispose();
   });
 
+  it("keeps parent attention and question navigation aligned with the asking child's activity run", () => {
+    const { registry, threads, snapshotAtom } = makeHarness();
+    const root = {
+      ...v2ThreadShell,
+      status: "running" as const,
+      latestRunId: RunId.make("running-parent"),
+      activeRunId: RunId.make("running-parent"),
+    };
+    const child = {
+      ...v2ThreadShell,
+      id: ThreadId.make("live-question"),
+      status: "waiting" as const,
+      activityRunStatus: "waiting" as const,
+      creationSource: "mcp" as const,
+      lineage: {
+        ...root.lineage,
+        parentThreadId: root.id,
+        relationshipToParent: "subagent" as const,
+      },
+      pendingRuntimeRequest: {
+        id: RuntimeRequestId.make("question"),
+        kind: "user_input" as const,
+        createdAt: v2Now,
+      },
+    };
+    const ref = { environmentId, threadId: root.id };
+    const disposeList = registry.mount(threads.threadShellsAtom);
+    const disposeInputs = registry.mount(threads.childThreadInputsAtom(ref));
+    const assertAttention = (expected: boolean) => {
+      const parent = registry.get(threads.threadShellsAtom).find((t) => t.id === root.id)!;
+      expect(parent.hasPendingUserInput).toBe(expected);
+      expect(isThreadWorking(parent)).toBe(!expected);
+      expect(registry.get(threads.childThreadInputsAtom(ref)).map((t) => t.id)).toEqual(
+        expected ? [child.id] : [],
+      );
+    };
+    try {
+      registry.set(snapshotAtom(environmentId), { ...v2ShellSnapshot, threads: [root, child] });
+      assertAttention(true);
+      registry.set(snapshotAtom(environmentId), {
+        ...v2ShellSnapshot,
+        threads: [root, { ...child, status: "queued" }],
+      });
+      assertAttention(true);
+      for (const status of ["completed", "cancelled"] as const) {
+        registry.set(snapshotAtom(environmentId), {
+          ...v2ShellSnapshot,
+          threads: [root, { ...child, status, activityRunStatus: null }],
+        });
+        assertAttention(false);
+        expect(
+          registry.get(threads.threadShellAtom({ environmentId, threadId: child.id }))
+            ?.hasPendingUserInput,
+        ).toBe(true);
+      }
+      const { activityRunStatus: _omitted, ...legacyChild } = child;
+      registry.set(snapshotAtom(environmentId), {
+        ...v2ShellSnapshot,
+        threads: [root, legacyChild],
+      });
+      assertAttention(true);
+      registry.set(snapshotAtom(environmentId), {
+        ...v2ShellSnapshot,
+        threads: [root, { ...legacyChild, status: "completed" }],
+      });
+      assertAttention(false);
+    } finally {
+      disposeInputs();
+      disposeList();
+      registry.dispose();
+    }
+  });
+
   it("returns a running parent to Input until its last hidden descendant question is answered", () => {
     const { registry, threads, snapshotAtom } = makeHarness();
     const root = {
@@ -117,6 +190,8 @@ describe("v2 thread shell lists", () => {
     const child = {
       ...v2ThreadShell,
       id: ThreadId.make("child"),
+      status: "waiting" as const,
+      activityRunStatus: "waiting" as const,
       creationSource: "mcp" as const,
       lineage: {
         ...root.lineage,
@@ -191,6 +266,8 @@ describe("v2 thread shell lists", () => {
     const question = {
       ...root,
       id: ThreadId.make("question"),
+      status: "waiting" as const,
+      activityRunStatus: "waiting" as const,
       creationSource: "mcp" as const,
       lineage: {
         ...root.lineage,
@@ -213,6 +290,17 @@ describe("v2 thread shell lists", () => {
           lineage: { ...question.lineage, relationshipToParent: "fork" },
         },
         { ...question, id: ThreadId.make("archived"), archivedAt: v2Now },
+        {
+          ...question,
+          id: ThreadId.make("archived-parent"),
+          archivedAt: v2Now,
+          pendingRuntimeRequest: null,
+        },
+        {
+          ...question,
+          id: ThreadId.make("under-archived-parent"),
+          lineage: { ...question.lineage, parentThreadId: ThreadId.make("archived-parent") },
+        },
         { ...question, id: ThreadId.make("native"), creationSource: "provider" },
       ],
     });
@@ -227,6 +315,19 @@ describe("v2 thread shell lists", () => {
         [environmentId, false],
         [remoteEnvironmentId, true],
       ]);
+      expect(
+        registry.get(threads.childThreadInputsAtom({ environmentId, threadId: root.id })),
+      ).toEqual([]);
+      expect(
+        registry
+          .get(
+            threads.childThreadInputsAtom({
+              environmentId: remoteEnvironmentId,
+              threadId: root.id,
+            }),
+          )
+          .map((t) => t.id),
+      ).toEqual([question.id]);
     } finally {
       dispose();
       registry.dispose();

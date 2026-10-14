@@ -30,6 +30,20 @@ const EMPTY_THREAD_REFS_BY_PROJECT: ReadonlyMap<
   ReadonlyArray<ScopedThreadRef>
 > = new Map();
 
+// An async question outlives the subagent's run, but once that run ends the
+// parent is no longer waiting on the answer, so it stops counting as input.
+// The activity run stays set when a follow-up is queued behind a blocked run;
+// older servers omit it, so fall back to the latest run's status.
+const isChildRunLive = (
+  thread: Pick<OrchestrationV2ThreadShell, "activityRunStatus" | "status">,
+) =>
+  thread.activityRunStatus !== undefined
+    ? thread.activityRunStatus !== null
+    : thread.status === "preparing" ||
+      thread.status === "starting" ||
+      thread.status === "running" ||
+      thread.status === "waiting";
+
 export function createEnvironmentThreadShellAtoms(input: {
   readonly catalogValueAtom: Atom.Atom<EnvironmentCatalogState>;
   readonly snapshotAtom: (
@@ -81,6 +95,7 @@ export function createEnvironmentThreadShellAtoms(input: {
         if (
           child.archivedAt !== null ||
           child.pendingRuntimeRequest?.kind !== "user_input" ||
+          !isChildRunLive(child) ||
           isProviderNativeSubagentThread(child)
         )
           continue;
@@ -203,11 +218,12 @@ export function createEnvironmentThreadShellAtoms(input: {
       const next: EnvironmentThreadShell[] = [];
       for (const parent of pending) {
         for (const child of children.get(parent) ?? []) {
-          if (seen.has(child.id)) continue;
+          if (child.archivedAt !== null || seen.has(child.id)) continue;
           seen.add(child.id);
           pending.push(child.id);
           if (
             child.pendingRuntimeRequest?.kind === "user_input" &&
+            isChildRunLive(child) &&
             !isProviderNativeSubagentThread(child)
           ) {
             next.push(scopedThread(ref.environmentId, child));

@@ -6155,7 +6155,7 @@ it.layer(
         assert.equal(persisted.runs[0]?.status, "running");
         assert.equal(persisted.providerTurns[0]?.status, "running");
         assert.deepEqual(persisted.providerThreads[0]?.goal, goal);
-        assert.isAtMost((yield* cutR89(input)).length, 1);
+        assert.lengthOf(yield* cutR89(input), 0);
         yield* continueRestartedRun({ threadId: input.threadId, sourceRunId: input.run.id });
         const after = yield* orchestrator.getThreadProjection(input.threadId);
         assert.deepEqual(after.providerThreads[0]?.goal, goal);
@@ -6181,9 +6181,152 @@ it.layer(
               "unbound native session",
               "goal only in an unreachable object",
             ],
-            next: "Root must repair native-goal eligibility at restart intent and dispatch; product source is frozen.",
+            next: "Inspect source-owned native-goal restart eligibility and authoritative dispatch.",
           }),
         );
+      }),
+  );
+
+  it.effect.each(["paused", "blocked", "budget_limited", "usage_limited"] as const)(
+    "R90 restart delivery rechecks a native goal changed from active to %s after durable intent",
+    (status) =>
+      Effect.gen(function* () {
+        const input = yield* seedR89Cut(`late-goal-${status}`);
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const events = yield* EventSink.EventSinkV2;
+        const sql = yield* SqlClient.SqlClient;
+        let goalUpdate = 0;
+        const setGoal = (goalStatus: "active" | typeof status) =>
+          Effect.gen(function* () {
+            const projection = yield* orchestrator.getThreadProjection(input.threadId);
+            const providerThread = projection.providerThreads.find(
+              (entry) => entry.id === input.run.providerThreadId,
+            );
+            if (providerThread === undefined) return yield* Effect.die("Missing source binding.");
+            yield* events.write({
+              events: [
+                {
+                  id: EventId.make(`${input.threadId}:goal-${goalStatus}:${goalUpdate++}`),
+                  type: "provider-thread.updated",
+                  threadId: input.threadId,
+                  occurredAt: yield* DateTime.now,
+                  payload: {
+                    ...providerThread,
+                    goal: {
+                      objective: "Previously authorized native objective",
+                      status: goalStatus,
+                      tokensUsed: 100,
+                      tokenBudget: 100,
+                    },
+                  },
+                },
+              ],
+            });
+          });
+        yield* setGoal("active");
+        yield* orchestrator.dispatch({
+          type: "message.dispatch",
+          commandId: CommandId.make(`${input.threadId}:queue`),
+          threadId: input.threadId,
+          messageId: MessageId.make(`${input.threadId}:queued`),
+          text: "Keep the earlier human requirement held.",
+          createdBy: "user",
+          creationSource: "web",
+          attachments: [],
+          dispatchMode: { type: "queue_after_active" },
+        });
+        assert.lengthOf(yield* cutR89(input), 1);
+        yield* setGoal(status);
+        const before = yield* orchestrator.getThreadProjection(input.threadId);
+        const startEffectsBefore = yield* sql<{ effect_id: string }>`SELECT effect_id
+          FROM orchestration_v2_effect_outbox WHERE thread_id = ${input.threadId}
+          AND effect_type = ${"provider-turn.start"} ORDER BY effect_id`;
+        yield* continueRestartedRun({ threadId: input.threadId, sourceRunId: input.run.id });
+        const refused = yield* orchestrator.getThreadProjection(input.threadId);
+        assert.deepEqual(refused.runs, before.runs);
+        assert.deepEqual(refused.messages, before.messages);
+        assert.deepEqual(refused.thread.continuity, before.thread.continuity);
+        assert.deepEqual(refused.providerThreads, before.providerThreads);
+        assert.isTrue(refused.runs.find((run) => run.status === "queued")?.queueHeld);
+        const commandId = CommandId.make(`command:restart-continuation:${input.run.id}`);
+        const receipts = yield* sql<{ status: string }>`SELECT status
+          FROM orchestration_command_receipts WHERE command_id = ${commandId}`;
+        assert.deepEqual(
+          receipts.map((receipt) => receipt.status),
+          ["accepted"],
+        );
+        // Replaying the same delivery must keep its accepted refusal, even if native state changes.
+        yield* setGoal("active");
+        yield* continueRestartedRun({ threadId: input.threadId, sourceRunId: input.run.id });
+        const replayed = yield* orchestrator.getThreadProjection(input.threadId);
+        assert.deepEqual(replayed.runs, refused.runs);
+        assert.deepEqual(replayed.messages, refused.messages);
+        assert.deepEqual(
+          yield* sql<{ effect_id: string }>`SELECT effect_id
+          FROM orchestration_v2_effect_outbox WHERE thread_id = ${input.threadId}
+          AND effect_type = ${"provider-turn.start"} ORDER BY effect_id`,
+          startEffectsBefore,
+        );
+      }),
+  );
+
+  it.effect.each(["missing", "active", "complete"] as const)(
+    "R90 restart admits one cut turn with %s source goal despite a paused alternate provider goal",
+    (status) =>
+      Effect.gen(function* () {
+        const input = yield* seedR89Cut(`goal-positive-${status}`);
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const events = yield* EventSink.EventSinkV2;
+        const before = yield* orchestrator.getThreadProjection(input.threadId);
+        const source = before.providerThreads.find(
+          (entry) => entry.id === input.run.providerThreadId,
+        );
+        if (source === undefined) return yield* Effect.die("Missing source binding.");
+        const goal =
+          status === "missing"
+            ? null
+            : {
+                objective: "Previously authorized native objective",
+                status,
+              };
+        yield* events.write({
+          events: [
+            {
+              id: EventId.make(`${input.threadId}:source-goal`),
+              type: "provider-thread.updated",
+              threadId: input.threadId,
+              occurredAt: yield* DateTime.now,
+              payload: { ...source, goal },
+            },
+            {
+              id: EventId.make(`${input.threadId}:alternate-goal`),
+              type: "provider-thread.updated",
+              threadId: input.threadId,
+              occurredAt: yield* DateTime.now,
+              payload: {
+                ...source,
+                id: ProviderThreadId.make(`${input.threadId}:alternate`),
+                providerInstanceId: alternateInstanceId,
+                goal: { objective: "Unrelated alternate provider objective", status: "paused" },
+              },
+            },
+          ],
+        });
+        assert.lengthOf(yield* cutR89(input), 1);
+        yield* continueRestartedRun({ threadId: input.threadId, sourceRunId: input.run.id });
+        yield* continueRestartedRun({ threadId: input.threadId, sourceRunId: input.run.id });
+        const after = yield* orchestrator.getThreadProjection(input.threadId);
+        assert.lengthOf(
+          after.runs.filter((run) => run.restartContinuationOfRunId === input.run.id),
+          1,
+        );
+        assert.equal(after.runs.at(-1)?.providerThreadId, source.id);
+        assert.deepEqual(after.thread.continuity, before.thread.continuity);
+        assert.deepEqual(
+          after.messages.find((message) => message.id === input.authorityMessageId),
+          before.messages.find((message) => message.id === input.authorityMessageId),
+        );
+        assert.deepEqual(after.providerThreads.find((entry) => entry.id === source.id)?.goal, goal);
       }),
   );
 

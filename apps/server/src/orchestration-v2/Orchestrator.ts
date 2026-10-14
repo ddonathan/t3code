@@ -4752,6 +4752,18 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           projection.thread.archivedAt !== null ||
           projection.thread.deletedAt !== null ||
           projection.thread.providerInstanceId !== source.providerInstanceId ||
+          projection.providerThreads.some(
+            (providerThread) =>
+              (providerThread.id === source.providerThreadId ||
+                providerThread.id === projection.thread.activeProviderThreadId) &&
+              providerThread.appThreadId === projection.thread.id &&
+              providerThread.ownerNodeId === null &&
+              providerThread.providerInstanceId === source.providerInstanceId &&
+              providerThread.goal != null &&
+              ["paused", "blocked", "usage_limited", "budget_limited"].includes(
+                providerThread.goal.status,
+              ),
+          ) ||
           // Held queued runs never started; they wait behind the continuation.
           projection.runs.some(
             (run) => run.id !== source.id && run.status !== "queued" && runRanAfter(run, source),

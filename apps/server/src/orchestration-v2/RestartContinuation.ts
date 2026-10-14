@@ -126,7 +126,17 @@ export function restartContinuationRun(
     providerThread.nativeThreadRef.driver !== providerThread.driver ||
     (liveTurnRequired && providerThread.status !== "active") ||
     providerThread.status === "closed" ||
-    providerThread.status === "archived"
+    providerThread.status === "archived" ||
+    projection.providerThreads.some(
+      (candidate) =>
+        (candidate.id === run.providerThreadId ||
+          candidate.id === projection.thread.activeProviderThreadId) &&
+        candidate.appThreadId === projection.thread.id &&
+        candidate.ownerNodeId === null &&
+        candidate.providerInstanceId === run.providerInstanceId &&
+        candidate.goal != null &&
+        ["paused", "blocked", "usage_limited", "budget_limited"].includes(candidate.goal.status),
+    )
   )
     return;
   const session = projection.providerSessions.find(

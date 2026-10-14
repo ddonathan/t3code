@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// @effect-diagnostics nodeBuiltinImport:off - Node's typed junction API avoids Windows symlink privileges while keeping the probe isolated.
+// @effect-diagnostics nodeBuiltinImport:off - ASAR's public file API requires native file metadata; junctions isolate the bundle probe.
 
 import * as NodeFSP from "node:fs/promises";
 import * as NodeCrypto from "node:crypto";
@@ -8,7 +8,7 @@ import * as NodeModule from "node:module";
 import Plist from "plist";
 
 import {
-  createPackageWithOptions,
+  createPackageFromFiles,
   extractAll,
   getRawHeader,
   statFile,
@@ -3040,6 +3040,29 @@ export const parseWslRuntimeArchiveMembers = (listing: string): ReadonlyArray<st
     .map((member) => member.replace(/^\.\//, "").replace(/\/$/, ""))
     .filter((member) => member.length > 0);
 
+// These are the bounded exclusions returned by resolveWindowsServerAsarIgnoreGlobs.
+// Segment comparisons treat staging paths and hidden conpty versions literally.
+function isWindowsServerAsarExcluded(segments: ReadonlyArray<string>, arch: typeof BuildArch.Type) {
+  const unusedArch = arch === "arm64" ? "x64" : "arm64";
+  return segments.some((segment, index) => {
+    if (segment !== "node_modules") return false;
+    const packageName = segments[index + 1];
+    if (packageName === ".bin") return true;
+    if (packageName === "@cursor" && segments[index + 2]?.startsWith("sdk-")) return true;
+    if (packageName === "@anthropic-ai" && segments[index + 2]?.startsWith("claude-agent-sdk-"))
+      return true;
+    if (packageName !== "node-pty") return false;
+    if (segments[index + 2] === "prebuilds") {
+      return segments[index + 3] === `win32-${unusedArch}`;
+    }
+    return (
+      segments[index + 2] === "third_party" &&
+      segments[index + 3] === "conpty" &&
+      segments[index + 5] === `win10-${unusedArch}`
+    );
+  });
+}
+
 // Stage and pack the Windows server sidecar: the bundled server plus a hoisted
 // install of only its runtime-external/native dependency closure for win32.
 // The Windows primary runs from the archive through the asar-aware
@@ -3052,47 +3075,107 @@ export const packWindowsServerAsar = Effect.fn("packWindowsServerAsar")(function
 }) {
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
-  // Native addons are unpacked only when they are Windows PE ("MZ") binaries.
-  // Signed builds Authenticode-sign every unpacked .node file, which fails on
-  // the darwin and linux prebuilds some packages (node-pty) ship alongside
-  // their win32 ones. The Windows primary never loads those, so they stay packed.
-  const unpackGlobs: string[] = [...WINDOWS_SERVER_ASAR_UNPACK_GLOBS];
-  for (const entry of yield* fs.readDirectory(input.sourceDir, { recursive: true })) {
-    if (!entry.endsWith(".node")) continue;
-    const addonPath = path.join(input.sourceDir, entry);
-    if ((yield* fs.stat(addonPath)).type !== "File") continue;
-    const bytes = yield* fs.readFile(addonPath);
-    if (bytes[0] !== 0x4d || bytes[1] !== 0x5a) continue;
-    const posixPath = entry.split(path.sep).join("/");
-    // Backslash escapes are path separators to minimatch on Windows.
-    if (/[\\*?[\]{}(),]/.test(posixPath)) {
-      return yield* new WindowsServerSidecarPackError({
-        asarPath: input.asarPath,
-        cause: new Error(`native addon path contains glob syntax: ${posixPath}`),
+  const sourceDir = yield* fs.realPath(input.sourceDir);
+  const filenames: string[] = [];
+  const metadata: NonNullable<Parameters<typeof createPackageFromFiles>[3]> = {};
+  const unpackedFilenames: string[] = [];
+  const pendingDirectories = [sourceDir];
+  while (pendingDirectories.length > 0) {
+    const directory = pendingDirectories.pop();
+    if (directory === undefined) break;
+    for (const basename of (yield* fs.readDirectory(directory)).sort()) {
+      const fullPath = path.join(directory, basename);
+      const relativePath = path.relative(sourceDir, fullPath);
+      const segments = relativePath.split(path.sep);
+      if (isWindowsServerAsarExcluded(segments, input.arch)) continue;
+      const stat = yield* Effect.tryPromise({
+        try: () => NodeFSP.lstat(fullPath),
+        catch: (cause) => new WindowsServerSidecarPackError({ asarPath: input.asarPath, cause }),
       });
+      if (stat.isDirectory()) {
+        if (!basename.endsWith(".map")) {
+          filenames.push(fullPath);
+          metadata[fullPath] = { type: "directory", stat };
+        }
+        pendingDirectories.push(fullPath);
+        continue;
+      }
+      if (basename.endsWith(".map")) continue;
+      if (!stat.isFile() && !stat.isSymbolicLink()) {
+        return yield* new WindowsServerSidecarPackError({
+          asarPath: input.asarPath,
+          cause: new Error(`Unknown file type for file: ${fullPath}`),
+        });
+      }
+      // Only PE .node files can be Authenticode-signed; ELF/Mach-O stay packed.
+      let unpacked = /\.(?:dll|exe|so(?:\..*)?|dylib)$/.test(basename);
+      if (basename.endsWith(".node") && (yield* fs.stat(fullPath)).type === "File") {
+        const bytes = yield* fs.readFile(fullPath);
+        unpacked = bytes[0] === 0x4d && bytes[1] === 0x5a;
+      }
+      if (stat.isSymbolicLink()) {
+        const target = yield* fs.readLink(fullPath);
+        const parent = yield* fs.realPath(path.dirname(fullPath));
+        const archiveTarget = path.relative(sourceDir, path.resolve(parent, target));
+        if (
+          path.isAbsolute(archiveTarget) ||
+          archiveTarget === ".." ||
+          archiveTarget.startsWith(`..${path.sep}`)
+        ) {
+          return yield* new WindowsServerSidecarPackError({
+            asarPath: input.asarPath,
+            cause: new Error(`${fullPath}: file "${archiveTarget}" links out of the package`),
+          });
+        }
+      }
+      filenames.push(fullPath);
+      metadata[fullPath] = { type: stat.isSymbolicLink() ? "link" : "file", stat };
+      if (unpacked) unpackedFilenames.push(fullPath);
     }
-    unpackGlobs.push(`**/${posixPath}`);
   }
-  yield* Effect.tryPromise({
-    try: () =>
-      createPackageWithOptions(input.sourceDir, input.asarPath, {
-        dot: true,
-        unpack: `{${unpackGlobs.join(",")}}`,
-        // glob 13 (via @electron/asar 4) matches `ignore` relative to `cwd`,
-        // not against the absolute paths it crawls, so anchor it at the source.
-        globOptions: {
-          cwd: input.sourceDir,
-          ignore: resolveWindowsServerAsarIgnoreGlobs(input.arch),
-        },
-      }),
-    catch: (cause) => new WindowsServerSidecarPackError({ asarPath: input.asarPath, cause }),
-  });
-  const unpackedDirPath = `${input.asarPath}.unpacked`;
-  if (!(yield* fs.exists(unpackedDirPath))) {
+  if (!unpackedFilenames.some((filename) => metadata[filename]?.type === "file")) {
     return yield* new WindowsServerSidecarPackError({
       asarPath: input.asarPath,
-      cause: new Error(`expected native binaries at ${unpackedDirPath}, but none were unpacked`),
+      cause: new Error(
+        `expected native binaries at ${input.asarPath}.unpacked, but none were unpacked`,
+      ),
     });
+  }
+  filenames.sort();
+  if (unpackedFilenames.some((filename) => /[\r\n\u2028\u2029]/.test(filename))) {
+    return yield* new WindowsServerSidecarPackError({
+      asarPath: input.asarPath,
+      cause: new Error("native source paths containing line terminators cannot be unpacked safely"),
+    });
+  }
+  // ASAR's file API hashes absolute source filenames, but still minimatches unpack.
+  // Escape each literal path before combining the selected natives in one pattern.
+  const unpackPatterns = unpackedFilenames.map((filename) =>
+    filename
+      .split(path.sep)
+      .join("/")
+      .replace(/[\\*?[\]{}(),!+@|]/g, (character) =>
+        character === "\\" ? "\\\\\\\\" : `\\${character}`,
+      ),
+  );
+  // Always brace-expand, including one selection: expansion consumes one backslash
+  // escape layer before minimatch consumes the second for literal POSIX backslashes.
+  const unpack = `{${[...unpackPatterns, unpackPatterns[0]].join(",")}}`;
+  const unpackedDirPath = `${input.asarPath}.unpacked`;
+  yield* fs.remove(unpackedDirPath, { recursive: true, force: true });
+  yield* Effect.tryPromise({
+    try: () => createPackageFromFiles(sourceDir, input.asarPath, filenames, metadata, { unpack }),
+    catch: (cause) => new WindowsServerSidecarPackError({ asarPath: input.asarPath, cause }),
+  });
+  for (const filename of unpackedFilenames) {
+    if (metadata[filename]?.type !== "file") continue;
+    const unpackedPath = path.join(unpackedDirPath, path.relative(sourceDir, filename));
+    if (!(yield* fs.exists(unpackedPath))) {
+      return yield* new WindowsServerSidecarPackError({
+        asarPath: input.asarPath,
+        cause: new Error(`expected native binary at ${unpackedPath}, but it was not unpacked`),
+      });
+    }
   }
 });
 

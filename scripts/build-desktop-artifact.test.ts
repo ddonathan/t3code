@@ -1,9 +1,10 @@
 // @effect-diagnostics nodeBuiltinImport:off - Tests use Node's glob matcher to verify electron-builder exclusions.
 import * as NodeCrypto from "node:crypto";
 import * as NodePath from "node:path";
+import * as NodeChildProcess from "node:child_process";
 
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import { extractFile } from "@electron/asar";
+import { extractFile, listPackage, statFile } from "@electron/asar";
 import { assert, it } from "@effect/vitest";
 import * as ConfigProvider from "effect/ConfigProvider";
 import * as FileSystem from "effect/FileSystem";
@@ -17,6 +18,7 @@ import { ChildProcess, ChildProcessSpawner } from "effect/process";
 
 import {
   BundleNotSelfContainedError,
+  WindowsServerSidecarPackError,
   BuildCommandFailedError,
   parseWslRuntimeArchiveMembers,
   DesktopDmgBackgroundSourceMissingError,
@@ -938,6 +940,485 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
       "**/node_modules/node-pty/third_party/conpty/*/win10-x64/**",
     ]);
   });
+
+  it.effect.each([".hidden", ".hidden/a[1]", ".hidden/a{x,y}"])(
+    "packs nonempty archives from literal staging ancestor %s",
+    (parent) =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const fs = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          const tempDir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-asar-ancestor-" });
+          const sourceDir = path.join(tempDir, parent, "server");
+          yield* fs.makeDirectory(sourceDir, { recursive: true });
+          yield* fs.writeFileString(path.join(sourceDir, "addon.node"), "MZ exact addon");
+          yield* fs.writeFileString(
+            path.join(sourceDir, "package.json"),
+            '{"name":"literal-source"}',
+          );
+          const asarPath = path.join(tempDir, "server.asar");
+          yield* packWindowsServerAsar({ sourceDir, asarPath, arch: "x64" });
+          assert.equal(
+            yield* fs.readFileString(path.join(`${asarPath}.unpacked`, "addon.node")),
+            "MZ exact addon",
+          );
+          assert.equal(
+            extractFile(asarPath, "package.json").toString(),
+            '{"name":"literal-source"}',
+          );
+          assert.notProperty(statFile(asarPath, "package.json"), "unpacked");
+          assert.deepStrictEqual(
+            listPackage(asarPath, { isPack: false }).sort(),
+            [path.join(path.sep, "addon.node"), path.join(path.sep, "package.json")].sort(),
+          );
+        }),
+      ),
+  );
+
+  it.effect.each(
+    [".hidden", ".hidden/a[1]", ".hidden/a{x,y}", ".hidden/a\\b"].flatMap((parent) =>
+      (["x64", "arm64"] as const).map((arch) => ({ parent, arch })),
+    ),
+  )("packs literal source and entry paths under $parent for $arch", ({ parent, arch }) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const tempDir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-asar-literal-" });
+        const sourceDir = path.join(tempDir, parent, "server");
+        const target = `node_modules/node-pty/prebuilds/win32-${arch}/.native[1]{x,y}/pty.node`;
+        const elf = "node_modules/node-pty/prebuilds/linux-x64/.native[1]{x,y}/pty.node";
+        const helper = `node_modules/node-pty/third_party/conpty/.version[1]{x,y}/win10-${arch}/.helper.exe`;
+        const unusedArch = arch === "x64" ? "arm64" : "x64";
+        const excluded = [
+          `node_modules/node-pty/prebuilds/win32-${unusedArch}/pty.node`,
+          `node_modules/node-pty/third_party/conpty/.version[1]{x,y}/win10-${unusedArch}/OpenConsole.exe`,
+          ".nested/node_modules/@cursor/sdk-win32-x64/index.js",
+          ".nested/node_modules/@anthropic-ai/claude-agent-sdk-win32-x64/index.js",
+          ".nested/node_modules/.bin/shim",
+          ".nested/debug.map",
+        ];
+        const files = [
+          [target, "MZ target"],
+          [elf, "\x7fELF packed"],
+          [helper, "MZ helper"],
+          ["apps/server/dist/bin.mjs", "export {}"],
+          [".nested/node_modules/@cursor/sdk/index.js", "retained SDK"],
+          [".empty-file", ""],
+          [".nested/directory.map/retained.js", "retained under map directory"],
+          ...excluded.map((file) => [file, "excluded"]),
+        ];
+        for (const [file, bytes] of files) {
+          if (file === undefined || bytes === undefined) throw new Error("invalid fixture");
+          const filename = path.join(sourceDir, file);
+          yield* fs.makeDirectory(path.dirname(filename), { recursive: true });
+          yield* fs.writeFileString(filename, bytes);
+        }
+        yield* fs.makeDirectory(path.join(sourceDir, ".empty-directory"));
+        const asarPath = path.join(tempDir, "server.asar");
+        yield* packWindowsServerAsar({ sourceDir, asarPath, arch });
+        const contents = listPackage(asarPath, { isPack: false }).map((entry) =>
+          entry.split(path.sep).join("/"),
+        );
+        assert.include(contents, "/apps/server/dist/bin.mjs");
+        assert.include(contents, "/.empty-directory");
+        assert.equal(extractFile(asarPath, ".empty-file").length, 0);
+        assert.equal(
+          extractFile(asarPath, path.join(".nested/directory.map/retained.js")).toString(),
+          "retained under map directory",
+        );
+        assert.equal(
+          extractFile(asarPath, ".nested/node_modules/@cursor/sdk/index.js").toString(),
+          "retained SDK",
+        );
+        for (const file of excluded) assert.notInclude(contents, `/${file}`);
+        for (const [file, bytes] of [
+          [target, "MZ target"],
+          [helper, "MZ helper"],
+        ]) {
+          if (file === undefined || bytes === undefined) throw new Error("invalid fixture");
+          assert.equal(yield* fs.readFileString(path.join(`${asarPath}.unpacked`, file)), bytes);
+          assert.propertyVal(statFile(asarPath, path.join(file)), "unpacked", true);
+        }
+        assert.equal(extractFile(asarPath, path.join(elf)).toString(), "\x7fELF packed");
+        assert.notProperty(statFile(asarPath, path.join(elf)), "unpacked");
+        assert.isFalse(yield* fs.exists(path.join(`${asarPath}.unpacked`, elf)));
+      }),
+    ),
+  );
+
+  it.effect.skipIf(!symlinksSupported)(
+    "preserves relative and absolute in-root ASAR links without traversing directories",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const fs = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          const tempDir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-asar-links-" });
+          const sourceDir = path.join(tempDir, ".hidden/a[1]{x,y}/server");
+          yield* fs.makeDirectory(path.join(sourceDir, "real"), { recursive: true });
+          yield* fs.writeFileString(path.join(sourceDir, "real/addon.node"), "MZ linked");
+          yield* fs.writeFileString(path.join(sourceDir, "real/index.js"), "linked JS");
+          yield* fs.symlink("real/index.js", path.join(sourceDir, "relative.js"));
+          yield* fs.symlink(
+            path.join(sourceDir, "real/index.js"),
+            path.join(sourceDir, "absolute.js"),
+          );
+          yield* fs.symlink("real", path.join(sourceDir, "directory"));
+          yield* fs.symlink("real/addon.node", path.join(sourceDir, "linked.node"));
+          const asarPath = path.join(tempDir, "server.asar");
+          yield* packWindowsServerAsar({ sourceDir, asarPath, arch: "x64" });
+          for (const file of ["relative.js", "absolute.js"]) {
+            assert.propertyVal(
+              statFile(asarPath, file, false),
+              "link",
+              path.join("real", "index.js"),
+            );
+            assert.equal(extractFile(asarPath, file).toString(), "linked JS");
+          }
+          assert.propertyVal(statFile(asarPath, "directory", false), "link", "real");
+          assert.equal(
+            extractFile(asarPath, path.join("directory/index.js")).toString(),
+            "linked JS",
+          );
+          assert.notInclude(
+            listPackage(asarPath, { isPack: false }),
+            path.join(path.sep, "directory/index.js"),
+          );
+          assert.propertyVal(statFile(asarPath, "linked.node", false), "unpacked", true);
+          assert.equal(
+            yield* fs.readFileString(path.join(`${asarPath}.unpacked`, "linked.node")),
+            "MZ linked",
+          );
+          assert.equal(
+            yield* fs.readLink(path.join(`${asarPath}.unpacked`, "linked.node")),
+            path.join("real", "addon.node"),
+          );
+        }),
+      ),
+  );
+
+  it.effect.each([false, true])(
+    "rejects out-of-root ASAR links (absolute=%s)",
+    (absolute) =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const fs = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          const tempDir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-asar-outside-" });
+          const sourceDir = path.join(tempDir, "server");
+          yield* fs.makeDirectory(sourceDir);
+          yield* fs.writeFileString(path.join(sourceDir, "addon.node"), "MZ");
+          yield* fs.writeFileString(path.join(tempDir, "outside.js"), "outside");
+          yield* fs.symlink(
+            absolute ? path.join(tempDir, "outside.js") : "../outside.js",
+            path.join(sourceDir, "link.js"),
+          );
+          const asarPath = path.join(tempDir, "server.asar");
+          const error = yield* packWindowsServerAsar({ sourceDir, asarPath, arch: "x64" }).pipe(
+            Effect.flip,
+          );
+          assert.instanceOf(error, WindowsServerSidecarPackError);
+          assert.include(String(error.cause), "links out of the package");
+          assert.isFalse(yield* fs.exists(asarPath));
+        }),
+      ),
+    { skip: !symlinksSupported },
+  );
+
+  it.effect.each(["native", "win32"] as const)(
+    "hashes extracted source bytes and preserves distinct files despite identical cwd namesakes (host=%s)",
+    (host) =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const fs = yield* FileSystem.FileSystem;
+          const platform = yield* HostProcess.Platform;
+          const path = yield* Path.Path;
+          const tempDir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-asar-integrity-" });
+          const cwd = path.join(tempDir, "cwd");
+          const sourceDir = path.join(
+            tempDir,
+            host === "win32" ? ".source[1]{x,y}/server" : ".source[1]{x,y}\\z/server",
+          );
+          yield* fs.makeDirectory(cwd, { recursive: true });
+          yield* fs.makeDirectory(sourceDir, { recursive: true });
+          const files = [
+            ["package.json", "source package"],
+            ["schema.json", "source schema!"],
+            ["duplicate.json", "source package"],
+            ["empty", ""],
+            ["small-boundary", "a".repeat(2 * 1024 * 1024)],
+            ["large-boundary", "b".repeat(2 * 1024 * 1024 + 1)],
+          ] as const;
+          for (const [filename, bytes] of files) {
+            yield* fs.writeFileString(path.join(sourceDir, filename), bytes);
+            yield* fs.writeFileString(path.join(cwd, filename), "identical cwd bytes");
+          }
+          yield* fs.writeFileString(
+            path.join(sourceDir, ".native[1]{x,y},!+@().node"),
+            "MZ native",
+          );
+          yield* fs.writeFileString(
+            path.join(sourceDir, ".native1x.node"),
+            "\x7fELF packed neighbor",
+          );
+          yield* fs.chmod(path.join(sourceDir, "schema.json"), 0o755);
+          const asarPath = path.join(tempDir, "server.asar");
+          yield* Effect.try({
+            try: () =>
+              NodeChildProcess.execFileSync(
+                process.execPath,
+                [
+                  "--input-type=module",
+                  "-e",
+                  `
+            import * as Effect from ${JSON.stringify(import.meta.resolve("effect/Effect"))};
+            import * as NodeServices from ${JSON.stringify(import.meta.resolve("@effect/platform-node/NodeServices"))};
+            ${host === "win32" ? 'Object.defineProperty(process, "platform", { value: "win32" });' : ""}
+            const { packWindowsServerAsar } = await import(${JSON.stringify(new URL("./build-desktop-artifact.ts", import.meta.url).href)});
+            await Effect.runPromise(packWindowsServerAsar(${JSON.stringify({ sourceDir, asarPath, arch: "x64" })}).pipe(Effect.provide(NodeServices.layer)));
+          `,
+                ],
+                { cwd, encoding: "utf8" },
+              ),
+            catch: (cause) => new WindowsServerSidecarPackError({ asarPath, cause }),
+          });
+          for (const [filename, bytes] of [
+            ...files,
+            [".native1x.node", "\x7fELF packed neighbor"],
+          ] as const) {
+            const extracted = extractFile(asarPath, filename);
+            assert.equal(extracted.toString(), bytes, filename);
+            const entry = statFile(asarPath, filename);
+            if (!("integrity" in entry)) assert.fail(`Expected packed file: ${filename}`);
+            assert.propertyVal(entry, "size", Buffer.byteLength(bytes));
+            assert.equal(
+              entry.integrity.hash,
+              NodeCrypto.createHash("sha256").update(extracted).digest("hex"),
+              filename,
+            );
+            assert.notProperty(entry, "unpacked");
+          }
+          assert.propertyVal(statFile(asarPath, ".native[1]{x,y},!+@().node"), "unpacked", true);
+          assert.equal(
+            yield* fs.readFileString(
+              path.join(`${asarPath}.unpacked`, ".native[1]{x,y},!+@().node"),
+            ),
+            "MZ native",
+          );
+          const packageEntry = statFile(asarPath, "package.json");
+          const schemaEntry = statFile(asarPath, "schema.json");
+          const duplicateEntry = statFile(asarPath, "duplicate.json");
+          if (
+            !("offset" in packageEntry) ||
+            !("offset" in schemaEntry) ||
+            !("offset" in duplicateEntry)
+          )
+            assert.fail("Expected packed dedupe entries");
+          if (host === "native" && platform !== "win32")
+            assert.propertyVal(schemaEntry, "executable", true);
+          assert.notEqual(packageEntry.offset, schemaEntry.offset);
+          assert.equal(packageEntry.offset, duplicateEntry.offset);
+        }),
+      ),
+  );
+
+  it.effect.skipIf(!symlinksSupported)(
+    "rejects a target under build cwd but outside the deeper source before writing an archive",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const fs = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          const tempDir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-asar-cwd-link-" });
+          const cwd = path.join(tempDir, "repo/a/b");
+          const sourceDir = path.join(tempDir, "stage/deeper/server");
+          yield* fs.makeDirectory(cwd, { recursive: true });
+          yield* fs.makeDirectory(sourceDir, { recursive: true });
+          yield* fs.writeFileString(path.join(cwd, "secret.js"), "outside source");
+          yield* fs.writeFileString(path.join(sourceDir, "addon.node"), "MZ");
+          yield* fs.symlink(path.join(cwd, "secret.js"), path.join(sourceDir, "link.js"));
+          const asarPath = path.join(tempDir, "server.asar");
+          yield* Effect.try({
+            try: () =>
+              NodeChildProcess.execFileSync(
+                process.execPath,
+                [
+                  "--input-type=module",
+                  "-e",
+                  `
+            import assert from "node:assert/strict";
+            import * as Effect from ${JSON.stringify(import.meta.resolve("effect/Effect"))};
+            import * as NodeServices from ${JSON.stringify(import.meta.resolve("@effect/platform-node/NodeServices"))};
+            import { packWindowsServerAsar, WindowsServerSidecarPackError } from ${JSON.stringify(new URL("./build-desktop-artifact.ts", import.meta.url).href)};
+            const result = await Effect.runPromise(packWindowsServerAsar(${JSON.stringify({ sourceDir, asarPath, arch: "x64" })}).pipe(Effect.result, Effect.provide(NodeServices.layer)));
+            assert.equal(result._tag, "Failure", "out-of-source cwd link must be refused");
+            assert.ok(result.failure instanceof WindowsServerSidecarPackError);
+            assert.match(String(result.failure.cause), /links out of the package/);
+          `,
+                ],
+                { cwd, encoding: "utf8" },
+              ),
+            catch: (cause) => new WindowsServerSidecarPackError({ asarPath, cause }),
+          });
+          assert.isFalse(yield* fs.exists(asarPath));
+        }),
+      ),
+  );
+
+  it.effect.skipIf(!symlinksSupported)(
+    "rejects different-drive Windows links under an explicitly simulated Windows host before ASAR",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const fs = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          const tempDir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-asar-win-link-" });
+          const realLink = path.join(tempDir, "link.js");
+          yield* fs.symlink("unused", realLink);
+          yield* Effect.try({
+            try: () =>
+              NodeChildProcess.execFileSync(
+                process.execPath,
+                [
+                  "--input-type=module",
+                  "-e",
+                  String.raw`
+            import assert from "node:assert/strict";
+            import fs from "node:fs";
+            import { syncBuiltinESMExports } from "node:module";
+            import * as Effect from ${JSON.stringify(import.meta.resolve("effect/Effect"))};
+            import * as FileSystem from ${JSON.stringify(import.meta.resolve("effect/FileSystem"))};
+            import * as NodePath from ${JSON.stringify(import.meta.resolve("@effect/platform-node/NodePath"))};
+            const stat = await fs.promises.lstat(${JSON.stringify(realLink)});
+            Object.defineProperty(process, "platform", { value: "win32" });
+            assert.equal(process.platform, "win32", "simulation host label");
+            fs.promises.lstat = async (filename) => {
+              assert.equal(filename, "C:\\Temp\\stage\\server\\link.js");
+              return stat;
+            };
+            syncBuiltinESMExports();
+            const { packWindowsServerAsar, WindowsServerSidecarPackError } = await import(${JSON.stringify(new URL("./build-desktop-artifact.ts", import.meta.url).href)});
+            const sourceDir = "C:\\Temp\\stage\\server";
+            const fakeFs = FileSystem.makeNoop({
+              realPath: (filename) => Effect.succeed(filename),
+              readDirectory: () => Effect.succeed(["link.js"]),
+              readLink: () => Effect.succeed("D:\\a\\repo\\secret.js"),
+            });
+            const result = await Effect.runPromise(packWindowsServerAsar({ sourceDir, asarPath: "C:\\output\\server.asar", arch: "x64" }).pipe(
+              Effect.result, Effect.provideService(FileSystem.FileSystem, fakeFs), Effect.provide(NodePath.layerWin32)
+            ));
+            assert.equal(result._tag, "Failure");
+            assert.ok(result.failure instanceof WindowsServerSidecarPackError);
+            assert.match(String(result.failure.cause), /links out of the package/);
+            assert.match(String(result.failure.cause), /D:/);
+          `,
+                ],
+                { encoding: "utf8" },
+              ),
+            catch: (cause) =>
+              new WindowsServerSidecarPackError({
+                asarPath: path.join(tempDir, "server.asar"),
+                cause,
+              }),
+          });
+        }),
+      ),
+  );
+
+  it.effect.skipIf(!symlinksSupported)(
+    "retains in-source link chains with ASAR-owned resolution",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const fs = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          const tempDir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-asar-link-chain-" });
+          const sourceDir = path.join(tempDir, "server");
+          yield* fs.makeDirectory(sourceDir);
+          yield* fs.writeFileString(path.join(sourceDir, "addon.node"), "MZ");
+          yield* fs.writeFileString(path.join(sourceDir, "real.js"), "chain bytes");
+          yield* fs.symlink("real.js", path.join(sourceDir, "first.js"));
+          yield* fs.symlink("first.js", path.join(sourceDir, "second.js"));
+          const asarPath = path.join(tempDir, "server.asar");
+          yield* packWindowsServerAsar({ sourceDir, asarPath, arch: "x64" });
+          assert.propertyVal(statFile(asarPath, "second.js", false), "link", "first.js");
+          assert.equal(extractFile(asarPath, "second.js").toString(), "chain bytes");
+        }),
+      ),
+  );
+
+  it.effect("rejects missing sources and empty archives without native payloads", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const tempDir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-asar-source-failure-" });
+        const asarPath = path.join(tempDir, "server.asar");
+        const sourceDir = path.join(tempDir, "server");
+        yield* packWindowsServerAsar({ sourceDir, asarPath, arch: "x64" }).pipe(Effect.flip);
+        assert.isFalse(yield* fs.exists(asarPath));
+        yield* fs.makeDirectory(sourceDir);
+        yield* fs.makeDirectory(`${asarPath}.unpacked`);
+        const error = yield* packWindowsServerAsar({ sourceDir, asarPath, arch: "x64" }).pipe(
+          Effect.flip,
+        );
+        assert.instanceOf(error, WindowsServerSidecarPackError);
+        assert.include(String(error.cause), "none were unpacked");
+        assert.isFalse(yield* fs.exists(asarPath));
+      }),
+    ),
+  );
+
+  it.effect("rejects line-terminator native paths even with stale unpacked output", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const tempDir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-asar-line-path-" });
+        const asarPath = path.join(tempDir, "server.asar");
+        yield* fs.makeDirectory(`${asarPath}.unpacked`);
+        for (const terminator of ["\n", "\r", "\u2028", "\u2029"]) {
+          const sourceDir = path.join(tempDir, `server${terminator}path`);
+          yield* fs.makeDirectory(sourceDir);
+          yield* fs.writeFileString(path.join(sourceDir, "addon.node"), "MZ");
+          const error = yield* packWindowsServerAsar({ sourceDir, asarPath, arch: "x64" }).pipe(
+            Effect.flip,
+          );
+          assert.instanceOf(error, WindowsServerSidecarPackError);
+          assert.include(String(error.cause), "line terminators");
+          assert.isFalse(yield* fs.exists(asarPath));
+        }
+      }),
+    ),
+  );
+
+  it.effect("removes stale unpacked files and retains each current native payload", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const tempDir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-asar-stale-output-" });
+        const sourceDir = path.join(tempDir, "server");
+        const asarPath = path.join(tempDir, "server.asar");
+        yield* fs.makeDirectory(sourceDir);
+        yield* fs.makeDirectory(`${asarPath}.unpacked`);
+        yield* fs.writeFileString(path.join(`${asarPath}.unpacked`, "obsolete.dll"), "old");
+        for (const name of ["addon.node", "helper.exe"]) {
+          yield* fs.writeFileString(path.join(sourceDir, name), `MZ${name}`);
+        }
+        yield* packWindowsServerAsar({ sourceDir, asarPath, arch: "x64" });
+        assert.isFalse(yield* fs.exists(path.join(`${asarPath}.unpacked`, "obsolete.dll")));
+        for (const name of ["addon.node", "helper.exe"]) {
+          assert.equal(
+            yield* fs.readFileString(path.join(`${asarPath}.unpacked`, name)),
+            `MZ${name}`,
+          );
+          assert.propertyVal(statFile(asarPath, name, false), "unpacked", true);
+        }
+      }),
+    ),
+  );
 
   it.effect("unpacks target Windows natives while excluding the other architecture", () =>
     Effect.scoped(

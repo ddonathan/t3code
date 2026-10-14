@@ -423,3 +423,43 @@ it.effect("ends a runless root turn's items when its node already ended", () =>
     );
   }),
 );
+
+it.each(["active", "paused", "blocked", "complete"] as const)(
+  "keeps parent %s continuation authority out of delegated and native children",
+  (status) => {
+    const parent = {
+      ...makeParentThread(),
+      continuityAutoEnrollDisabled: true,
+      continuity: {
+        generation: CommandId.make("parent-continuity-generation"),
+        authorityMessageId: MessageId.make("parent-only-human-authority"),
+        maxChecks: 3,
+        checksRemaining: status === "blocked" ? 0 : 3,
+        status,
+        reason: "Parent assignment",
+        lastReportedRunId: null,
+        lastAdvancedRunId: null,
+        wait: null,
+      },
+    } satisfies OrchestrationV2AppThread;
+    const original = { ...parent.continuity };
+
+    for (const creationSource of ["mcp", "provider"] as const) {
+      const child = makeSubagentChildThread({
+        parentThread: parent,
+        childThreadId,
+        parentNodeId: NodeId.make("parent-continuity-node"),
+        activeProviderThreadId: null,
+        providerInstanceId: childProviderInstanceId,
+        modelSelection: childModelSelection,
+        title: "Independent child",
+        now: childCreatedAt,
+        createdBy: "agent",
+        creationSource,
+      });
+      assert.isNull(child.continuity);
+      assert.isTrue(child.continuityAutoEnrollDisabled);
+      assert.deepEqual(parent.continuity, original);
+    }
+  },
+);

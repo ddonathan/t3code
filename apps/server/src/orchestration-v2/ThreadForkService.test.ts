@@ -228,3 +228,31 @@ it.effect("rejects in-progress and rolled-back fork sources", () =>
     }
   }),
 );
+
+it.effect.each(["active", "paused", "blocked", "complete"] as const)(
+  "keeps parent %s continuation authority and opt-out out of the fork ledger",
+  (status) =>
+    Effect.gen(function* () {
+      const parent = {
+        ...makeSourceThread(),
+        continuityAutoEnrollDisabled: true,
+        continuity: {
+          generation: CommandId.make("parent-continuity-generation"),
+          authorityMessageId: MessageId.make("parent-only-human-authority"),
+          maxChecks: 3,
+          checksRemaining: status === "blocked" ? 0 : 3,
+          status,
+          reason: "Parent assignment",
+          lastReportedRunId: null,
+          lastAdvancedRunId: null,
+          wait: null,
+        },
+      } satisfies OrchestrationV2AppThread;
+      const original = { ...parent.continuity };
+
+      const fork = yield* planFork(makeSourceRun("failed"), parent);
+      assert.isNull(fork.targetThread.continuity);
+      assert.isTrue(fork.targetThread.continuityAutoEnrollDisabled);
+      assert.deepEqual(parent.continuity, original);
+    }),
+);

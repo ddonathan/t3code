@@ -141,6 +141,8 @@ function makeRun(input: {
 
 it("the actual orchestrator MCP toolkit registers continuity with an object wire schema", async () => {
   const layer = McpHttpServer.layerOrchestratorToolkit.pipe(
+    Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
+    Layer.provide(Layer.mock(GitVcsDriver.GitVcsDriver)({})),
     Layer.provideMerge(McpServer.McpServer.layer),
     Layer.provide(
       Layer.mergeAll(
@@ -205,7 +207,7 @@ it("continuity mutations cannot target a different thread and read/list preserve
     wait: { kind: "delegated_task", taskId },
   };
   const shell = { ...liveThreadShell(parentThreadId, { activeRunId: null }), continuity };
-  const layer = OrchestratorMcpService.layer.pipe(
+  const layer = layerOrchestratorService.pipe(
     Layer.provide(
       Layer.mergeAll(
         Layer.mock(ThreadManagementService.ThreadManagementService)({
@@ -271,7 +273,7 @@ it("MCP re-enrollment for the same authority cannot refill exhausted checks or r
     wait: null,
   };
   const shell = { ...liveThreadShell(parentThreadId, { activeRunId: null }), continuity };
-  const layer = OrchestratorMcpService.layer.pipe(
+  const layer = layerOrchestratorService.pipe(
     Layer.provide(
       Layer.mergeAll(
         Layer.mock(ThreadManagementService.ThreadManagementService)({
@@ -315,7 +317,7 @@ it.each(["enable", "disable"] as const)(
       continuityAutoEnrollDisabled: true,
     };
     let dispatched = 0;
-    const layer = OrchestratorMcpService.layer.pipe(
+    const layer = layerOrchestratorService.pipe(
       Layer.provide(
         Layer.mergeAll(
           Layer.mock(ThreadManagementService.ThreadManagementService)({
@@ -388,7 +390,7 @@ it.each(["active", "paused", "blocked", "usage_limited", "budget_limited", "comp
       status: "idle",
       goal,
     });
-    const layer = OrchestratorMcpService.layer.pipe(
+    const layer = layerOrchestratorService.pipe(
       Layer.provide(
         Layer.mergeAll(
           Layer.mock(ThreadManagementService.ThreadManagementService)({
@@ -658,7 +660,7 @@ it.each(["read", "cancel"] as const)(
       runs: [run],
     };
     const writes: string[] = [];
-    const layer = OrchestratorMcpService.layer.pipe(
+    const layer = layerOrchestratorService.pipe(
       Layer.provide(
         Layer.mergeAll(
           Layer.mock(ThreadManagementService.ThreadManagementService)({
@@ -1036,7 +1038,7 @@ it("MCP read list and wait expose capacity ownership without hiding raw failure 
     capacityRecovery: recovery,
   };
   const projection = () => ({ ...idleThreadProjection(shell), runs: [run] });
-  const layer = OrchestratorMcpService.layer.pipe(
+  const layer = layerOrchestratorService.pipe(
     Layer.provide(
       Layer.mergeAll(
         Layer.mock(ThreadManagementService.ThreadManagementService)({

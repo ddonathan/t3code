@@ -183,6 +183,30 @@ describe("ssh tunnel scripts", () => {
     );
   });
 
+  it("refuses local patched archives before generating launch or pairing installers", () => {
+    for (const archiveVersion of [
+      "0.0.46-nightly.20261013.3053.continuity.45",
+      "0.0.46-preview.20261013.3053.continuity.45",
+      "0.0.46-nightly.20261012.3021.continuity.rollback.r47",
+    ]) {
+      assert.throws(
+        () => SshTunnel.buildRemoteLaunchScript({ archiveVersion }),
+        SshTunnel.SshLocalArchiveUnavailableError,
+      );
+      assert.throws(
+        () => SshTunnel.buildRemotePairingScript("test", { archiveVersion }),
+        SshTunnel.SshLocalArchiveUnavailableError,
+      );
+    }
+    assert.include(
+      SshTunnel.buildRemoteT3RunnerScript({
+        ...NODE_SCRIPT,
+        archiveVersion: "0.0.46-nightly.20261013.3053.continuity.45",
+      }),
+      "T3_NODE_SCRIPT_PATH=",
+    );
+  });
+
   it("refuses to build a runner with neither an archive version nor a node script", () => {
     for (const input of [undefined, {}, { archiveVersion: "  " }, { nodeScriptPath: null }]) {
       assert.throws(

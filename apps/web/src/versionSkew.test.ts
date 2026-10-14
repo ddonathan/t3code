@@ -46,24 +46,53 @@ describe("versionSkew", () => {
       updateTargetVersion: official,
       hint: MISMATCH_HINT,
     });
-    expect(manualServerUpdateCommand(mismatch!.updateTargetVersion!)).toBe(`npx t3@${official}`);
+    expect(manualServerUpdateCommand(official, undefined, server)).toBeNull();
+    expect(
+      manualServerUpdateCommand(
+        `${official}.continuity.45`,
+        undefined,
+        "0.0.46-nightly.20261012.3021",
+      ),
+    ).toBe(`npx t3@${official}`);
   });
 
   it("updates only the proven npm prefix and safely quotes its path", () => {
-    expect(manualServerUpdateCommand("0.0.45", { kind: "npm-global", prefix: "/opt/node" })).toBe(
-      "npm install --global --prefix '/opt/node' t3@0.0.45",
-    );
     expect(
-      manualServerUpdateCommand("0.0.45", { kind: "npm-global", prefix: "/opt/maria's node" }),
+      manualServerUpdateCommand("0.0.45", { kind: "npm-global", prefix: "/opt/node" }, "0.0.44"),
+    ).toBe("npm install --global --prefix '/opt/node' t3@0.0.45");
+    expect(
+      manualServerUpdateCommand(
+        "0.0.45",
+        { kind: "npm-global", prefix: "/opt/maria's node" },
+        "0.0.44",
+      ),
     ).toBe("npm install --global --prefix '/opt/maria'\\''s node' t3@0.0.45");
   });
 
   it("keeps runner and unknown commands as relaunches", () => {
-    expect(manualServerUpdateCommand("0.0.45")).toBe("npx t3@0.0.45");
-    expect(manualServerUpdateCommand("0.0.45", { kind: "npx" })).toBe("npx t3@0.0.45");
-    expect(manualServerUpdateCommand("0.0.45", { kind: "pnpm-dlx" })).toBe("pnpm dlx t3@0.0.45");
-    expect(manualServerUpdateCommand("0.0.45", { kind: "bunx" })).toBe("bunx t3@0.0.45");
+    expect(manualServerUpdateCommand("0.0.45", undefined, "0.0.44")).toBe("npx t3@0.0.45");
+    expect(manualServerUpdateCommand("0.0.45", { kind: "npx" }, "0.0.44")).toBe("npx t3@0.0.45");
+    expect(manualServerUpdateCommand("0.0.45", { kind: "pnpm-dlx" }, "0.0.44")).toBe(
+      "pnpm dlx t3@0.0.45",
+    );
+    expect(manualServerUpdateCommand("0.0.45", { kind: "bunx" }, "0.0.44")).toBe("bunx t3@0.0.45");
   });
+  it.each([undefined, "0.0.46-nightly.20261012.3021.continuity.2", "dev"])(
+    "never emits an npm replacement command for an unverified or patched server (%s)",
+    (serverVersion) => {
+      for (const installation of [
+        undefined,
+        { kind: "npx" },
+        { kind: "pnpm-dlx" },
+        { kind: "bunx" },
+        { kind: "npm-global", prefix: "/opt/node" },
+      ] as const) {
+        expect(
+          manualServerUpdateCommand("0.0.46-nightly.20261013.3053", installation, serverVersion),
+        ).toBeNull();
+      }
+    },
+  );
   beforeEach(() => {
     branding.APP_VERSION = "0.0.34";
   });

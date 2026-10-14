@@ -1,3 +1,4 @@
+import { resolvePublicCliUpdateTarget } from "@t3tools/shared/cliRelease";
 import {
   ORCHESTRATION_PROTOCOL_VERSION,
   type EnvironmentId,
@@ -69,6 +70,9 @@ export const updateOutdatedHost = Effect.fn("clientRuntime.connection.updateOutd
     const { prepared, descriptor } = yield* Effect.firstSuccessOf(
       connectionRoutes(entry).map((route) => resolver.prepareForUpdate(routeEntry(entry, route))),
     );
+    const eligibility = resolvePublicCliUpdateTarget(descriptor.serverVersion, input.targetVersion);
+    if (eligibility._tag !== "Allowed") return yield* eligibility;
+    input = { ...input, targetVersion: eligibility.targetVersion };
     const capabilities = descriptor.capabilities;
     if (
       capabilities.serverSelfUpdate === undefined ||

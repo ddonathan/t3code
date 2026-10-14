@@ -1,3 +1,4 @@
+import { publishedCliVersion, resolvePublicCliUpdateTarget } from "@t3tools/shared/cliRelease";
 import type { EnvironmentId, ServerSelfUpdateInput } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
@@ -47,7 +48,7 @@ export function createOutdatedServerUpdateCommand<E>(
     },
     execute: (target: OutdatedServerUpdateTarget, atomRegistry) => {
       const stateAtom = serverUpdateStateAtom(target.environmentId);
-      const targetVersion = target.input.targetVersion;
+      const targetVersion = publishedCliVersion(target.input.targetVersion);
       const fromVersion = target.fromVersion ?? targetVersion;
       let currentStage: ServerUpdateStage = "downloading";
       const setStage = (stage: ServerUpdateStage) =>
@@ -56,7 +57,19 @@ export function createOutdatedServerUpdateCommand<E>(
           atomRegistry.set(stateAtom, { status: "running", stage, fromVersion, targetVersion });
         });
       return setStage(currentStage).pipe(
-        Effect.andThen(updateOutdatedHost(target.environmentId, target.input, setStage)),
+        Effect.andThen(
+          Effect.suspend(() => {
+            if (target.fromVersion !== undefined) {
+              const eligibility = resolvePublicCliUpdateTarget(target.fromVersion, targetVersion);
+              if (eligibility._tag !== "Allowed") return Effect.fail(eligibility);
+            }
+            return updateOutdatedHost(
+              target.environmentId,
+              { ...target.input, targetVersion },
+              setStage,
+            );
+          }),
+        ),
         Effect.onExit((exit) =>
           Effect.sync(() => {
             if (Exit.isSuccess(exit) || Cause.hasInterruptsOnly(exit.cause)) {

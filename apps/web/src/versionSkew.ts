@@ -5,6 +5,7 @@ import type {
   ServerSelfUpdateCapability,
 } from "@t3tools/contracts";
 import type { ServerUpdateState } from "@t3tools/client-runtime/state/server";
+import { publishedCliVersion, resolvePublicCliUpdateTarget } from "@t3tools/shared/cliRelease";
 import { compareSemverVersions, parseSemver } from "@t3tools/shared/semver";
 import * as Schema from "effect/Schema";
 
@@ -49,10 +50,6 @@ function versionCore(version: string): string {
   return version.replace(/[-+].*$/, "");
 }
 
-function publishedNightlyVersion(version: string): string {
-  return version.replace(/^([^-+]+-nightly\.\d{8}\.\d+)\.continuity\.\d+$/, "$1");
-}
-
 /**
  * The skew a user can act on: the connected server runs an older T3 Code than
  * this client (or than `clientVersion`, the version this client is about to
@@ -76,8 +73,8 @@ export function resolveVersionMismatch(
 
   const clientCore = versionCore(normalizedClientVersion);
   const serverCore = versionCore(normalizedServerVersion);
-  const clientNightly = publishedNightlyVersion(normalizedClientVersion);
-  const serverNightly = publishedNightlyVersion(normalizedServerVersion);
+  const clientNightly = publishedCliVersion(normalizedClientVersion);
+  const serverNightly = publishedCliVersion(normalizedServerVersion);
   const compareNightlyBuilds =
     parseSemver(normalizedClientVersion)?.prerelease[0] === "nightly" &&
     parseSemver(normalizedServerVersion)?.prerelease[0] === "nightly";
@@ -134,7 +131,11 @@ export function supportsServerUpdateThreadContinuation(
 export function manualServerUpdateCommand(
   targetVersion: string,
   installation?: ServerInstallation,
-): string {
+  serverVersion?: string | null,
+): string | null {
+  const eligibility = resolvePublicCliUpdateTarget(serverVersion, targetVersion);
+  if (eligibility._tag !== "Allowed") return null;
+  targetVersion = eligibility.targetVersion;
   if (installation?.kind === "npm-global") {
     const prefix = `'${installation.prefix.replaceAll("'", "'\\''")}'`;
     return `npm install --global --prefix ${prefix} t3@${targetVersion}`;

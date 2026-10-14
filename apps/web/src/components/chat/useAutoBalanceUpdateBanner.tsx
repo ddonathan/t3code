@@ -1,3 +1,4 @@
+import { publishedCliVersion, resolvePublicCliUpdateTarget } from "@t3tools/shared/cliRelease";
 import { useAtomValue } from "@effect/atom-react";
 import type { ServerUpdateState } from "@t3tools/client-runtime/state/server";
 import { Atom } from "effect/reactivity";
@@ -59,6 +60,15 @@ export function useAutoBalanceUpdateBanner(
       return [];
     const selfUpdate = resolveServerSelfUpdateCapability(environment.serverConfig);
     const desktopAppUpdate = supportsDesktopAppUpdate(environment.serverConfig);
+    const targetVersion = publishedCliVersion(
+      state.status === "idle"
+        ? (mismatch?.updateTargetVersion ?? mismatch?.clientVersion ?? "")
+        : state.targetVersion,
+    );
+    const eligibility = resolvePublicCliUpdateTarget(
+      environment.serverConfig?.environment.serverVersion,
+      targetVersion,
+    );
     return [
       {
         environmentId: environment.environmentId,
@@ -69,9 +79,13 @@ export function useAutoBalanceUpdateBanner(
         threadContinuation: supportsServerUpdateThreadContinuation(environment.serverConfig),
         continueThreadsAfterServerUpdate:
           environment.serverConfig?.settings.continueThreadsAfterServerUpdate ?? false,
-        targetVersion: state.status === "idle" ? mismatch!.clientVersion : state.targetVersion,
+        targetVersion,
+        blockedGuidance: eligibility._tag === "Allowed" ? null : eligibility.message,
         connected: environment.connection.phase === "connected",
-        remoteUpdate: selfUpdate !== null && (selfUpdate !== "desktop-managed" || desktopAppUpdate),
+        remoteUpdate:
+          eligibility._tag === "Allowed" &&
+          selfUpdate !== null &&
+          (selfUpdate !== "desktop-managed" || desktopAppUpdate),
         state,
         dismissKey,
       },
@@ -112,8 +126,10 @@ export function useAutoBalanceUpdateBanner(
                   <ServerUpdateProgress state={machine.state} />
                 ) : !machine.remoteUpdate ? (
                   <>
-                    <div className="text-muted-foreground">Manual update required</div>
-                    <ServerUpdateAction {...machine} />
+                    <div className="text-muted-foreground">
+                      {machine.blockedGuidance ?? "Manual update required"}
+                    </div>
+                    {machine.blockedGuidance === null ? <ServerUpdateAction {...machine} /> : null}
                   </>
                 ) : (
                   <div className="text-muted-foreground">

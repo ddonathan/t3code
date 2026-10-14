@@ -14,6 +14,8 @@ const testState = vi.hoisted(() => ({
   continueThreadsAfterServerUpdate: false,
   session: null as AsyncResult.AsyncResult<AuthSessionState, Error> | null,
   sessionAtom: Symbol("session"),
+  configAtom: Symbol("config"),
+  serverConfig: { environment: { serverVersion: "0.0.30" } },
 }));
 
 vi.mock("~/hooks/useCopyToClipboard", () => ({
@@ -30,15 +32,24 @@ vi.mock("~/hooks/useSettings", () => ({
     selector: (settings: { continueThreadsAfterServerUpdate: boolean }) => unknown,
   ) => selector({ continueThreadsAfterServerUpdate: testState.continueThreadsAfterServerUpdate }),
 }));
-vi.mock("@effect/atom-react", () => ({ useAtomValue: () => testState.session }));
+vi.mock("@effect/atom-react", () => ({
+  useAtomValue: (atom: unknown) =>
+    atom === testState.configAtom ? testState.serverConfig : testState.session,
+}));
 vi.mock("~/rpc/atomRegistry", () => ({
-  appAtomRegistry: { get: () => testState.session },
+  appAtomRegistry: {
+    get: (atom: unknown) =>
+      atom === testState.configAtom ? testState.serverConfig : testState.session,
+  },
 }));
 vi.mock("~/state/session", () => ({
   environmentSession: { sessionStateAtom: () => testState.sessionAtom },
 }));
 vi.mock("~/state/server", () => ({
-  serverEnvironment: { updateServer: Symbol("updateServer") },
+  serverEnvironment: {
+    updateServer: Symbol("updateServer"),
+    configValueAtom: () => testState.configAtom,
+  },
 }));
 vi.mock("~/state/use-atom-command", () => ({
   useAtomCommand: () => testState.updateServer,

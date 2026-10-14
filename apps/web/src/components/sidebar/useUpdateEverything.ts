@@ -1,3 +1,4 @@
+import { publishedCliVersion } from "@t3tools/shared/cliRelease";
 import { useAtomValue } from "@effect/atom-react";
 import { PROVIDER_DISPLAY_NAMES } from "@t3tools/contracts";
 import { Atom } from "effect/reactivity";
@@ -27,7 +28,7 @@ import {
  * this app's own download and install when given.
  */
 export function useUpdateEverything(localUpdateVersion: string | null) {
-  const targetVersion = localUpdateVersion ?? APP_VERSION;
+  const targetVersion = publishedCliVersion(localUpdateVersion ?? APP_VERSION);
   const { environments } = useEnvironments();
   const machinesAtom = useMemo(
     () =>

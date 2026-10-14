@@ -1,3 +1,4 @@
+import { publishedCliVersion, resolvePublicCliUpdateTarget } from "@t3tools/shared/cliRelease";
 import { useAtomValue } from "@effect/atom-react";
 import {
   AuthEnvironmentMaintainScope,
@@ -81,7 +82,7 @@ export function useServerUpdate() {
       const result = await updateServer({
         environmentId,
         input: {
-          targetVersion,
+          targetVersion: publishedCliVersion(targetVersion),
           ...(target.threadContinuation && target.continueThreadsAfterServerUpdate
             ? { continueRunningThreads: true }
             : {}),
@@ -127,7 +128,12 @@ export function ServerUpdatesAction({
   const eligible = targets.filter(
     (target) =>
       target.selfUpdate !== null &&
-      (target.selfUpdate !== "desktop-managed" || target.desktopAppUpdate),
+      (target.selfUpdate !== "desktop-managed" || target.desktopAppUpdate) &&
+      resolvePublicCliUpdateTarget(
+        appAtomRegistry.get(serverEnvironment.configValueAtom(target.environmentId))?.environment
+          .serverVersion,
+        target.targetVersion,
+      )._tag === "Allowed",
   );
   const handleUpdate = async () => {
     if (pending.current) return;
@@ -226,6 +232,11 @@ export function ServerUpdateAction({
   appearance = "button",
 }: Omit<ServerUpdateTarget, "continueThreadsAfterServerUpdate"> & UpdateButtonProps) {
   const isDesktopAppUpdate = selfUpdate === "desktop-managed";
+  const serverConfig = useAtomValue(serverEnvironment.configValueAtom(environmentId));
+  const eligibility = resolvePublicCliUpdateTarget(
+    serverConfig?.environment.serverVersion,
+    targetVersion,
+  );
   const sessionStateAtom = environmentSession.sessionStateAtom(environmentId);
   const canUpdate = canUpdateServer(useAtomValue(sessionStateAtom));
   const continueThreadsAfterServerUpdate = useEnvironmentSettings(
@@ -286,6 +297,10 @@ export function ServerUpdateAction({
     });
   };
 
+  if (eligibility._tag !== "Allowed") {
+    return <span className="text-muted-foreground text-xs">{eligibility.message}</span>;
+  }
+
   if (selfUpdate === "desktop-managed" && !desktopAppUpdate) {
     return (
       <span className="text-muted-foreground text-xs">
@@ -295,7 +310,13 @@ export function ServerUpdateAction({
   }
 
   const manualCommand =
-    selfUpdate === null ? manualServerUpdateCommand(targetVersion, installation) : null;
+    selfUpdate === null
+      ? manualServerUpdateCommand(
+          targetVersion,
+          installation,
+          serverConfig?.environment.serverVersion,
+        )
+      : null;
   const actionLabel =
     manualCommand !== null
       ? installation?.kind === "npm-global"
@@ -366,7 +387,7 @@ export function OutdatedServerUpdateAction({
     try {
       const result = await update({
         environmentId,
-        input: { targetVersion },
+        input: { targetVersion: publishedCliVersion(targetVersion) },
         ...(fromVersion === undefined ? {} : { fromVersion }),
       });
       if (result._tag === "Failure") {
@@ -388,6 +409,10 @@ export function OutdatedServerUpdateAction({
       pendingUpdateEnvironmentIds.delete(environmentId);
     }
   };
+  const eligibility = resolvePublicCliUpdateTarget(fromVersion, targetVersion);
+  if (fromVersion !== undefined && eligibility._tag !== "Allowed") {
+    return <span className="text-muted-foreground text-xs">{eligibility.message}</span>;
+  }
   return (
     <Button size="xs" variant="outline" onClick={() => void handleUpdate()}>
       {label}

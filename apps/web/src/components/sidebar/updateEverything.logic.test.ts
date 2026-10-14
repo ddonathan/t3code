@@ -41,6 +41,25 @@ function machine(
 }
 
 describe("collectServerUpdateTargets", () => {
+  it("selects older official nightlies for a local client while preserving patched, newer, and unverified servers", () => {
+    const old = "0.0.46-nightly.20261012.3021";
+    const target = "0.0.46-nightly.20261013.3053";
+    const modes = ["boot-service", "respawn", "desktop-managed"] as const;
+    const machines = modes.flatMap((mode) => [
+      machine(`official-${mode}`, old, mode),
+      machine(`patched-${mode}`, `${old}.continuity.2`, mode),
+      machine(`newer-${mode}`, "0.0.46-nightly.20261014.3054", mode),
+      machine(`unknown-${mode}`, "dev", mode),
+      machine(`no-config-${mode}`, old, mode, { serverConfig: null }),
+      machine(`no-authority-${mode}`, old, mode, { canMaintain: false }),
+    ]);
+    expect(
+      collectServerUpdateTargets(machines, `${target}.continuity.45`).map(
+        ({ serverLabel, targetVersion }) => [serverLabel, targetVersion],
+      ),
+    ).toEqual(modes.map((mode) => [`official-${mode}`, target]));
+  });
+
   it("updates only remote servers that can move to the target on their channel", () => {
     const targets = collectServerUpdateTargets(
       [

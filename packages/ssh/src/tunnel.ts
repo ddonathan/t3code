@@ -789,6 +789,15 @@ export class SshMissingRunnerError extends Schema.TaggedError<SshMissingRunnerEr
   }
 }
 
+export class SshLocalArchiveUnavailableError extends Schema.TaggedError<SshLocalArchiveUnavailableError>()(
+  "SshLocalArchiveUnavailableError",
+  { archiveVersion: Schema.String },
+) {
+  override get message(): string {
+    return "This desktop uses a locally patched build without a public SSH runtime archive. Connect directly to a server already running the verified patched build. The automatic SSH installer cannot use local patched archives, and an official runtime will not be substituted.";
+  }
+}
+
 export function buildRemoteT3RunnerScript(input?: RemoteT3RunnerOptions): string {
   const nodeScriptPath = input?.nodeScriptPath?.trim() || "";
   const archiveVersion = input?.archiveVersion?.trim() || "";
@@ -797,6 +806,9 @@ export function buildRemoteT3RunnerScript(input?: RemoteT3RunnerOptions): string
   }
   if (archiveVersion !== "" && !EXACT_ARCHIVE_VERSION.test(archiveVersion)) {
     throw new SshInvalidArchiveVersionError({ archiveVersion });
+  }
+  if (nodeScriptPath === "" && /\.continuity(?:\.|$)/u.test(archiveVersion)) {
+    throw new SshLocalArchiveUnavailableError({ archiveVersion });
   }
   // Strip the `/v<version>` the helper appends: the script builds URLs itself.
   const releaseBaseUrl = cliReleaseDownloadBaseUrl("", input?.releaseBaseUrl ?? undefined).replace(

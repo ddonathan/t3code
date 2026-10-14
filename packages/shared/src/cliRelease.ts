@@ -1,3 +1,5 @@
+import * as Schema from "effect/Schema";
+
 /**
  * Naming shared by the release workflow, the runtime installers, and
  * install scripts for the per-platform CLI archives attached to GitHub
@@ -29,7 +31,7 @@ export const CLI_ARCHIVE_PLATFORM_KEYS = [
 export type CliArchivePlatformKey = (typeof CLI_ARCHIVE_PLATFORM_KEYS)[number];
 
 export function cliArchivePlatformKey(
-  platform: NodeJS.Platform,
+  platform: string,
   arch: string,
 ): CliArchivePlatformKey | undefined {
   const key = `${platform}-${arch}`;
@@ -42,7 +44,7 @@ export function cliArchivePlatformKey(
  * PATH cannot open the zip, so the system copy is named by absolute path.
  */
 export function cliArchiveTarCommand(
-  platform: NodeJS.Platform,
+  platform: string,
   env: Readonly<Record<string, string | undefined>>,
 ): string {
   if (platform !== "win32") return "tar";
@@ -86,10 +88,63 @@ export const CLI_RELEASE_CHANNELS: ReadonlyArray<CliReleaseChannel> = [
   "preview",
 ];
 
-/** The release train a version was published on, derived from its prerelease tag. */
+/** Local continuity builds retain their release train without becoming public releases. */
 export function cliReleaseChannelOf(version: string): CliReleaseChannel {
-  const channel = /^[^-+]+-(nightly|preview)\.\d{8}\.\d+$/.exec(version)?.[1];
+  const channel = /^[^-+]+-(nightly|preview)\.\d{8}\.\d+(?:\.continuity\.\d+)?$/.exec(version)?.[1];
   return channel === "nightly" || channel === "preview" ? channel : "stable";
+}
+
+/** The public baseline of an actual local nightly identity; display keeps the original. */
+export function publishedCliVersion(version: string): string {
+  return version.replace(/^(\d+\.\d+\.\d+-nightly\.\d{8}\.\d+)\.continuity\.\d+$/, "$1");
+}
+
+export const PATCHED_SERVER_UPDATE_GUIDANCE =
+  "This server runs local patches. Open its patch registry or ask its installation owner to rebase the patches onto the desired release, verify the patched build, and install it through the registered patched-build installer.";
+
+export class PublicCliUpdateBlocked extends Schema.TaggedError<PublicCliUpdateBlocked>()(
+  "PublicCliUpdateBlocked",
+  {
+    reason: Schema.Literals(["patched-server", "unverified-server", "unpublished-target"]),
+    serverVersion: Schema.NullOr(Schema.String),
+    targetVersion: Schema.String,
+    message: Schema.String,
+  },
+) {}
+
+/** Ordinary update paths cannot establish patch preservation or approve a runtime build. */
+export function resolvePublicCliUpdateTarget(
+  serverVersion: string | null | undefined,
+  requestedVersion: string,
+): { readonly _tag: "Allowed"; readonly targetVersion: string } | PublicCliUpdateBlocked {
+  const targetVersion = publishedCliVersion(requestedVersion);
+  const blocked = (reason: PublicCliUpdateBlocked["reason"], message: string) =>
+    new PublicCliUpdateBlocked({
+      reason,
+      serverVersion: serverVersion ?? null,
+      targetVersion,
+      message,
+    });
+  if (
+    serverVersion &&
+    /^\d+\.\d+\.\d+-(?:nightly|preview)\.\d{8}\.\d+\.continuity\.\d+$/.test(serverVersion)
+  ) {
+    return blocked("patched-server", PATCHED_SERVER_UPDATE_GUIDANCE);
+  }
+  const officialVersion = /^\d+\.\d+\.\d+(?:-(?:nightly|preview)\.\d{8}\.\d+)?$/;
+  if (!serverVersion || !officialVersion.test(serverVersion)) {
+    return blocked(
+      "unverified-server",
+      "The server build is unknown. Verify its version and whether it contains local patches before updating; use the patch maintenance procedure for patched builds.",
+    );
+  }
+  if (!officialVersion.test(targetVersion)) {
+    return blocked(
+      "unpublished-target",
+      "This target is not a public release identity. Use the registered patch maintenance procedure for local builds.",
+    );
+  }
+  return { _tag: "Allowed", targetVersion };
 }
 
 /**
@@ -117,7 +172,7 @@ export function newestCliReleaseVersion(
   for (const release of releases) {
     if (release.draft) continue;
     const version = /^v(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)$/.exec(release.tag_name)?.[1];
-    if (version === undefined) continue;
+    if (version === undefined || /\.continuity\.\d+$/.test(version)) continue;
     if (cliReleaseChannelOf(version) === channel) return version;
   }
   return undefined;

@@ -1,3 +1,4 @@
+import { publishedCliVersion } from "@t3tools/shared/cliRelease";
 import { SessionPermissions } from "./SessionPermissions";
 import { AUTH_SCOPE_OPTIONS as PAIRING_SCOPE_OPTIONS } from "@t3tools/shared/authScopeOptions";
 import {
@@ -1720,7 +1721,7 @@ function SavedBackendListRow({
           environmentId={environmentId}
           serverLabel={`${environment.label} server`}
           fromVersion={lastDescriptor?.serverVersion}
-          targetVersion={APP_VERSION}
+          targetVersion={publishedCliVersion(APP_VERSION)}
           label={serverUpdateState.status === "failed" ? "Retry update" : "Update"}
         />
       ) : null}
@@ -3685,11 +3686,11 @@ export function ConnectionsSettings() {
                       threadContinuation={supportsServerUpdateThreadContinuation(
                         primaryServerConfig,
                       )}
-                      targetVersion={primaryVersionMismatch.clientVersion}
+                      targetVersion={publishedCliVersion(primaryVersionMismatch.clientVersion)}
                       label={
                         primaryServerUpdateState.status === "failed"
                           ? "Retry update"
-                          : `Update to ${primaryVersionMismatch.clientVersion}`
+                          : `Update to ${publishedCliVersion(primaryVersionMismatch.clientVersion)}`
                       }
                     />
                   ) : primaryServerUpdateState.status === "idle" && primaryServerConfig ? (

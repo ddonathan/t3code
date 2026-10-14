@@ -9,6 +9,9 @@ import {
   cliReleaseIndexPageUrl,
   newestCliReleaseVersion,
   parseChecksums,
+  publishedCliVersion,
+  resolvePublicCliUpdateTarget,
+  PATCHED_SERVER_UPDATE_GUIDANCE,
 } from "./cliRelease.ts";
 
 describe("cliRelease", () => {
@@ -72,6 +75,8 @@ describe("cliRelease", () => {
 
   it("picks the newest non-draft release on the requested channel", () => {
     const releases = [
+      { tag_name: "v1.2.4-preview.20260912.9.continuity.1" },
+      { tag_name: "v1.2.4-nightly.20260912.9.continuity.1" },
       { tag_name: "v1.2.4-preview.20260912.9", draft: true },
       { tag_name: "v1.2.4-preview.20260912.8" },
       { tag_name: "v1.2.4-nightly.20260912.7" },
@@ -84,6 +89,69 @@ describe("cliRelease", () => {
     expect(newestCliReleaseVersion(releases, "stable")).toBe("1.2.3");
     expect(newestCliReleaseVersion([{ tag_name: "v1.2.3" }], "preview")).toBeUndefined();
   });
+
+  it("normalizes only anchored numeric nightly continuity identities", () => {
+    const official = "0.0.46-nightly.20261013.3053";
+    expect(publishedCliVersion(`${official}.continuity.45`)).toBe(official);
+    for (const version of [
+      "0.0.46",
+      "0.0.46-preview.20261013.3053.continuity.45",
+      `${official}.other.45`,
+      `${official}.continuity.x`,
+      `${official}.continuity.45+build`,
+      `prefix${official}.continuity.45`,
+    ]) {
+      expect(publishedCliVersion(version)).toBe(version);
+    }
+  });
+
+  it("classifies local release trains without treating their identities as public targets", () => {
+    for (const train of ["nightly", "preview"] as const) {
+      const local = `0.0.46-${train}.20261013.3053.continuity.45`;
+      expect(cliReleaseChannelOf(local)).toBe(train);
+      expect(resolvePublicCliUpdateTarget(local, "0.0.46")).toMatchObject({
+        _tag: "PublicCliUpdateBlocked",
+        reason: "patched-server",
+        serverVersion: local,
+        message: PATCHED_SERVER_UPDATE_GUIDANCE,
+      });
+    }
+  });
+
+  it("allows official targets and repairs an old unpublished retry target only for an official server", () => {
+    const official = "0.0.46-nightly.20261013.3053";
+    expect(
+      resolvePublicCliUpdateTarget("0.0.46-nightly.20261012.3021", `${official}.continuity.45`),
+    ).toEqual({ _tag: "Allowed", targetVersion: official });
+    for (const version of ["0.0.46", official, "0.0.46-preview.20261013.3053"]) {
+      expect(resolvePublicCliUpdateTarget("0.0.45", version)).toEqual({
+        _tag: "Allowed",
+        targetVersion: version,
+      });
+    }
+  });
+
+  it.each([null, undefined, "", "dev", "0.0.46-nightly.20261012.3021.other.2"])(
+    "refuses public replacement when the server identity cannot prove an official build (%s)",
+    (serverVersion) =>
+      expect(resolvePublicCliUpdateTarget(serverVersion, "0.0.46")).toMatchObject({
+        _tag: "PublicCliUpdateBlocked",
+        reason: "unverified-server",
+      }),
+  );
+
+  it.each([
+    "0.0.46-nightly.20261013.3053.other.45",
+    "0.0.46-preview.20261013.3053.continuity.45",
+    "latest",
+    "0.0.46; touch bad",
+  ])("refuses a target outside public release identities (%s)", (targetVersion) =>
+    expect(resolvePublicCliUpdateTarget("0.0.45", targetVersion)).toMatchObject({
+      _tag: "PublicCliUpdateBlocked",
+      reason: "unpublished-target",
+      targetVersion,
+    }),
+  );
 
   it("pages through the release index at the largest page GitHub allows", () => {
     expect(cliReleaseIndexPageUrl(1)).toBe(

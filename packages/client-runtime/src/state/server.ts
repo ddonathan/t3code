@@ -1,3 +1,4 @@
+import { publishedCliVersion, resolvePublicCliUpdateTarget } from "@t3tools/shared/cliRelease";
 import {
   type EnvironmentId,
   type ServerConfig,
@@ -693,7 +694,7 @@ export function createServerEnvironmentAtoms<R, E>(
     concurrency: configConcurrency,
     execute: (target, atomRegistry) => {
       const stateAtom = serverUpdateStateAtom(target.environmentId);
-      let targetVersion = target.input.targetVersion;
+      let targetVersion = publishedCliVersion(target.input.targetVersion);
       let fromVersion =
         atomRegistry.get(configValueAtom(target.environmentId))?.environment.serverVersion ??
         targetVersion;
@@ -730,6 +731,12 @@ export function createServerEnvironmentAtoms<R, E>(
           target,
           Effect.gen(function* () {
             const currentConfig = atomRegistry.get(configValueAtom(target.environmentId));
+            const eligibility = resolvePublicCliUpdateTarget(
+              currentConfig?.environment.serverVersion,
+              targetVersion,
+            );
+            if (eligibility._tag !== "Allowed") return yield* eligibility;
+            const updateInput = { ...target.input, targetVersion: eligibility.targetVersion };
             fromVersion = currentConfig?.environment.serverVersion ?? targetVersion;
             atomRegistry.set(stateAtom, {
               status: "running",
@@ -748,7 +755,7 @@ export function createServerEnvironmentAtoms<R, E>(
                   const streamExit = yield* environmentRegistry
                     .runStream(
                       target.environmentId,
-                      runStream(WS_METHODS.serverUpdateServerWithProgress, target.input),
+                      runStream(WS_METHODS.serverUpdateServerWithProgress, updateInput),
                     )
                     .pipe(
                       Stream.runForEach((event) =>
@@ -777,7 +784,7 @@ export function createServerEnvironmentAtoms<R, E>(
               : yield* Effect.gen(function* () {
                   const selfUpdateMethod = currentConfig?.environment.capabilities.serverSelfUpdate;
                   const exit = yield* environmentRegistry
-                    .run(target.environmentId, request(WS_METHODS.serverUpdateServer, target.input))
+                    .run(target.environmentId, request(WS_METHODS.serverUpdateServer, updateInput))
                     .pipe(Effect.exit);
                   if (Exit.isSuccess(exit)) {
                     return exit.value;

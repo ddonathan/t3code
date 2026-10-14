@@ -68,82 +68,100 @@ const extractingRunner = (fs: FileSystem.FileSystem, path: Path.Path, commands: 
   });
 
 it.layer(NodeServices.layer)("ensurePinnedRuntimeInstalled", (it) => {
-  it.effect.each(["cached-stock", "bad-archive", "bad-staged-executable", "malformed-policy"])(
-    "approval refusal preserves selection and never validates or publishes (%s)",
-    (scenario) =>
-      Effect.gen(function* () {
-        const fs = yield* FileSystem.FileSystem;
-        const path = yield* Path.Path;
-        const baseDir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-approved-install-" });
-        const paths = pinnedRuntimePaths(path, baseDir, version, "linux");
-        const hash = (text: string) => archiveHex(new TextEncoder().encode(text));
-        yield* fs.makeDirectory(path.join(baseDir, "runtime"), { recursive: true });
-        const selectionPath = path.join(baseDir, "runtime", "service-state.json");
-        yield* fs.writeFileString(selectionPath, "previous selection");
-        yield* fs.writeFileString(
-          path.join(baseDir, "runtime", "approved-builds.json"),
-          scenario === "malformed-policy"
-            ? "{"
-            : JSON.stringify({
-                format: 1,
-                builds: [
-                  {
-                    version,
-                    platform: "linux",
-                    arch: "x64",
-                    archiveSha256:
-                      scenario === "bad-archive"
-                        ? yield* hash("wrong archive")
-                        : yield* archiveHex(archiveBytes),
-                    executableSha256: yield* hash("approved patched executable"),
-                    clientTreeSha256: yield* hash("[]"),
-                  },
-                ],
-              }),
-        );
-        if (scenario === "cached-stock") {
-          yield* fs.makeDirectory(paths.versionDir, { recursive: true });
-          yield* fs.writeFileString(paths.entryPath, "stock executable");
-          yield* fs.writeFileString(paths.sentinelPath, version);
-          yield* fs.writeFileString(
-            path.join(paths.versionDir, ".archive-sha256"),
-            yield* archiveHex(archiveBytes),
-          );
-        }
-        let validations = 0;
-        const commands: string[] = [];
-        const requests: string[] = [];
-        const refused = yield* ensurePinnedRuntimeInstalled({
-          baseDir,
-          version,
-          fs,
-          path,
-          platform: "linux",
-          arch: "x64",
-          httpClient: releaseHttpClient(yield* validChecksums, requests),
-          runner: extractingRunner(fs, path, commands),
-          validate: () =>
-            Effect.sync(() => {
-              validations += 1;
+  it.effect.each([
+    "cached-stock",
+    "bad-archive",
+    "bad-staged-executable",
+    "malformed-policy",
+    "unknown-build",
+  ])("approval refusal preserves selection and never validates or publishes (%s)", (scenario) =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const baseDir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-approved-install-" });
+      const paths = pinnedRuntimePaths(path, baseDir, version, "linux");
+      const hash = (text: string) => archiveHex(new TextEncoder().encode(text));
+      yield* fs.makeDirectory(path.join(baseDir, "runtime"), { recursive: true });
+      const selectionPath = path.join(baseDir, "runtime", "service-state.json");
+      yield* fs.writeFileString(selectionPath, "previous selection");
+      yield* fs.writeFileString(
+        path.join(baseDir, "runtime", "approved-builds.json"),
+        scenario === "malformed-policy"
+          ? "{"
+          : JSON.stringify({
+              format: 1,
+              builds: [
+                {
+                  version: scenario === "unknown-build" ? "9.9.9" : version,
+                  platform: "linux",
+                  arch: "x64",
+                  archiveSha256:
+                    scenario === "bad-archive"
+                      ? yield* hash("wrong archive")
+                      : yield* archiveHex(archiveBytes),
+                  executableSha256: yield* hash("approved patched executable"),
+                  clientTreeSha256: yield* hash("[]"),
+                },
+              ],
             }),
-        }).pipe(Effect.flip);
-        assert.instanceOf(refused, PinnedRuntimePreflightBlockedError);
-        assert.include(refused.message, "approved-builds.json");
-        assert.equal(validations, 0);
-        assert.equal(yield* fs.readFileString(selectionPath), "previous selection");
-        if (scenario === "cached-stock")
-          assert.equal(yield* fs.readFileString(paths.entryPath), "stock executable");
-        else assert.isFalse(yield* fs.exists(paths.versionDir));
-        assert.deepEqual(commands, scenario === "bad-staged-executable" ? ["tar"] : []);
-        if (scenario === "cached-stock" || scenario === "malformed-policy")
-          assert.deepEqual(requests, []);
-        const versionsDir = path.join(baseDir, "runtime", "versions");
-        if (yield* fs.exists(versionsDir))
-          assert.deepEqual(
-            (yield* fs.readDirectory(versionsDir)).filter((name) => name.startsWith(".staging-")),
-            [],
-          );
-      }),
+      );
+      const userdataPath = path.join(baseDir, "userdata", "statev2.sqlite");
+      yield* fs.makeDirectory(path.join(baseDir, "userdata"));
+      yield* fs.writeFileString(userdataPath, "existing user data");
+      if (scenario === "unknown-build") {
+        yield* fs.makeDirectory(paths.versionDir, { recursive: true });
+        yield* fs.writeFileString(paths.entryPath, "incomplete existing install");
+      }
+      if (scenario === "cached-stock") {
+        yield* fs.makeDirectory(paths.versionDir, { recursive: true });
+        yield* fs.writeFileString(paths.entryPath, "stock executable");
+        yield* fs.writeFileString(paths.sentinelPath, version);
+        yield* fs.writeFileString(
+          path.join(paths.versionDir, ".archive-sha256"),
+          yield* archiveHex(archiveBytes),
+        );
+      }
+      let validations = 0;
+      const commands: string[] = [];
+      const requests: string[] = [];
+      const refused = yield* ensurePinnedRuntimeInstalled({
+        baseDir,
+        version,
+        fs,
+        path,
+        platform: "linux",
+        arch: "x64",
+        httpClient: releaseHttpClient(yield* validChecksums, requests),
+        runner: extractingRunner(fs, path, commands),
+        validate: () =>
+          Effect.sync(() => {
+            validations += 1;
+          }),
+      }).pipe(Effect.flip);
+      assert.instanceOf(refused, PinnedRuntimePreflightBlockedError);
+      assert.include(refused.message, "approved-builds.json");
+      assert.equal(validations, 0);
+      assert.equal(yield* fs.readFileString(selectionPath), "previous selection");
+      assert.equal(yield* fs.readFileString(userdataPath), "existing user data");
+      if (scenario === "unknown-build")
+        assert.equal(yield* fs.readFileString(paths.entryPath), "incomplete existing install");
+      else if (scenario === "cached-stock")
+        assert.equal(yield* fs.readFileString(paths.entryPath), "stock executable");
+      else assert.isFalse(yield* fs.exists(paths.versionDir));
+      assert.deepEqual(commands, scenario === "bad-staged-executable" ? ["tar"] : []);
+      if (
+        scenario === "cached-stock" ||
+        scenario === "malformed-policy" ||
+        scenario === "unknown-build"
+      )
+        assert.deepEqual(requests, []);
+      const versionsDir = path.join(baseDir, "runtime", "versions");
+      if (yield* fs.exists(versionsDir))
+        assert.deepEqual(
+          (yield* fs.readDirectory(versionsDir)).filter((name) => name.startsWith(".staging-")),
+          [],
+        );
+    }),
   );
 
   it.effect.each([false, true])(

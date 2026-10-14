@@ -6124,39 +6124,66 @@ it.layer(
       ),
   );
 
-  it.effect("capacity recovery rejects a stale cancel and Stop prevents the pending wake", () =>
-    withCapacityRecovery(
-      Effect.gen(function* () {
-        const input = yield* seedContinuity("capacity-stop");
-        const orchestrator = yield* Orchestrator.OrchestratorV2;
-        const pending = yield* awaitCapacityState(input.threadId, "pending");
-        yield* failCapacity(input.threadId, input.run);
-        yield* Fiber.join(pending);
-        const recovery = (yield* orchestrator.getThreadProjection(input.threadId)).thread
-          .capacityRecovery!;
-        yield* orchestrator.dispatch({
-          type: "thread.capacity.cancel",
-          commandId: CommandId.make(`${input.threadId}:stale-cancel`),
-          threadId: input.threadId,
-          generation: CommandId.make("old-capacity-generation"),
-        });
-        assert.equal(
-          (yield* orchestrator.getThreadProjection(input.threadId)).thread.capacityRecovery?.status,
-          "pending",
-        );
-        yield* orchestrator.dispatch({
-          type: "thread.stop",
-          commandId: CommandId.make(`${input.threadId}:stop`),
-          threadId: input.threadId,
-        });
-        yield* TestClock.adjust("1 minute");
-        yield* ModelCapacityRecoveryWorker.sweep;
-        const stopped = yield* orchestrator.getThreadProjection(input.threadId);
-        assert.equal(stopped.thread.capacityRecovery?.generation, recovery.generation);
-        assert.equal(stopped.thread.capacityRecovery?.status, "cancelled");
-        assert.lengthOf(stopped.runs, 1);
-      }),
-    ),
+  it.effect.each(["unwatched", "watched"] as const)(
+    "capacity recovery rejects a stale cancel and Stop prevents the pending wake with %s PR",
+    (watchMode) =>
+      withCapacityRecovery(
+        Effect.gen(function* () {
+          const input = yield* seedContinuity(`capacity-stop-${watchMode}`);
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          if (watchMode === "watched") {
+            yield* orchestrator.dispatch({
+              type: "thread.pull-request.watch",
+              commandId: CommandId.make(`${input.threadId}:watch`),
+              threadId: input.threadId,
+              host: "github.com",
+              repository: "pingdotgg/t3code",
+              number: 7,
+              watching: true,
+              link: { url: "https://github.com/pingdotgg/t3code/pull/7", source: "agent" },
+            });
+            assert.isDefined(
+              (yield* orchestrator.getThreadProjection(input.threadId)).thread.pullRequests?.[0]
+                ?.watch,
+            );
+          }
+          const pending = yield* awaitCapacityState(input.threadId, "pending");
+          yield* failCapacity(input.threadId, input.run);
+          yield* Fiber.join(pending);
+          const recovery = (yield* orchestrator.getThreadProjection(input.threadId)).thread
+            .capacityRecovery!;
+          yield* orchestrator.dispatch({
+            type: "thread.capacity.cancel",
+            commandId: CommandId.make(`${input.threadId}:stale-cancel`),
+            threadId: input.threadId,
+            generation: CommandId.make("old-capacity-generation"),
+          });
+          assert.equal(
+            (yield* orchestrator.getThreadProjection(input.threadId)).thread.capacityRecovery
+              ?.status,
+            "pending",
+          );
+
+          yield* orchestrator.dispatch({
+            type: "thread.stop",
+            commandId: CommandId.make(`${input.threadId}:stop`),
+            threadId: input.threadId,
+          });
+          const immediateStop = yield* orchestrator.getThreadProjection(input.threadId);
+          assert.equal(immediateStop.thread.capacityRecovery?.status, "cancelled");
+          yield* TestClock.adjust("1 minute");
+          yield* ModelCapacityRecoveryWorker.sweep;
+          const stopped = yield* orchestrator.getThreadProjection(input.threadId);
+          assert.equal(stopped.thread.capacityRecovery?.generation, recovery.generation);
+          assert.equal(stopped.thread.capacityRecovery?.status, "cancelled");
+          assert.lengthOf(stopped.runs, 1);
+          assert.equal(stopped.thread.capacityRecovery?.attemptsUsed, recovery.attemptsUsed);
+          assert.lengthOf(stopped.thread.pullRequests ?? [], watchMode === "watched" ? 1 : 0);
+          assert.isTrue(
+            stopped.thread.pullRequests?.every((link) => link.watch === undefined) ?? true,
+          );
+        }),
+      ),
   );
 
   it.effect(

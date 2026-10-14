@@ -9186,13 +9186,15 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       }
       const pullRequests = thread.pullRequests ?? [];
       if (pullRequests.some((link) => link.watch !== undefined)) {
+        const stoppedThread = (yield* getProjectionWithPendingEvents(thread.id, input.events))
+          .thread;
         yield* emitEvent({
           type: "thread.pull-request-synced",
           threadId: thread.id,
           providerInstanceId: thread.providerInstanceId,
           occurredAt: input.now,
           payload: {
-            ...thread,
+            ...stoppedThread,
             continuity: null,
             pullRequests: pullRequests.map((link) => withPullRequestWatch(link, undefined)),
           },

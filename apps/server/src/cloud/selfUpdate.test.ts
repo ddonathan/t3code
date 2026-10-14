@@ -15,13 +15,19 @@ import * as ServerConfig from "../config.ts";
 import * as DesktopAppUpdate from "../desktopUpdate/DesktopAppUpdate.ts";
 import * as ProcessRunner from "../processRunner.ts";
 import * as ServiceLauncherClient from "./serviceLauncherClient.ts";
-import { SERVICE_LAUNCHER_PROTOCOL } from "./serviceProtocol.ts";
+import {
+  SERVICE_LAUNCHER_PROTOCOL,
+  SERVICE_LAUNCHER_CONTEXT_ENV,
+  type ServiceLauncherParentMessage,
+  type ServiceLauncherChildMessage,
+} from "./serviceProtocol.ts";
 import * as ServerSelfUpdate from "./selfUpdate.ts";
 
 interface HarnessOptions {
   readonly mode?: "web" | "desktop";
   readonly managed?: boolean;
   readonly preflight?: "ready" | "blocked";
+  readonly launcher?: ServiceLauncherClient.ServiceLauncherClient["Service"];
   readonly requestUpdate?: ServiceLauncherClient.ServiceLauncherClient["Service"]["requestUpdate"];
   readonly desktopAppUpdate?: DesktopAppUpdate.DesktopAppUpdate["Service"];
 }
@@ -95,17 +101,19 @@ const makeHarness = Effect.fn("test.make_self_update_harness")(function* (
         };
       }),
   });
-  const launcher = ServiceLauncherClient.ServiceLauncherClient.of({
-    managed: options.managed ?? true,
-    requestUpdate:
-      options.requestUpdate ??
-      (() =>
-        Effect.sync(() => {
-          order.push("accept");
-          return "launcher-id";
-        })),
-    prepareTrial: Effect.undefined,
-  });
+  const launcher =
+    options.launcher ??
+    ServiceLauncherClient.ServiceLauncherClient.of({
+      managed: options.managed ?? true,
+      requestUpdate:
+        options.requestUpdate ??
+        (() =>
+          Effect.sync(() => {
+            order.push("accept");
+            return "launcher-id";
+          })),
+      prepareTrial: Effect.undefined,
+    });
   const config = yield* ServerConfig.ServerConfig.pipe(
     Effect.provide(ServerConfig.layerTest(process.cwd(), baseDir)),
   );
@@ -128,6 +136,101 @@ const makeHarness = Effect.fn("test.make_self_update_harness")(function* (
 });
 
 it.layer(NodeServices.layer)("server self update", (it) => {
+  it.effect.each([false, true])(
+    "late launcher rejection clears continuation markers and admits another update in the same server (caller interrupted: %s)",
+    (interrupted) =>
+      Effect.gen(function* () {
+        const requested = yield* Deferred.make<void>();
+        const cleared = yield* Deferred.make<void>();
+        const listeners = new Map<string, Set<(...args: ReadonlyArray<unknown>) => void>>();
+        const emit = (message: ServiceLauncherParentMessage) => {
+          for (const listener of listeners.get("message") ?? []) listener(message);
+        };
+        let requests = 0;
+        const host = {
+          connected: true,
+          send: (
+            _message: ServiceLauncherChildMessage,
+            callback?: (error: Error | null) => void,
+          ) => {
+            requests += 1;
+            callback?.(null);
+            if (requests === 1) Deferred.doneUnsafe(requested, Effect.void);
+            else emit({ type: "update-accepted", updateId: "second-update" });
+            return true;
+          },
+          on: (
+            event: "message" | "disconnect",
+            listener: (...args: ReadonlyArray<unknown>) => void,
+          ) => {
+            const eventListeners = listeners.get(event) ?? new Set();
+            eventListeners.add(listener);
+            listeners.set(event, eventListeners);
+          },
+          off: (
+            event: "message" | "disconnect",
+            listener: (...args: ReadonlyArray<unknown>) => void,
+          ) => {
+            listeners.get(event)?.delete(listener);
+          },
+        };
+        yield* Effect.scoped(
+          Effect.gen(function* () {
+            const launcher = yield* ServiceLauncherClient.make({ currentVersion: "1.0.0" }).pipe(
+              Effect.provideService(ServiceLauncherClient.ServiceLauncherHostProcess, host),
+              Effect.provideService(HostProcess.Environment, {
+                [SERVICE_LAUNCHER_CONTEXT_ENV]: JSON.stringify({
+                  protocol: SERVICE_LAUNCHER_PROTOCOL,
+                  childVersion: "1.0.0",
+                }),
+              }),
+            );
+            const { selfUpdate: raw } = yield* makeHarness({ launcher });
+            const prepared = new Set<ThreadId>();
+            const threadId = ThreadId.make("running-before-refused-handoff");
+            let clears = 0;
+            const selfUpdate = yield* ServerSelfUpdate.withRunningThreadContinuation({
+              mode: "web",
+              selfUpdate: raw,
+              prepare: Effect.sync(() => {
+                prepared.add(threadId);
+                return [threadId];
+              }),
+              clear: (ids) =>
+                Effect.sync(() => {
+                  clears += 1;
+                  for (const id of ids) prepared.delete(id);
+                }).pipe(Effect.andThen(Deferred.succeed(cleared, undefined))),
+            });
+            const first = yield* selfUpdate
+              .update({ targetVersion: "1.1.0", continueRunningThreads: true })
+              .pipe(Effect.forkChild({ startImmediately: true }));
+            yield* Deferred.await(requested);
+            emit({ type: "update-accepted", updateId: "first-update" });
+            if (interrupted) yield* Fiber.interrupt(first);
+            else expect((yield* Fiber.join(first)).updateId).toBe("first-update");
+            expect(prepared.has(threadId)).toBe(true);
+            expect(clears).toBe(0);
+            expect((yield* raw.update({ targetVersion: "1.1.0" }).pipe(Effect.flip)).reason).toBe(
+              "A server update is already in progress.",
+            );
+            emit({ type: "update-rejected", reason: "target-not-approved after acceptance" });
+            yield* Deferred.await(cleared);
+            yield* Effect.yieldNow;
+            expect(prepared.size).toBe(0);
+            expect(clears).toBe(1);
+            // The persistent client hook consumes each rejection once.
+            emit({ type: "update-rejected", reason: "duplicate old rejection" });
+            const second = yield* selfUpdate.update({ targetVersion: "1.1.0" });
+            expect(second.updateId).toBe("second-update");
+            expect(requests).toBe(2);
+            expect(clears).toBe(1);
+          }),
+        );
+        expect([...listeners.values()].every((set) => set.size === 0)).toBe(true);
+      }),
+  );
+
   it.effect("marks running threads at the boot-service handoff", () =>
     Effect.gen(function* () {
       const events: string[] = [];

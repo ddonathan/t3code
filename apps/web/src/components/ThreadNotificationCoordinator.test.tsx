@@ -1,4 +1,11 @@
 import type { ClientSettings } from "@t3tools/contracts/settings";
+import {
+  CommandId,
+  MessageId,
+  ProviderInstanceId,
+  ProviderThreadId,
+  RunId,
+} from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Option from "effect/Option";
 import { act } from "react";
@@ -19,6 +26,9 @@ const state = vi.hoisted(() => ({
   sessionError: false,
   turnError: false,
   limited: false,
+  runId: "run-1",
+  capacityStatus: null as "pending" | "exhausted" | null,
+  capacityAttempts: 0,
   subagent: false,
   background: [] as Array<{ taskId: string; kind: "command" | "monitor" }>,
   add: vi.fn(
@@ -55,7 +65,26 @@ function mockThreadShell() {
     forkedFrom: null,
     createdBy: "user",
     creationSource: "web",
-    latestRunId: "run-1",
+    latestRunId: state.runId,
+    capacityRecovery: state.capacityStatus
+      ? {
+          generation: CommandId.make("capacity-generation"),
+          originalRunId: RunId.make("run-1"),
+          authorityMessageId: MessageId.make("capacity-authority"),
+          failedRunId: RunId.make(state.runId),
+          providerThreadId: ProviderThreadId.make("capacity-native"),
+          modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-6.1-sol" },
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          reactionsReleased: false,
+          retryRunId: null,
+          attemptsUsed: state.capacityAttempts,
+          nextAttemptAt:
+            state.capacityStatus === "pending" ? DateTime.makeUnsafe("2026-09-13T10:00:00Z") : null,
+          status: state.capacityStatus,
+          reason: "Temporary capacity failure.",
+        }
+      : null,
     activeRunId: null,
     status: state.completedAt
       ? "completed"
@@ -152,6 +181,9 @@ beforeEach(() => {
     sessionError: false,
     turnError: false,
     limited: false,
+    runId: "run-1",
+    capacityStatus: null,
+    capacityAttempts: 0,
     subagent: false,
     background: [],
   });
@@ -175,6 +207,28 @@ afterEach(async () => {
 });
 
 describe("thread notifications", () => {
+  it("alerts only after capacity retries are exhausted, not for each scheduled attempt", async () => {
+    state.mode = "notifications-and-sound";
+    await render();
+    state.turnError = true;
+    state.capacityStatus = "pending";
+    for (let attempt = 0; attempt < 3; attempt++) {
+      state.runId = `run-${attempt + 1}`;
+      state.capacityAttempts = attempt;
+      await render();
+    }
+    expect(state.add).not.toHaveBeenCalled();
+    expect(state.sound).not.toHaveBeenCalled();
+    expect(state.notification).not.toHaveBeenCalled();
+    state.runId = "run-4";
+    state.capacityStatus = "exhausted";
+    state.capacityAttempts = 3;
+    await render();
+    await render();
+    expect(state.add).toHaveBeenCalledTimes(1);
+    expect(state.add).toHaveBeenCalledWith(expect.objectContaining({ title: "Thread failed" }));
+    expect(state.sound).toHaveBeenCalledTimes(1);
+  });
   it.each([true, false])("keeps subagents silent with focus=%s", async (focused) => {
     state.subagent = true;
     state.focused = focused;

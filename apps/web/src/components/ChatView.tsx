@@ -1,5 +1,6 @@
 import { ThreadFind, ThreadFindCanvas, type ThreadFindControls } from "./chat/ThreadFindProvider";
 import { THREAD_FIND_BAR_RESERVED_HEIGHT } from "./chat/ThreadFindBar";
+import { capacityRecoveryBannerItem } from "./chat/CapacityRecoveryBanner";
 import { usageLimitRecoveryBannerItem } from "./chat/UsageLimitRecoveryBanner";
 import {
   resolveBackgroundDraftWorkspaceOptions,
@@ -1620,6 +1621,9 @@ export default function ChatView(props: ChatViewProps) {
   const closeTerminalMutation = useAtomCommand(terminalEnvironment.close, "terminal close");
   const createThread = useOrchestrationCommand(threadEnvironment.create, { reportFailure: false });
   const deleteThread = useOrchestrationCommand(threadEnvironment.delete, { reportFailure: false });
+  const cancelCapacityRecovery = useOrchestrationCommand(threadEnvironment.cancelCapacityRecovery, {
+    reportFailure: false,
+  });
   const updateThreadMetadata = useOrchestrationCommand(threadEnvironment.updateMetadata, {
     reportFailure: false,
   });
@@ -3204,7 +3208,7 @@ export default function ChatView(props: ChatViewProps) {
             installation={versionMismatchInstallation}
             desktopAppUpdate={versionMismatchDesktopAppUpdate}
             threadContinuation={versionMismatchThreadContinuation}
-            targetVersion={versionMismatch.clientVersion}
+            targetVersion={versionMismatch.updateTargetVersion ?? versionMismatch.clientVersion}
             label={updateFailed ? "Retry" : "Update"}
             variant="ghost"
           />
@@ -7867,8 +7871,26 @@ export default function ChatView(props: ChatViewProps) {
           },
         })
       : null;
+  const capacityRecoveryBanner = activeThreadShell?.capacityRecovery
+    ? capacityRecoveryBannerItem(activeThreadShell, async () => {
+        const recovery = activeThreadShell.capacityRecovery;
+        if (!recovery) return;
+        const result = await cancelCapacityRecovery({
+          environmentId,
+          input: {
+            type: "thread.capacity.cancel",
+            commandId: CommandId.make(randomUUID()),
+            threadId: activeThreadShell.id,
+            generation: recovery.generation,
+          },
+        });
+        if (result._tag === "Failure") throw squashAtomCommandFailure(result);
+      })
+    : null;
   const composerBannerItems = useMemo<ComposerBannerStackItem[]>(() => {
-    const limitRecoveryItems = limitRecoveryBanner === null ? [] : [limitRecoveryBanner];
+    const limitRecoveryItems = [capacityRecoveryBanner, limitRecoveryBanner].filter(
+      (item) => item !== null,
+    );
     const backgroundWorkItems = [
       childInputBannerItem,
       goalBannerItem,
@@ -7941,6 +7963,7 @@ export default function ChatView(props: ChatViewProps) {
     canWriteSourceControl,
     feedbackBannerItems,
     limitRecoveryBanner,
+    capacityRecoveryBanner,
     handleRestoreThreadBranch,
     isRestoringThreadBranch,
     backgroundWorkBannerItem,

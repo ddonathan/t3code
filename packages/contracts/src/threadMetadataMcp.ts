@@ -10,6 +10,7 @@ import {
 } from "./baseSchemas.ts";
 import { ThreadLinkedPullRequest } from "./threadPullRequest.ts";
 import { ThreadTitleRegeneration } from "./threadTitle.ts";
+import { OrchestrationV2CapacityRecoveryJson } from "./orchestrationV2.ts";
 
 function hasOnlyPairedSurrogates(value: string): boolean {
   for (let index = 0; index < value.length; index += 1) {
@@ -63,9 +64,10 @@ export const ThreadMetadataMcpAction = Schema.Literals([
   "regenerate_title",
   "link_pull_request",
   "unlink_pull_request",
+  "cancel_capacity_retry",
 ]).annotate({
   description:
-    "Metadata mutation: rename, regenerate_title, link_pull_request, or unlink_pull_request.",
+    "Thread mutation: rename, regenerate_title, link_pull_request, unlink_pull_request, or cancel_capacity_retry.",
 });
 export type ThreadMetadataMcpAction = typeof ThreadMetadataMcpAction.Type;
 
@@ -87,23 +89,39 @@ export const ThreadMetadataMcpUpdateInput = Schema.Struct({
   pullRequest: Schema.optional(ThreadMetadataMcpPullRequest).annotate({
     description: "Pull request to link. Required only when action is link_pull_request.",
   }),
+  generation: Schema.optional(CommandId).annotate({
+    description:
+      "Capacity episode generation from thread read/list. Required only for cancel_capacity_retry.",
+  }),
   clientRequestId: Schema.optional(ThreadMetadataClientRequestId),
 }).check(
   Schema.makeFilter((input) => {
     switch (input.action) {
       case "rename":
-        return input.title !== undefined && input.pullRequest === undefined
+        return input.title !== undefined &&
+          input.pullRequest === undefined &&
+          input.generation === undefined
           ? true
           : "rename requires title and does not accept pullRequest.";
       case "link_pull_request":
-        return input.pullRequest !== undefined && input.title === undefined
+        return input.pullRequest !== undefined &&
+          input.title === undefined &&
+          input.generation === undefined
           ? true
           : "link_pull_request requires pullRequest and does not accept title.";
       case "regenerate_title":
       case "unlink_pull_request":
-        return input.title === undefined && input.pullRequest === undefined
+        return input.title === undefined &&
+          input.pullRequest === undefined &&
+          input.generation === undefined
           ? true
-          : `${input.action} does not accept title or pullRequest.`;
+          : `${input.action} does not accept title, pullRequest, or generation.`;
+      case "cancel_capacity_retry":
+        return input.generation !== undefined &&
+          input.title === undefined &&
+          input.pullRequest === undefined
+          ? true
+          : "cancel_capacity_retry requires generation and does not accept title or pullRequest.";
     }
   }),
 );
@@ -118,5 +136,9 @@ export const ThreadMetadataMcpUpdateResult = Schema.Struct({
   titleRegeneration: Schema.NullOr(ThreadTitleRegeneration),
   linkedPullRequest: Schema.NullOr(ThreadLinkedPullRequest),
   updatedAt: IsoDateTime,
+  capacityRecovery: Schema.optional(Schema.NullOr(OrchestrationV2CapacityRecoveryJson)),
+  capacityCancellation: Schema.optional(
+    Schema.Literals(["cancelled", "already_cancelled", "not_pending"]),
+  ),
 });
 export type ThreadMetadataMcpUpdateResult = typeof ThreadMetadataMcpUpdateResult.Type;

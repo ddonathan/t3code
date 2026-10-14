@@ -149,7 +149,9 @@ export type ProjectionRecoveryKind =
   | "queued-runs"
   | "runtime"
   | "subagent-results"
-  | "delegated-completions";
+  | "delegated-completions"
+  | "continuity"
+  | "capacity";
 
 /** Persisted state needed for limit recovery, without transcript or fork history. */
 export type ProjectionLimitRecoveryCandidate = Pick<
@@ -547,6 +549,21 @@ function needsRecovery(
 ): boolean {
   if (projection.thread.deletedAt !== null) return false;
   switch (kind) {
+    case "capacity":
+      return (
+        ["pending", "retrying"].includes(projection.thread.capacityRecovery?.status ?? "") ||
+        (projection.thread.capacityRecovery != null &&
+          ["cancelled", "exhausted", "complete"].includes(
+            projection.thread.capacityRecovery.status,
+          ) &&
+          !projection.thread.capacityRecovery.reactionsReleased)
+      );
+    case "continuity":
+      return (
+        projection.thread.archivedAt === null &&
+        projection.thread.continuity != null &&
+        ["active", "waiting", "needs_input"].includes(projection.thread.continuity.status)
+      );
     case "queued-runs":
       return (
         projection.thread.archivedAt === null &&
@@ -1494,7 +1511,10 @@ export function threadShellFromProjection(
     activityRunStatus: activityRun?.status ?? null,
     activityRunStartedAt:
       activityRun === null ? null : orchestrationV2RunWorkStartedAt(activityRun),
-    status: latestRun?.status ?? "idle",
+    status:
+      projection.thread.capacityRecovery?.status === "pending"
+        ? "waiting"
+        : (latestRun?.status ?? "idle"),
     ...threadErrorSummary(
       latestRootProviderFailure(latestRun, projection.turnItems),
       providerSession?.lastError ?? null,
@@ -1542,6 +1562,9 @@ export function threadShellFromProjection(
     lastVisitedAt: projection.thread.lastVisitedAt,
     titleRegeneration: projection.thread.titleRegeneration ?? null,
     limitRecovery: projection.thread.limitRecovery ?? null,
+    capacityRecovery: projection.thread.capacityRecovery ?? null,
+    continuity: projection.thread.continuity ?? null,
+    continuityAutoEnrollDisabled: projection.thread.continuityAutoEnrollDisabled ?? false,
     deletedAt: projection.thread.deletedAt,
   };
 }
@@ -1761,7 +1784,10 @@ function shellFromState(input: {
     activeRunId: input.state.activeRunId,
     activityRunStatus: input.state.activityRunStatus,
     activityRunStartedAt: input.state.activityRunStartedAt,
-    status: input.state.latestRunStatus,
+    status:
+      input.state.thread.capacityRecovery?.status === "pending"
+        ? "waiting"
+        : input.state.latestRunStatus,
     lastError: input.state.lastError,
     lastErrorClass: input.state.lastErrorClass,
     usageLimitResetAt: input.state.usageLimitResetAt,
@@ -1797,6 +1823,9 @@ function shellFromState(input: {
     lastVisitedAt: input.state.thread.lastVisitedAt,
     titleRegeneration: input.state.thread.titleRegeneration ?? null,
     limitRecovery: input.state.thread.limitRecovery ?? null,
+    capacityRecovery: input.state.thread.capacityRecovery ?? null,
+    continuity: input.state.thread.continuity ?? null,
+    continuityAutoEnrollDisabled: input.state.thread.continuityAutoEnrollDisabled ?? false,
     deletedAt: input.state.thread.deletedAt,
   };
 }
@@ -3578,6 +3607,17 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       function* (kind: ProjectionRecoveryKind) {
         const candidates = (() => {
           switch (kind) {
+            case "capacity":
+              return sql`SELECT thread_id FROM orchestration_v2_projection_threads
+                WHERE CASE WHEN json_valid(payload_json) THEN (json_extract(payload_json, '$.capacityRecovery.status') IN ('pending', 'retrying') OR (json_extract(payload_json, '$.capacityRecovery.status') IN ('cancelled', 'exhausted', 'complete') AND json_extract(payload_json, '$.capacityRecovery.reactionsReleased') = 0)) ELSE 0 END`;
+            case "continuity":
+              return sql`
+                SELECT thread_id FROM orchestration_v2_projection_threads
+                WHERE archived_at IS NULL AND deleted_at IS NULL
+                  AND CASE WHEN json_valid(payload_json) THEN
+                    json_extract(payload_json, '$.continuity.status') IN ('active', 'waiting', 'needs_input')
+                    ELSE 0 END
+              `;
             case "queued-runs":
               return sql`
                 SELECT thread_id FROM orchestration_v2_projection_runs

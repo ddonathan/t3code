@@ -1,6 +1,7 @@
 import {
   EnvironmentId,
   ProjectId,
+  RunId,
   RuntimeRequestId,
   ThreadId,
   type OrchestrationV2ShellSnapshot,
@@ -10,6 +11,7 @@ import { Atom, AtomRegistry } from "effect/reactivity";
 import { describe, expect, it } from "vite-plus/test";
 
 import { PrimaryConnectionTarget } from "../connection/model.ts";
+import { isThreadWorking } from "./threadInbox.ts";
 import { v2Now, v2ShellSnapshot, v2ThreadShell } from "./orchestrationV2TestFixtures.ts";
 import { applyShellStreamEvent } from "./shellReducer.ts";
 import { createEnvironmentThreadShellAtoms } from "./threadShell.ts";
@@ -104,15 +106,92 @@ describe("v2 thread shell lists", () => {
     registry.dispose();
   });
 
-  it("counts a subagent question on its parent only while the subagent runs", () => {
+  it("returns a running parent to Input until its last hidden descendant question is answered", () => {
     const { registry, threads, snapshotAtom } = makeHarness();
-    const root = v2ThreadShell;
+    const root = {
+      ...v2ThreadShell,
+      status: "running" as const,
+      latestRunId: RunId.make("running-root"),
+      activeRunId: RunId.make("running-root"),
+    };
     const child = {
-      ...root,
+      ...v2ThreadShell,
       id: ThreadId.make("child"),
       creationSource: "mcp" as const,
-      status: "running" as const,
-      activityRunStatus: "running" as const,
+      lineage: {
+        ...root.lineage,
+        parentThreadId: root.id,
+        relationshipToParent: "subagent" as const,
+      },
+    };
+    const question = {
+      ...child,
+      id: ThreadId.make("nested-question"),
+      lineage: { ...child.lineage, parentThreadId: child.id },
+      pendingRuntimeRequest: {
+        id: RuntimeRequestId.make("question"),
+        kind: "user_input" as const,
+        createdAt: v2Now,
+      },
+    };
+    const secondQuestion = { ...question, id: ThreadId.make("second-question") };
+    const snapshot = { ...v2ShellSnapshot, threads: [root, child, question, secondQuestion] };
+    registry.set(snapshotAtom(environmentId), snapshot);
+    const dispose = registry.mount(threads.threadShellsAtom);
+    const disposeNavigation = registry.mount(threads.navigationThreadShellsAtom);
+    const ref = { environmentId, threadId: root.id };
+    const parent = () => registry.get(threads.threadShellsAtom)[0]!;
+    try {
+      expect(parent().hasPendingUserInput).toBe(true);
+      expect(isThreadWorking(parent())).toBe(false);
+      expect(registry.get(threads.navigationThreadShellsAtom)[0]).toBe(parent());
+      expect(
+        registry.get(
+          threads.threadShellsForProjectRefsAtom([{ environmentId, projectId: root.projectId }]),
+        )[0],
+      ).toBe(parent());
+      expect(registry.get(threads.threadShellAtom(ref))?.hasPendingUserInput).toBe(false);
+      expect(registry.get(threads.childThreadInputsAtom(ref)).map((t) => t.id)).toEqual([
+        question.id,
+        secondQuestion.id,
+      ]);
+      const before = parent();
+      registry.set(snapshotAtom(environmentId), {
+        ...snapshot,
+        threads: [root, { ...child, title: "Streaming" }, question, secondQuestion],
+      });
+      expect(parent()).toBe(before);
+      registry.set(snapshotAtom(environmentId), {
+        ...snapshot,
+        threads: [root, child, { ...question, pendingRuntimeRequest: null }, secondQuestion],
+      });
+      expect(parent().hasPendingUserInput).toBe(true);
+      registry.set(snapshotAtom(environmentId), {
+        ...snapshot,
+        threads: [
+          root,
+          child,
+          { ...question, pendingRuntimeRequest: null },
+          { ...secondQuestion, pendingRuntimeRequest: null },
+        ],
+      });
+      expect(parent().hasPendingUserInput).toBe(false);
+      expect(isThreadWorking(parent())).toBe(true);
+      expect(registry.get(threads.childThreadInputsAtom(ref))).toEqual([]);
+    } finally {
+      disposeNavigation();
+      dispose();
+      registry.dispose();
+    }
+  });
+
+  it("keeps fork, archived, provider-native and other-environment questions out of parent attention", () => {
+    const { registry, threads, snapshotAtom } = makeHarness([environmentId, remoteEnvironmentId]);
+    const root = v2ThreadShell;
+    const question = {
+      ...root,
+      id: ThreadId.make("question"),
+      creationSource: "mcp" as const,
       lineage: {
         ...root.lineage,
         parentThreadId: root.id,
@@ -124,31 +203,34 @@ describe("v2 thread shell lists", () => {
         createdAt: v2Now,
       },
     };
-    const inputs = threads.childThreadInputsAtom({ environmentId, threadId: root.id });
-    const dispose = registry.mount(inputs);
-    registry.set(snapshotAtom(environmentId), { ...v2ShellSnapshot, threads: [root, child] });
-    expect(registry.get(inputs).map((thread) => thread.id)).toEqual([child.id]);
-    // A follow-up queued behind the blocked run leaves the question live.
     registry.set(snapshotAtom(environmentId), {
       ...v2ShellSnapshot,
-      threads: [root, { ...child, status: "queued" as const }],
+      threads: [
+        root,
+        {
+          ...question,
+          id: ThreadId.make("fork"),
+          lineage: { ...question.lineage, relationshipToParent: "fork" },
+        },
+        { ...question, id: ThreadId.make("archived"), archivedAt: v2Now },
+        { ...question, id: ThreadId.make("native"), creationSource: "provider" },
+      ],
     });
-    expect(registry.get(inputs).map((thread) => thread.id)).toEqual([child.id]);
-    // An async question stays pending after the run that asked it completes.
-    registry.set(snapshotAtom(environmentId), {
+    registry.set(snapshotAtom(remoteEnvironmentId), {
       ...v2ShellSnapshot,
-      threads: [root, { ...child, status: "completed" as const, activityRunStatus: null }],
+      threads: [root, question],
     });
-    expect(registry.get(inputs)).toEqual([]);
-    // Older servers omit the activity run, so the latest run's status decides.
-    const { activityRunStatus: _omitted, ...legacyChild } = child;
-    registry.set(snapshotAtom(environmentId), {
-      ...v2ShellSnapshot,
-      threads: [root, { ...legacyChild, status: "completed" as const }],
-    });
-    expect(registry.get(inputs)).toEqual([]);
-    dispose();
-    registry.dispose();
+    const dispose = registry.mount(threads.threadShellsAtom);
+    try {
+      const roots = registry.get(threads.threadShellsAtom).filter((t) => t.id === root.id);
+      expect(roots.map((t) => [t.environmentId, t.hasPendingUserInput])).toEqual([
+        [environmentId, false],
+        [remoteEnvironmentId, true],
+      ]);
+    } finally {
+      dispose();
+      registry.dispose();
+    }
   });
 
   it("leaves switched-off environments out of navigation", () => {

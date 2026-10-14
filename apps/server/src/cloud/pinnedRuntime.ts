@@ -19,6 +19,37 @@ import {
 } from "@t3tools/shared/cliRelease";
 
 import * as ProcessRunner from "../processRunner.ts";
+import {
+  approvedRuntimeBuild,
+  verifyApprovedRuntime,
+  ApprovedRuntimeRefused,
+} from "./approvedRuntime.ts";
+
+const guardFailure = (version: string, cause: unknown) =>
+  new PinnedRuntimePreflightBlockedError({
+    version,
+    reason:
+      cause instanceof ApprovedRuntimeRefused
+        ? cause.message
+        : "Approved runtime verification failed; keep the current selection and inspect the local policy.",
+  });
+const verifyApproval = (
+  input: PinnedRuntimeInstallInput,
+  versionDir: string,
+  archiveSha256?: string,
+) =>
+  Effect.tryPromise({
+    try: () =>
+      verifyApprovedRuntime(
+        input.baseDir,
+        input.version,
+        input.platform,
+        input.arch,
+        versionDir,
+        archiveSha256,
+      ),
+    catch: (cause) => guardFailure(input.version, cause),
+  });
 
 /**
  * A pinned runtime is an exact t3 release archive unpacked into
@@ -224,12 +255,27 @@ const installFromArchive = Effect.fn("cloud.pinned_runtime.install_archive")(fun
     catch: (cause) =>
       new PinnedRuntimeInstallError({ step: "verifying the t3 release archive", cause }),
   });
-  if (Hex.encode(new Uint8Array(digest)) !== expected) {
+  const archiveSha256 = Hex.encode(new Uint8Array(digest));
+  if (archiveSha256 !== expected) {
     return yield* new PinnedRuntimeInstallError({
       step: "verifying the t3 release archive checksum",
     });
   }
 
+  const approval = yield* Effect.tryPromise({
+    try: () => approvedRuntimeBuild(input.baseDir, input.version, input.platform, input.arch),
+    catch: (cause) => guardFailure(input.version, cause),
+  });
+  if (approval !== undefined && archiveSha256 !== approval.archiveSha256) {
+    return yield* guardFailure(
+      input.version,
+      new ApprovedRuntimeRefused(
+        input.path.join(input.baseDir, "runtime", "approved-builds.json"),
+        input.version,
+        "downloaded archive SHA256 does not match approval",
+      ),
+    );
+  }
   const archivePath = path.join(stagingDir, PINNED_RUNTIME_ARCHIVE_FILE);
   yield* fs
     .writeFile(archivePath, archive)
@@ -262,12 +308,26 @@ const installFromArchive = Effect.fn("cloud.pinned_runtime.install_archive")(fun
       ),
     );
   yield* fs.remove(archivePath, { force: true }).pipe(Effect.ignore);
+  yield* verifyApproval(input, stagingDir, archiveSha256);
+  if (approval !== undefined)
+    yield* fs
+      .writeFileString(path.join(stagingDir, ".archive-sha256"), `${archiveSha256}\n`)
+      .pipe(
+        Effect.mapError(
+          (cause) => new PinnedRuntimeInstallError({ step: "recording the archive digest", cause }),
+        ),
+      );
 });
 
 const installPinnedRuntime = Effect.fn("cloud.pinned_runtime.ensure_installed")(function* (
   input: PinnedRuntimeInstallInput,
 ) {
   const { fs } = input;
+  // Refuse unknown builds before deleting incomplete installs or changing selection.
+  yield* Effect.tryPromise({
+    try: () => approvedRuntimeBuild(input.baseDir, input.version, input.platform, input.arch),
+    catch: (cause) => guardFailure(input.version, cause),
+  });
   const paths = pinnedRuntimePaths(input.path, input.baseDir, input.version, input.platform);
   const [versionDirExists, entryExists, sentinel] = yield* Effect.all([
     fs.exists(paths.versionDir),
@@ -282,6 +342,7 @@ const installPinnedRuntime = Effect.fn("cloud.pinned_runtime.ensure_installed")(
     entryExists && Option.isSome(sentinel) && sentinel.value.trim() === input.version;
   if (alreadyPinned) {
     input.onProgress?.({ stage: "cached" });
+    yield* verifyApproval(input, paths.versionDir);
     yield* input.validate(paths);
     return paths;
   }
@@ -332,6 +393,7 @@ const installPinnedRuntime = Effect.fn("cloud.pinned_runtime.ensure_installed")(
 
     input.onProgress?.({ stage: "validate" });
     yield* input.validate(stagingPaths);
+    yield* verifyApproval(input, stagingDir);
     yield* fs
       .writeFileString(stagingPaths.sentinelPath, `${input.version}\n`)
       .pipe(
@@ -369,7 +431,10 @@ const installPinnedRuntime = Effect.fn("cloud.pinned_runtime.ensure_installed")(
         ),
       ),
     );
-    if (!published) yield* input.validate(paths);
+    if (!published) {
+      yield* verifyApproval(input, paths.versionDir);
+      yield* input.validate(paths);
+    }
     return paths;
   }).pipe(
     Effect.ensuring(fs.remove(stagingDir, { recursive: true, force: true }).pipe(Effect.ignore)),

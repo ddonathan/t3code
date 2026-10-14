@@ -14,6 +14,7 @@ import {
   pinnedRuntimeCommand,
   pinnedRuntimePaths,
   PinnedRuntimeInstallError,
+  PinnedRuntimePreflightBlockedError,
   type PinnedRuntimeProgress,
 } from "./pinnedRuntime.ts";
 
@@ -49,6 +50,10 @@ const extractingRunner = (fs: FileSystem.FileSystem, path: Path.Path, commands: 
           return yield* Effect.die(`unexpected command ${input.command}`);
         }
         yield* fs.writeFileString(path.join(stagingDir, "t3"), "#!/bin/sh\n").pipe(Effect.orDie);
+        yield* fs.makeDirectory(path.join(stagingDir, "client")).pipe(Effect.orDie);
+        yield* fs
+          .writeFileString(path.join(stagingDir, "client", "index.html"), "patched client")
+          .pipe(Effect.orDie);
         return {
           stdout: "",
           stderr: "",
@@ -63,39 +68,167 @@ const extractingRunner = (fs: FileSystem.FileSystem, path: Path.Path, commands: 
   });
 
 it.layer(NodeServices.layer)("ensurePinnedRuntimeInstalled", (it) => {
-  it.effect("installs the verified release archive as the runtime executable", () =>
-    Effect.gen(function* () {
-      const fs = yield* FileSystem.FileSystem;
-      const path = yield* Path.Path;
-      const baseDir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-pinned-archive-" });
-      const requests: string[] = [];
-      const commands: string[] = [];
-      const paths = yield* ensurePinnedRuntimeInstalled({
-        baseDir,
-        version,
-        fs,
-        path,
-        platform: "linux",
-        arch: "x64",
-        httpClient: releaseHttpClient(yield* validChecksums, requests),
-        releaseBaseUrl: "https://releases.example/download",
-        runner: extractingRunner(fs, path, commands),
-        validate: (staging) =>
-          fs.exists(staging.entryPath).pipe(
-            Effect.flatMap((exists) => (exists ? Effect.void : Effect.die("missing runtime"))),
-            Effect.orDie,
-          ),
-      });
-      assert.equal(paths.entryPath, path.join(paths.versionDir, "t3"));
-      assert.deepEqual(pinnedRuntimeCommand(paths), { command: paths.entryPath, args: [] });
-      assert.deepEqual(requests, [
-        `https://releases.example/download/v${version}/SHA256SUMS`,
-        `https://releases.example/download/v${version}/${archiveName}`,
-      ]);
-      assert.deepEqual(commands, ["tar"]);
-      assert.equal(yield* fs.readFileString(paths.sentinelPath), `${version}\n`);
-      assert.isFalse(yield* fs.exists(path.join(paths.versionDir, "t3-runtime-archive")));
-    }),
+  it.effect.each(["cached-stock", "bad-archive", "bad-staged-executable", "malformed-policy"])(
+    "approval refusal preserves selection and never validates or publishes (%s)",
+    (scenario) =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const baseDir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-approved-install-" });
+        const paths = pinnedRuntimePaths(path, baseDir, version, "linux");
+        const hash = (text: string) => archiveHex(new TextEncoder().encode(text));
+        yield* fs.makeDirectory(path.join(baseDir, "runtime"), { recursive: true });
+        const selectionPath = path.join(baseDir, "runtime", "service-state.json");
+        yield* fs.writeFileString(selectionPath, "previous selection");
+        yield* fs.writeFileString(
+          path.join(baseDir, "runtime", "approved-builds.json"),
+          scenario === "malformed-policy"
+            ? "{"
+            : JSON.stringify({
+                format: 1,
+                builds: [
+                  {
+                    version,
+                    platform: "linux",
+                    arch: "x64",
+                    archiveSha256:
+                      scenario === "bad-archive"
+                        ? yield* hash("wrong archive")
+                        : yield* archiveHex(archiveBytes),
+                    executableSha256: yield* hash("approved patched executable"),
+                    clientTreeSha256: yield* hash("[]"),
+                  },
+                ],
+              }),
+        );
+        if (scenario === "cached-stock") {
+          yield* fs.makeDirectory(paths.versionDir, { recursive: true });
+          yield* fs.writeFileString(paths.entryPath, "stock executable");
+          yield* fs.writeFileString(paths.sentinelPath, version);
+          yield* fs.writeFileString(
+            path.join(paths.versionDir, ".archive-sha256"),
+            yield* archiveHex(archiveBytes),
+          );
+        }
+        let validations = 0;
+        const commands: string[] = [];
+        const requests: string[] = [];
+        const refused = yield* ensurePinnedRuntimeInstalled({
+          baseDir,
+          version,
+          fs,
+          path,
+          platform: "linux",
+          arch: "x64",
+          httpClient: releaseHttpClient(yield* validChecksums, requests),
+          runner: extractingRunner(fs, path, commands),
+          validate: () =>
+            Effect.sync(() => {
+              validations += 1;
+            }),
+        }).pipe(Effect.flip);
+        assert.instanceOf(refused, PinnedRuntimePreflightBlockedError);
+        assert.include(refused.message, "approved-builds.json");
+        assert.equal(validations, 0);
+        assert.equal(yield* fs.readFileString(selectionPath), "previous selection");
+        if (scenario === "cached-stock")
+          assert.equal(yield* fs.readFileString(paths.entryPath), "stock executable");
+        else assert.isFalse(yield* fs.exists(paths.versionDir));
+        assert.deepEqual(commands, scenario === "bad-staged-executable" ? ["tar"] : []);
+        if (scenario === "cached-stock" || scenario === "malformed-policy")
+          assert.deepEqual(requests, []);
+        const versionsDir = path.join(baseDir, "runtime", "versions");
+        if (yield* fs.exists(versionsDir))
+          assert.deepEqual(
+            (yield* fs.readDirectory(versionsDir)).filter((name) => name.startsWith(".staging-")),
+            [],
+          );
+      }),
+  );
+
+  it.effect.each([false, true])(
+    "installs the verified release archive as the runtime executable (approved policy: %s)",
+    (guarded) =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const baseDir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-pinned-archive-" });
+        const requests: string[] = [];
+        const commands: string[] = [];
+        if (guarded) {
+          yield* fs.makeDirectory(path.join(baseDir, "runtime"), { recursive: true });
+          const sha = (text: string) => archiveHex(new TextEncoder().encode(text));
+          yield* fs.writeFileString(
+            path.join(baseDir, "runtime", "approved-builds.json"),
+            JSON.stringify({
+              format: 1,
+              builds: [
+                {
+                  version,
+                  platform: "linux",
+                  arch: "x64",
+                  archiveSha256: yield* archiveHex(archiveBytes),
+                  executableSha256: yield* sha("#!/bin/sh\n"),
+                  clientTreeSha256: yield* sha(
+                    JSON.stringify([["index.html", yield* sha("patched client")]]),
+                  ),
+                },
+              ],
+            }),
+          );
+        }
+        const paths = yield* ensurePinnedRuntimeInstalled({
+          baseDir,
+          version,
+          fs,
+          path,
+          platform: "linux",
+          arch: "x64",
+          httpClient: releaseHttpClient(yield* validChecksums, requests),
+          releaseBaseUrl: "https://releases.example/download",
+          runner: extractingRunner(fs, path, commands),
+          validate: (staging) =>
+            fs.exists(staging.entryPath).pipe(
+              Effect.flatMap((exists) => (exists ? Effect.void : Effect.die("missing runtime"))),
+              Effect.orDie,
+            ),
+        });
+        assert.equal(paths.entryPath, path.join(paths.versionDir, "t3"));
+        assert.deepEqual(pinnedRuntimeCommand(paths), { command: paths.entryPath, args: [] });
+        assert.deepEqual(requests, [
+          `https://releases.example/download/v${version}/SHA256SUMS`,
+          `https://releases.example/download/v${version}/${archiveName}`,
+        ]);
+        assert.deepEqual(commands, ["tar"]);
+        assert.equal(yield* fs.readFileString(paths.sentinelPath), `${version}\n`);
+        assert.isFalse(yield* fs.exists(path.join(paths.versionDir, "t3-runtime-archive")));
+        if (!guarded)
+          assert.isFalse(yield* fs.exists(path.join(paths.versionDir, ".archive-sha256")));
+        if (guarded) {
+          assert.equal(
+            yield* fs.readFileString(path.join(paths.versionDir, ".archive-sha256")),
+            `${yield* archiveHex(archiveBytes)}\n`,
+          );
+          let validations = 0;
+          yield* ensurePinnedRuntimeInstalled({
+            baseDir,
+            version,
+            fs,
+            path,
+            platform: "linux",
+            arch: "x64",
+            httpClient: releaseHttpClient(yield* validChecksums, requests),
+            runner: extractingRunner(fs, path, commands),
+            validate: () =>
+              Effect.sync(() => {
+                validations += 1;
+              }),
+          });
+          assert.equal(validations, 1);
+          assert.equal(requests.length, 2);
+          assert.deepEqual(commands, ["tar"]);
+        }
+      }),
   );
 
   it.effect.each([true, false])(

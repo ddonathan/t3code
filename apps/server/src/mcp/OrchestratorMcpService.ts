@@ -36,6 +36,8 @@ import {
   type OrchestratorMcpListScheduledTasksInput,
   type ProjectId,
   type OrchestratorMcpThreadDetail,
+  type OrchestratorMcpWorkContinuityInput,
+  type OrchestratorMcpWorkContinuityResult,
   type OrchestratorMcpThreadInterruptInput,
   type OrchestratorMcpThreadInterruptResult,
   type OrchestratorMcpThreadListInput,
@@ -173,6 +175,10 @@ export interface OrchestratorMcpServiceShape {
     scope: McpInvocationScope,
     input: OrchestratorMcpThreadListInput,
   ) => Effect.Effect<OrchestratorMcpThreadListResult, OrchestratorMcpFailure>;
+  readonly workContinuity: (
+    scope: McpInvocationScope,
+    input: OrchestratorMcpWorkContinuityInput,
+  ) => Effect.Effect<OrchestratorMcpWorkContinuityResult, OrchestratorMcpFailure>;
   readonly readThread: (
     scope: McpInvocationScope,
     input: OrchestratorMcpThreadReadInput,
@@ -704,6 +710,18 @@ function threadSnooze(
   };
 }
 
+function effectiveShellThreadStatus(shell: OrchestrationV2ThreadShell) {
+  const runStatus = shell.activityRunStatus ?? shell.status;
+  return ThreadManagementService.capacityRecoveryDisposition(
+    shell.capacityRecovery,
+    shell.latestRunId,
+    shell.activeRunId,
+    runStatus,
+  ) === "pending"
+    ? ("waiting" as const)
+    : runStatus;
+}
+
 function listItemFromShell(
   shell: OrchestrationV2ThreadShell,
   nowMs: number,
@@ -713,7 +731,11 @@ function listItemFromShell(
     title: shell.title,
     createdBy: shell.createdBy,
     creationSource: shell.creationSource,
-    status: shell.activityRunStatus ?? shell.status,
+    status: effectiveShellThreadStatus(shell),
+    runStatus: shell.activityRunStatus ?? shell.status,
+    ...listGoal(shell.goal),
+    continuity: shell.continuity ?? null,
+    capacityRecovery: shell.capacityRecovery ?? null,
     latestRunId: shell.latestRunId,
     providerInstanceId: shell.modelSelection.instanceId,
     model: shell.modelSelection.model,
@@ -727,6 +749,16 @@ function listItemFromShell(
     itemCount: shell.visibleItemCount,
     createdAt: DateTime.formatIso(shell.createdAt),
     updatedAt: DateTime.formatIso(shell.updatedAt),
+  };
+}
+
+function listGoal(goal: OrchestrationV2ThreadShell["goal"]) {
+  if (goal == null) return { goal: null, goalTextTruncated: false };
+  const objective = goal.objective.slice(0, 1_000);
+  const lastCheck = goal.lastCheck?.slice(0, 2_000);
+  return {
+    goal: { ...goal, objective, ...(lastCheck === undefined ? {} : { lastCheck }) },
+    goalTextTruncated: objective !== goal.objective || lastCheck !== goal.lastCheck,
   };
 }
 
@@ -744,7 +776,19 @@ function threadDetail(
     title: projection.thread.title,
     createdBy: projection.thread.createdBy,
     creationSource: projection.thread.creationSource,
-    status: active?.status ?? latest?.status ?? "idle",
+    status:
+      ThreadManagementService.capacityRecoveryDisposition(
+        shell.capacityRecovery,
+        latest?.id ?? null,
+        active?.id ?? null,
+        active?.status ?? latest?.status ?? "idle",
+      ) === "pending"
+        ? "waiting"
+        : (active?.status ?? latest?.status ?? "idle"),
+    runStatus: active?.status ?? latest?.status ?? "idle",
+    goal: shell.goal ?? null,
+    continuity: shell.continuity ?? null,
+    capacityRecovery: shell.capacityRecovery ?? null,
     latestRunId: latest?.id ?? null,
     activeRunId: active?.id ?? null,
     providerInstanceId: projection.thread.modelSelection.instanceId,
@@ -1389,29 +1433,43 @@ const make = Effect.gen(function* () {
       };
       // A restart cut the child's run and its continuation has not settled, or
       // the child started working again after this read.
+      const capacityRecovery = task.result === null ? childControls.thread.capacityRecovery : null;
+      const capacityHeld =
+        capacityRecovery?.status === "pending" || capacityRecovery?.status === "retrying";
       const heldForRestart =
+        !capacityHeld &&
         task.result === null &&
         taskWorkState === "result_available" &&
         (yield* threadManagement
           .delegatedTaskResultPending(task.childThreadId, childRun?.delegatedTaskId)
           .pipe(Effect.mapError(threadManagementFailure)));
       const workState =
-        task.result !== null ? "result_available" : heldForRestart ? "working" : taskWorkState;
+        capacityRecovery?.status === "pending"
+          ? "waiting_for_capacity"
+          : capacityRecovery?.status === "retrying"
+            ? "working"
+            : task.result !== null
+              ? "result_available"
+              : heldForRestart
+                ? "working"
+                : taskWorkState;
       const status =
-        task.result !== null
-          ? taskStatusForRun(
-              task.status === "completed" ||
-                task.status === "failed" ||
-                task.status === "cancelled" ||
-                task.status === "interrupted"
-                ? { status: task.status }
-                : childRun,
-            )
-          : workState === "result_available"
-            ? taskStatusForRun(taskResultRun ?? childRun)
-            : taskStatusForRun(taskResultRun ?? childRun) === "queued"
-              ? "queued"
-              : "running";
+        capacityRecovery?.status === "pending"
+          ? "queued"
+          : task.result !== null
+            ? taskStatusForRun(
+                task.status === "completed" ||
+                  task.status === "failed" ||
+                  task.status === "cancelled" ||
+                  task.status === "interrupted"
+                  ? { status: task.status }
+                  : childRun,
+              )
+            : workState === "result_available"
+              ? taskStatusForRun(taskResultRun ?? childRun)
+              : taskStatusForRun(taskResultRun ?? childRun) === "queued"
+                ? "queued"
+                : "running";
       const derivedResult =
         task.result !== null
           ? task.result
@@ -1441,20 +1499,26 @@ const make = Effect.gen(function* () {
         childNodeId: task.id,
         status,
         workState,
+        capacityRecovery: capacityRecovery ?? null,
         hasPendingChildRuns: hasPendingChildRuns(childProjection, childRun),
         providerInstanceId: task.providerInstanceId,
         model: task.model,
         summary: derivedResult,
         resultContextTransferId: resultTransfer?.id ?? null,
-        latestTerminalRunId: terminalRun?.id ?? null,
+        latestTerminalRunId: capacityHeld ? null : (terminalRun?.id ?? null),
         latestTerminalStatus:
-          terminalStatus !== null && isTerminalTaskStatus(terminalStatus) ? terminalStatus : null,
-        latestTerminalSummary: canExposeTaskRunResult(terminalRun)
-          ? terminalRun.id === childRun?.id
-            ? derivedResult
-            : subagentResultForRun(childProjection, terminalRun).text
-          : null,
-        latestTerminalResultContextTransferId: resultTransferForRun(terminalRun)?.id ?? null,
+          !capacityHeld && terminalStatus !== null && isTerminalTaskStatus(terminalStatus)
+            ? terminalStatus
+            : null,
+        latestTerminalSummary:
+          !capacityHeld && canExposeTaskRunResult(terminalRun)
+            ? terminalRun.id === childRun?.id
+              ? derivedResult
+              : subagentResultForRun(childProjection, terminalRun).text
+            : null,
+        latestTerminalResultContextTransferId: capacityHeld
+          ? null
+          : (resultTransferForRun(terminalRun)?.id ?? null),
         waitTimedOut,
       } satisfies OrchestratorMcpDelegateTaskResult;
       if (
@@ -2259,6 +2323,7 @@ const make = Effect.gen(function* () {
         const child = yield* loadProjection(current.childThreadId);
         if (
           current.workState !== "waiting_for_children" &&
+          child.thread.capacityRecovery?.status !== "pending" &&
           ThreadManagementService.latestActiveRun(child) === undefined
         ) {
           return yield* failure(
@@ -2450,10 +2515,7 @@ const make = Effect.gen(function* () {
         const statuses = input.statuses === undefined ? null : new Set(input.statuses);
         const titleContains = input.titleContains?.toLocaleLowerCase();
         const filtered = projectThreads
-          .filter(
-            (thread) =>
-              statuses === null || statuses.has(thread.activityRunStatus ?? thread.status),
-          )
+          .filter((thread) => statuses === null || statuses.has(effectiveShellThreadStatus(thread)))
           .filter(
             (thread) =>
               input.settled === undefined || threadSettlement(thread).settled === input.settled,
@@ -2573,6 +2635,66 @@ const make = Effect.gen(function* () {
           hasMore: timeline.hasMore,
         } satisfies OrchestratorMcpThreadReadResult;
       }),
+    workContinuity: (scope, input) =>
+      Effect.gen(function* () {
+        const { parent } = yield* loadCaller(scope);
+        const threadId = input.threadId ?? parent?.thread.id;
+        if (threadId === undefined) {
+          return yield* failure("target_required", "Pass threadId when no calling thread exists.");
+        }
+        if (parent?.thread.id !== threadId) {
+          return yield* failure(
+            "invalid_request",
+            "Work continuity changes must belong to the calling thread.",
+          );
+        }
+        if (input.action === "enable" && parent.thread.continuityAutoEnrollDisabled === true)
+          return yield* failure(
+            "invalid_request",
+            "The user disabled automatic continuation for this thread. Re-enable it in the client before agent enrollment.",
+          );
+        if (
+          input.action === "enable" &&
+          parent.thread.continuity?.authorityMessageId === input.authorityMessageId
+        ) {
+          return { threadId, continuity: parent.thread.continuity };
+        }
+        const key = yield* requestKey(input.clientRequestId);
+        const commandId = stableCommandId({
+          scope,
+          requestKey: key,
+          operation: `continuity-${input.action}`,
+        });
+        yield* threadManagement
+          .dispatch(
+            input.action === "report"
+              ? {
+                  type: "thread.continuity.report",
+                  commandId,
+                  threadId,
+                  runId: input.runId,
+                  status: input.status,
+                  reason: input.reason,
+                  ...(input.wait === undefined ? {} : { wait: input.wait }),
+                }
+              : {
+                  type: "thread.continuity.set",
+                  creationSource: "mcp",
+                  commandId,
+                  threadId,
+                  enabled: input.action === "enable",
+                  ...(input.action === "enable"
+                    ? {
+                        authorityMessageId: input.authorityMessageId,
+                        ...(input.maxChecks === undefined ? {} : { maxChecks: input.maxChecks }),
+                      }
+                    : {}),
+                },
+          )
+          .pipe(Effect.mapError(threadManagementFailure));
+        const updated = yield* loadProjection(threadId);
+        return { threadId, continuity: updated.thread.continuity ?? null };
+      }),
     sendToThread: (scope, input) =>
       Effect.gen(function* () {
         const { parent, limits, target } = yield* loadScopedThread(scope, input.threadId);
@@ -2642,7 +2764,9 @@ const make = Effect.gen(function* () {
         return {
           threadId: input.threadId,
           runId: result.run?.id ?? null,
-          status: result.run?.status ?? "idle",
+          status: result.status,
+          runStatus: result.run?.status ?? "idle",
+          capacityRecovery: result.capacityRecovery,
           timedOut: result.timedOut,
         } satisfies OrchestratorMcpThreadWaitResult;
       }),

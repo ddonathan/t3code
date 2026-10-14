@@ -464,6 +464,26 @@ export const pinThread = Effect.fn("EnvironmentCommands.pinThread")(function* (
   });
 });
 
+export type SetThreadWorkContinuityInput = Extract<
+  OrchestrationV2Command,
+  { readonly type: "thread.continuity.set" }
+>;
+export const setThreadWorkContinuity = Effect.fn("EnvironmentCommands.setThreadWorkContinuity")(
+  function* (input: SetThreadWorkContinuityInput) {
+    return yield* dispatch(input);
+  },
+);
+
+export type CancelThreadCapacityRecoveryInput = Extract<
+  OrchestrationV2Command,
+  { readonly type: "thread.capacity.cancel" }
+>;
+export const cancelThreadCapacityRecovery = Effect.fn(
+  "EnvironmentCommands.cancelThreadCapacityRecovery",
+)(function* (input: CancelThreadCapacityRecoveryInput) {
+  return yield* dispatch(input);
+});
+
 export interface SetThreadAutoSettleInput extends ThreadCommandInput {
   readonly enabled: boolean;
 }

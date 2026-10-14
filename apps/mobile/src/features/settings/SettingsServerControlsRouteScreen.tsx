@@ -230,6 +230,20 @@ function ServerSettingsDetail(props: { readonly page: SettingsPage }) {
     (target) =>
       target.environment.serverConfig.environment.capabilities.threadRestartContinuation === true,
   );
+  const supportsCapacityRecovery =
+    targets.length > 0 &&
+    targets.every(
+      (target) =>
+        target.environment.serverConfig.environment.capabilities.threadModelCapacityRecovery ===
+        true,
+    );
+  const supportsAutomaticContinuity =
+    targets.length > 0 &&
+    targets.every(
+      (target) =>
+        target.environment.serverConfig.environment.capabilities
+          .threadWorkContinuityAutoEnrollment === true,
+    );
   const disabledFor = (key: string) =>
     disabled ||
     (projectSelected &&
@@ -449,6 +463,42 @@ function ServerSettingsDetail(props: { readonly page: SettingsPage }) {
                       ))}
                     </SettingsSection>
                   ) : null}
+                  <SettingsSection title="Model capacity">
+                    <SettingsSwitchRow
+                      icon="arrow.clockwise"
+                      label="Retry model capacity errors"
+                      subtitle={
+                        projectSelected
+                          ? "Environment-wide setting. Select All projects to change it."
+                          : supportsCapacityRecovery
+                            ? "Retry the same Codex model up to three times after temporary capacity failures. Cancel a pending retry from the thread."
+                            : "Update older servers to enable model capacity retries."
+                      }
+                      value={uniform("autoResumeCapacityThreads")}
+                      disabled={
+                        disabledFor("autoResumeCapacityThreads") || !supportsCapacityRecovery
+                      }
+                      onValueChange={(value) => write({ autoResumeCapacityThreads: value })}
+                    />
+                  </SettingsSection>
+                  <SettingsSection title="Continuation checks">
+                    <SettingsSwitchRow
+                      icon="arrow.clockwise"
+                      label="Automatic continuation checks"
+                      subtitle={
+                        projectSelected
+                          ? "Environment-wide setting. Select All projects to change it."
+                          : supportsAutomaticContinuity
+                            ? "Enable up to three checks for new work, including a new job after completion. Paused, blocked, exhausted, and disabled checks stay closed."
+                            : "Update older servers to enable automatic continuation checks."
+                      }
+                      value={uniform("workContinuityAutoEnroll")}
+                      disabled={
+                        disabledFor("workContinuityAutoEnroll") || !supportsAutomaticContinuity
+                      }
+                      onValueChange={(value) => write({ workContinuityAutoEnroll: value })}
+                    />
+                  </SettingsSection>
                   <SettingsSection title="Updates">
                     <SettingsSwitchRow
                       icon="arrow.clockwise"

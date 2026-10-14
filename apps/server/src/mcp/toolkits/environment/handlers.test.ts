@@ -49,13 +49,13 @@ const layerEnvironment = Layer.mock(Environment.ServerEnvironment)({
   }),
 });
 
-it.effect("updates preferences for a thread caller through the /mcp registration", () =>
+it.effect("updates allowed MCP preferences without enabling automatic continuity", () =>
   Effect.gen(function* () {
     const server = yield* McpServer.McpServer;
     const result = yield* server
       .callTool({
         name: "t3_environment_preferences_update",
-        arguments: { newWorktreesStartFromOrigin: true },
+        arguments: { newWorktreesStartFromOrigin: true, workContinuityAutoEnroll: true },
       })
       .pipe(
         Effect.provideService(McpInvocationContext.McpInvocationContext, caller),
@@ -77,6 +77,8 @@ it.effect("updates preferences for a thread caller through the /mcp registration
       );
     expect(result.isError).toBe(false);
     expect(result.structuredContent).toMatchObject({ newWorktreesStartFromOrigin: true });
+    const settings = yield* Settings.ServerSettingsService;
+    expect((yield* settings.getSettings).workContinuityAutoEnroll).toBe(false);
   }).pipe(
     Effect.provide(
       McpHttpServer.layerEnvironmentToolkit.pipe(
@@ -87,7 +89,7 @@ it.effect("updates preferences for a thread caller through the /mcp registration
           }),
         ),
         Layer.provide(layerEnvironment),
-        Layer.provide(Settings.layerTest()),
+        Layer.provideMerge(Settings.layerTest()),
       ),
     ),
   ),

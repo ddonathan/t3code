@@ -27,6 +27,9 @@ import {
   OrchestrationV2Checkpoint,
   OrchestrationV2CheckpointScope,
   OrchestrationV2Command,
+  type OrchestrationV2ServerCommand,
+  OrchestrationV2CapacityRecoveryJson,
+  OrchestrationV2AppThreadJson,
   OrchestrationV2LimitRecoveryUpdate,
   OrchestrationV2DomainEvent,
   OrchestrationV2ProviderCapabilities,
@@ -117,6 +120,77 @@ const encodeOrchestrationV2SubagentJson = Schema.encodeSync(OrchestrationV2Subag
 const decodeOrchestrationV2ThreadProjection = Schema.decodeUnknownSync(
   OrchestrationV2ThreadProjection,
 );
+it("historical thread projections omit the auto enrollment tombstone and new projections preserve opt-out", () => {
+  const oldProjection = emptyThreadProjection();
+  expect(
+    decodeOrchestrationV2ThreadProjection(oldProjection).thread.continuityAutoEnrollDisabled,
+  ).toBeUndefined();
+  expect(
+    decodeOrchestrationV2ThreadProjection({
+      ...oldProjection,
+      thread: { ...oldProjection.thread, continuityAutoEnrollDisabled: true },
+    }).thread.continuityAutoEnrollDisabled,
+  ).toBe(true);
+});
+
+const decodeCapacityRecoveryJson = Schema.decodeUnknownSync(OrchestrationV2CapacityRecoveryJson);
+const encodeCapacityThreadJson = Schema.encodeSync(OrchestrationV2AppThreadJson);
+const decodeCapacityThreadJson = Schema.decodeUnknownSync(OrchestrationV2AppThreadJson);
+
+const isPublicOrchestrationCommand = Schema.is(OrchestrationV2Command);
+
+it("capacity release and refusal commands cannot cross the public command boundary", () => {
+  for (const type of [
+    "thread.capacity.release",
+    "thread.capacity.abort",
+    "thread.capacity.retry",
+    "thread.capacity.reconcile",
+  ] as const) {
+    const command = {
+      type,
+      commandId: CommandId.make(`${type}:command`),
+      threadId: ThreadId.make("thread:capacity"),
+      generation: CommandId.make("capacity:generation"),
+      runId: RunId.make("capacity:run"),
+    } satisfies OrchestrationV2ServerCommand;
+    expect(isPublicOrchestrationCommand(command)).toBe(false);
+  }
+});
+
+it("capacity deadlines round-trip through persisted thread JSON without becoming quota resets", () => {
+  const original = decodeOrchestrationV2ThreadProjection(emptyThreadProjection()).thread;
+  expect(original.capacityRecovery).toBeUndefined();
+  const deadline = "2026-04-20T00:00:17.000Z";
+  const recovery = decodeCapacityRecoveryJson({
+    generation: "capacity-generation",
+    originalRunId: "capacity-original",
+    authorityMessageId: "accepted-request",
+    failedRunId: "capacity-original",
+    retryRunId: null,
+    providerThreadId: "native-capacity-thread",
+    modelSelection: original.modelSelection,
+    runtimeMode: original.runtimeMode,
+    interactionMode: original.interactionMode,
+    reactionsReleased: false,
+    attemptsUsed: 0,
+    nextAttemptAt: deadline,
+    status: "pending",
+    reason: "Selected model capacity is unavailable.",
+  });
+  const encoded = encodeCapacityThreadJson({
+    ...original,
+    capacityRecovery: recovery,
+  });
+  expect(encoded.capacityRecovery?.nextAttemptAt).toBe(deadline);
+  expect(encoded.limitRecovery).toBeUndefined();
+  const restored = decodeCapacityThreadJson(JSON.parse(JSON.stringify(encoded)));
+  if (restored.capacityRecovery?.nextAttemptAt == null)
+    throw new Error("Capacity deadline disappeared during persisted thread JSON roundtrip.");
+  expect(DateTime.formatIso(restored.capacityRecovery.nextAttemptAt)).toBe(deadline);
+  expect(restored.capacityRecovery?.authorityMessageId).toBe("accepted-request");
+  expect(restored.capacityRecovery?.attemptsUsed).toBe(0);
+});
+
 const decodeOrchestrationV2ThreadStreamItem = Schema.decodeUnknownSync(
   OrchestrationV2ThreadStreamItem,
 );
@@ -1313,6 +1387,7 @@ describe("orchestration V2 contracts", () => {
     });
 
     expect(shell.pendingBackgroundTasks).toEqual([]);
+    expect(shell.continuityAutoEnrollDisabled).toBeUndefined();
   });
 });
 

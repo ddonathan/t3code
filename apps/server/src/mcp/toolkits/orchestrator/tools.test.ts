@@ -85,7 +85,10 @@ describe("orchestrator MCP tool guidance", () => {
       "title",
       "pullRequest",
       "clientRequestId",
+      "generation",
     ]);
     assert.include(ThreadUpdateTool.description ?? "", "Workspace and branch changes");
+    assert.include(ThreadUpdateTool.description ?? "", "cancel_capacity_retry");
+    assert.include(ThreadUpdateTool.description ?? "", "not_pending");
   });
 });

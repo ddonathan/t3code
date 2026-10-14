@@ -1,3 +1,5 @@
+import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
+import * as ModelCapacityRecoveryWorker from "./ModelCapacityRecoveryWorker.ts";
 import { SourceControlProviderKind } from "@t3tools/contracts";
 import { limitRecoveryCommand } from "./UsageLimitRecoveryWorker.ts";
 import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
@@ -27,6 +29,7 @@ import {
   ProviderThreadId,
   ProviderTurnId,
   RunId,
+  ScheduledTaskId,
   ThreadId,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
@@ -63,6 +66,7 @@ import * as EffectWorker from "./EffectWorker.ts";
 import * as EffectOutbox from "./EffectOutbox.ts";
 import * as EventSink from "./EventSink.ts";
 import * as ProviderRuntimeRecoveryService from "./ProviderRuntimeRecoveryService.ts";
+import { continueRestartedRun } from "./RestartContinuation.ts";
 import * as ProjectionMaintenance from "./ProjectionMaintenance.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as PullRequestWatchReactor from "./PullRequestWatchReactor.ts";
@@ -278,7 +282,7 @@ const layerTest = Layer.mergeAll(
   Layer.provide(SqlitePersistence.layerMemory),
   Layer.provide(layerCheckpointStoreTest),
   Layer.provide(layerServerConfig),
-  Layer.provide(ServerSettings.layerTest()),
+  Layer.provideMerge(ServerSettings.layerTest()),
   Layer.provide(layerTestProviderInstanceRegistry),
   Layer.provide(layerGitWorkflowTest),
   Layer.provide(layerProjectServiceTest),
@@ -5726,3 +5730,3872 @@ it.layer(layerQueueResumeDisabledInstanceTest)(
     );
   },
 );
+
+it.layer(
+  layerTest.pipe(
+    Layer.provideMerge(SqlitePersistence.layerMemory),
+    Layer.provideMerge(IdAllocator.layer),
+  ),
+)("bounded work continuity", (it) => {
+  const seedContinuity = (
+    name: string,
+    maxChecks?: number,
+    automatic = false,
+    selection = modelSelection,
+  ) =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const threadId = ThreadId.make(`continuity:${name}`);
+      const authorityMessageId = MessageId.make(`${threadId}:authority`);
+      const generation = CommandId.make(`${threadId}:enroll`);
+      yield* seedProject({
+        projectId: ProjectId.make(`${threadId}:project`),
+        title: name,
+        workspaceRoot: process.cwd(),
+        defaultModelSelection: selection,
+        createdAt: DateTime.formatIso(yield* DateTime.now),
+      });
+      yield* orchestrator.dispatch({
+        type: "thread.create",
+        commandId: CommandId.make(`${threadId}:create`),
+        threadId,
+        projectId: ProjectId.make(`${threadId}:project`),
+        title: name,
+        createdBy: "user",
+        creationSource: "web",
+        modelSelection: selection,
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: null,
+      });
+      yield* orchestrator.dispatch({
+        type: "message.dispatch",
+        commandId: CommandId.make(`${threadId}:request`),
+        threadId,
+        messageId: authorityMessageId,
+        text: "Finish this assignment, including verification.",
+        createdBy: "user",
+        creationSource: "web",
+        attachments: [],
+        dispatchMode: { type: "start_immediately" },
+      });
+      if (!automatic)
+        yield* orchestrator.dispatch({
+          type: "thread.continuity.set",
+          creationSource: "web",
+          commandId: generation,
+          threadId,
+          enabled: true,
+          authorityMessageId,
+          ...(maxChecks === undefined ? {} : { maxChecks }),
+        });
+      const run = (yield* orchestrator.getThreadProjection(threadId)).runs[0]!;
+      return { threadId, authorityMessageId, generation, run };
+    });
+
+  const seedLiveChild = (input: { threadId: ThreadId; run: OrchestrationV2Run }) =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const events = yield* EventSink.EventSinkV2;
+      const rootNodeId = input.run.rootNodeId;
+      if (rootNodeId === null)
+        return yield* Effect.die("The delegate fixture requires an allocated root node.");
+      yield* orchestrator.dispatch({
+        type: "delegated_task.request",
+        commandId: CommandId.make(`${input.threadId}:delegate`),
+        parentThreadId: input.threadId,
+        parentRunId: input.run.id,
+        parentNodeId: rootNodeId,
+        task: "Complete the isolated child assignment.",
+        modelSelection,
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        completionWake: "always",
+        createdBy: "agent",
+        creationSource: "server",
+      });
+      const task = (yield* orchestrator.getThreadProjection(input.threadId)).subagents[0]!;
+      const childThreadId = task.childThreadId;
+      if (childThreadId === null)
+        return yield* Effect.die("The delegate fixture requires its app-owned child binding.");
+      const now = yield* DateTime.now;
+      const running = { ...task, status: "running" as const, startedAt: now, updatedAt: now };
+      yield* events.write({
+        events: [
+          {
+            id: EventId.make(`${input.threadId}:child-running`),
+            type: "subagent.updated",
+            threadId: input.threadId,
+            runId: input.run.id,
+            nodeId: task.id,
+            occurredAt: now,
+            payload: running,
+          },
+        ],
+      });
+      return running;
+    });
+
+  const finishRun = (
+    threadId: ThreadId,
+    run: OrchestrationV2Run,
+    status: "completed" | "failed" | "cancelled" = "completed",
+  ) =>
+    Effect.gen(function* () {
+      const events = yield* EventSink.EventSinkV2;
+      const now = yield* DateTime.now;
+      yield* events.write({
+        events: [
+          {
+            id: EventId.make(`${run.id}:terminal`),
+            type: "run.updated",
+            threadId,
+            runId: run.id,
+            occurredAt: now,
+            payload: { ...run, status, startedAt: run.startedAt ?? now, completedAt: now },
+          },
+        ],
+      });
+    });
+
+  const advance = (
+    input: { threadId: ThreadId; generation: CommandId; run: OrchestrationV2Run },
+    suffix: string,
+  ) =>
+    Effect.flatMap(Orchestrator.OrchestratorV2, (orchestrator) =>
+      orchestrator.dispatch({
+        type: "thread.continuity.advance",
+        commandId: CommandId.make(`${input.run.id}:advance:${suffix}`),
+        threadId: input.threadId,
+        endedRunId: input.run.id,
+        generation: input.generation,
+      }),
+    );
+
+  const withCapacityRecovery = <A, E, R>(program: Effect.Effect<A, E, R>) =>
+    Effect.gen(function* () {
+      const settings = yield* ServerSettings.ServerSettingsService;
+      yield* settings.updateSettings({ autoResumeCapacityThreads: true });
+      return yield* program.pipe(
+        Effect.ensuring(
+          settings.updateSettings({ autoResumeCapacityThreads: false }).pipe(Effect.orDie),
+        ),
+      );
+    });
+  const failCapacity = (
+    threadId: ThreadId,
+    run: OrchestrationV2Run,
+    code = "serverOverloaded",
+    commandId?: CommandId,
+  ) =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const events = yield* EventSink.EventSinkV2;
+      const projection = yield* orchestrator.getThreadProjection(threadId);
+      const providerThread = projection.providerThreads.find(
+        (entry) => entry.id === run.providerThreadId,
+      )!;
+      const now = yield* DateTime.now;
+      yield* events.write({
+        ...(commandId === undefined ? {} : { commandId }),
+        events: [
+          {
+            id: EventId.make(`${run.id}:native-ready`),
+            type: "provider-thread.updated",
+            threadId,
+            occurredAt: now,
+            payload: {
+              ...providerThread,
+              status: "active",
+              nativeThreadRef: {
+                driver: providerThread.driver,
+                nativeId: `capacity-native:${threadId}`,
+                strength: "strong",
+              },
+            },
+          },
+          {
+            id: EventId.make(`${run.id}:capacity-error`),
+            type: "turn-item.updated",
+            threadId,
+            runId: run.id,
+            nodeId: run.rootNodeId ?? undefined,
+            occurredAt: now,
+            payload: {
+              id: TurnItemId.make(`${run.id}:capacity-error`),
+              threadId,
+              runId: run.id,
+              nodeId: run.rootNodeId,
+              providerThreadId: run.providerThreadId,
+              providerTurnId: null,
+              nativeItemRef: null,
+              parentItemId: null,
+              ordinal: run.ordinal * 100 + 1,
+              status: "failed",
+              title: "Model capacity unavailable",
+              startedAt: now,
+              completedAt: now,
+              updatedAt: now,
+              type: "error",
+              failure: {
+                class:
+                  code === "usageLimitExceeded" || code === "rateLimitExceeded"
+                    ? "usage_limit"
+                    : "provider_error",
+                code,
+                message: "Selected model is at capacity. Please try a different model.",
+                retryable: null,
+              },
+            },
+          },
+          {
+            id: EventId.make(`${run.id}:capacity-terminal`),
+            type: "run.updated",
+            threadId,
+            runId: run.id,
+            occurredAt: now,
+            payload: {
+              ...run,
+              status: "failed",
+              startedAt: run.startedAt ?? now,
+              completedAt: now,
+            },
+          },
+        ],
+      });
+    });
+  const awaitCapacityState = (
+    threadId: ThreadId,
+    status: "pending" | "exhausted" | "cancelled" | "complete",
+  ) =>
+    Effect.gen(function* () {
+      const events = yield* EventSink.EventSinkV2;
+      return yield* events
+        .stream({
+          afterSequence: yield* events.latestSequence(),
+          eventType: "thread.metadata-updated",
+        })
+        .pipe(
+          Stream.filter(
+            (stored) =>
+              stored.event.threadId === threadId &&
+              stored.event.type === "thread.metadata-updated" &&
+              stored.event.payload.capacityRecovery?.status === status,
+          ),
+          Stream.take(1),
+          Stream.runCollect,
+          Effect.forkChild({ startImmediately: true }),
+        );
+    });
+
+  it.effect(
+    "capacity recovery retains native history, authority, model and a three-attempt budget across startup",
+    () =>
+      withCapacityRecovery(
+        Effect.gen(function* () {
+          const selected = {
+            ...modelSelection,
+            options: [{ id: "reasoningEffort", value: "high" }],
+          };
+          const input = yield* seedContinuity("capacity-bounded", undefined, false, selected);
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const events = yield* EventSink.EventSinkV2;
+          const nativeGoal = {
+            objective: "Existing explicit objective",
+            status: "active" as const,
+            tokensUsed: 17,
+            tokenBudget: 100_000,
+          };
+          const providerThread = (yield* orchestrator.getThreadProjection(input.threadId))
+            .providerThreads[0]!;
+          yield* events.write({
+            events: [
+              {
+                id: EventId.make(`${input.run.id}:native-goal`),
+                type: "provider-thread.updated",
+                threadId: input.threadId,
+                occurredAt: yield* DateTime.now,
+                payload: { ...providerThread, goal: nativeGoal },
+              },
+            ],
+          });
+          const toolCompletedAt = yield* DateTime.now;
+          const completedTool = {
+            id: TurnItemId.make(`${input.run.id}:completed-tool`),
+            threadId: input.threadId,
+            runId: input.run.id,
+            nodeId: input.run.rootNodeId,
+            providerThreadId: input.run.providerThreadId,
+            providerTurnId: null,
+            nativeItemRef: null,
+            parentItemId: null,
+            ordinal: 101,
+            status: "completed" as const,
+            title: "Completed mutation",
+            startedAt: toolCompletedAt,
+            completedAt: toolCompletedAt,
+            updatedAt: toolCompletedAt,
+            type: "command_execution" as const,
+            input: "create-once external-operation",
+            output: "Operation receipt abc-123",
+            exitCode: 0,
+          };
+          yield* events.write({
+            events: [
+              {
+                id: EventId.make(`${input.run.id}:completed-tool`),
+                type: "turn-item.updated",
+                threadId: input.threadId,
+                occurredAt: toolCompletedAt,
+                payload: completedTool,
+              },
+            ],
+          });
+          const storedTool = (yield* orchestrator.getThreadProjection(
+            input.threadId,
+          )).turnItems.find((entry) => entry.id === completedTool.id)!;
+          const pending = yield* awaitCapacityState(input.threadId, "pending");
+          yield* failCapacity(input.threadId, input.run);
+          yield* Fiber.join(pending);
+          const armed = yield* orchestrator.getThreadProjection(input.threadId);
+          assert.equal(armed.thread.capacityRecovery?.attemptsUsed, 0);
+          assert.equal(armed.thread.capacityRecovery?.authorityMessageId, input.authorityMessageId);
+          assert.equal(armed.thread.capacityRecovery?.status, "pending");
+          assert.equal((yield* orchestrator.getThreadShell(input.threadId))?.status, "waiting");
+          assert.equal(armed.thread.continuity?.checksRemaining, 3);
+          const maintenance = yield* ProjectionMaintenance.ProjectionMaintenanceV2;
+          assert.isTrue((yield* maintenance.rebuild).valid);
+          yield* ModelCapacityRecoveryWorker.sweep;
+          assert.lengthOf((yield* orchestrator.getThreadProjection(input.threadId)).runs, 1);
+          for (let attempt = 1; attempt <= 3; attempt++) {
+            yield* TestClock.adjust(
+              attempt === 1 ? "20 seconds" : attempt === 2 ? "35 seconds" : "65 seconds",
+            );
+            if (attempt === 1) yield* orchestrator.recoverDelegatedTasks;
+            else yield* ModelCapacityRecoveryWorker.sweep;
+            const retrying = yield* orchestrator.getThreadProjection(input.threadId);
+            const recovery = retrying.thread.capacityRecovery!;
+            assert.equal(recovery.attemptsUsed, attempt);
+            assert.equal(recovery.status, "retrying");
+            yield* ModelCapacityRecoveryWorker.sweep;
+            yield* orchestrator.recoverDelegatedTasks;
+            assert.lengthOf(
+              (yield* orchestrator.getThreadProjection(input.threadId)).runs,
+              attempt + 1,
+            );
+            assert.equal(recovery.originalRunId, input.run.id);
+            const retry = retrying.runs.find((run) => run.id === recovery.retryRunId)!;
+            assert.deepEqual(retry.modelSelection, input.run.modelSelection);
+            assert.deepEqual(retry.modelSelection, selected);
+            assert.equal(retry.runtimeMode, input.run.runtimeMode);
+            assert.equal(retry.interactionMode, input.run.interactionMode);
+            assert.deepEqual(
+              retrying.providerThreads.find((entry) => entry.id === retry.providerThreadId)?.goal,
+              nativeGoal,
+            );
+            assert.equal(retry.providerThreadId, input.run.providerThreadId);
+            assert.deepEqual(
+              retrying.turnItems.find((entry) => entry.id === completedTool.id),
+              storedTool,
+            );
+            const message = retrying.messages.find((entry) => entry.id === retry.userMessageId)!;
+            assert.include(message.text, input.authorityMessageId);
+            assert.include(message.text, "actual current state");
+            assert.notEqual(
+              message.text,
+              retrying.messages.find((entry) => entry.id === input.authorityMessageId)?.text,
+            );
+            const next = yield* awaitCapacityState(
+              input.threadId,
+              attempt === 3 ? "exhausted" : "pending",
+            );
+            yield* failCapacity(input.threadId, retry);
+            yield* Fiber.join(next);
+          }
+          yield* TestClock.adjust("5 minutes");
+          yield* ModelCapacityRecoveryWorker.sweep;
+          const exhausted = yield* orchestrator.getThreadProjection(input.threadId);
+          assert.lengthOf(exhausted.runs, 4);
+          assert.equal(exhausted.thread.capacityRecovery?.attemptsUsed, 3);
+          assert.equal(exhausted.thread.capacityRecovery?.status, "exhausted");
+          assert.equal(exhausted.thread.continuity?.checksRemaining, 3);
+        }),
+      ),
+  );
+
+  it.effect("capacity recovery rejects a stale cancel and Stop prevents the pending wake", () =>
+    withCapacityRecovery(
+      Effect.gen(function* () {
+        const input = yield* seedContinuity("capacity-stop");
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const pending = yield* awaitCapacityState(input.threadId, "pending");
+        yield* failCapacity(input.threadId, input.run);
+        yield* Fiber.join(pending);
+        const recovery = (yield* orchestrator.getThreadProjection(input.threadId)).thread
+          .capacityRecovery!;
+        yield* orchestrator.dispatch({
+          type: "thread.capacity.cancel",
+          commandId: CommandId.make(`${input.threadId}:stale-cancel`),
+          threadId: input.threadId,
+          generation: CommandId.make("old-capacity-generation"),
+        });
+        assert.equal(
+          (yield* orchestrator.getThreadProjection(input.threadId)).thread.capacityRecovery?.status,
+          "pending",
+        );
+        yield* orchestrator.dispatch({
+          type: "thread.stop",
+          commandId: CommandId.make(`${input.threadId}:stop`),
+          threadId: input.threadId,
+        });
+        yield* TestClock.adjust("1 minute");
+        yield* ModelCapacityRecoveryWorker.sweep;
+        const stopped = yield* orchestrator.getThreadProjection(input.threadId);
+        assert.equal(stopped.thread.capacityRecovery?.generation, recovery.generation);
+        assert.equal(stopped.thread.capacityRecovery?.status, "cancelled");
+        assert.lengthOf(stopped.runs, 1);
+      }),
+    ),
+  );
+
+  it.effect(
+    "continuity advancement arms exact capacity recovery under its lock before marking a failed assignment blocked",
+    () =>
+      withCapacityRecovery(
+        Effect.gen(function* () {
+          const input = yield* seedContinuity("capacity-continuity-preflight");
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          yield* failCapacity(
+            input.threadId,
+            input.run,
+            "serverOverloaded",
+            CommandId.make("command:runtime-reconcile:capacity-continuity-preflight"),
+          );
+          yield* advance(input, "capacity-preflight");
+          const after = yield* orchestrator.getThreadProjection(input.threadId);
+          assert.equal(after.thread.capacityRecovery?.status, "pending");
+          assert.equal(after.thread.continuity?.status, "active");
+          assert.equal(after.thread.continuity?.checksRemaining, 3);
+          assert.lengthOf(after.runs, 1);
+          yield* orchestrator.dispatch({
+            type: "thread.stop",
+            commandId: CommandId.make(`${input.threadId}:cleanup-stop`),
+            threadId: input.threadId,
+          });
+        }),
+      ),
+  );
+
+  const awaitCapacityRelease = (threadId: ThreadId) =>
+    Effect.gen(function* () {
+      const events = yield* EventSink.EventSinkV2;
+      return yield* events
+        .stream({
+          afterSequence: yield* events.latestSequence(),
+          eventType: "thread.metadata-updated",
+        })
+        .pipe(
+          Stream.filter(
+            (stored) =>
+              stored.event.threadId === threadId &&
+              stored.event.type === "thread.metadata-updated" &&
+              stored.event.payload.capacityRecovery?.reactionsReleased === true,
+          ),
+          Stream.take(1),
+          Stream.runCollect,
+          Effect.forkChild({ startImmediately: true }),
+        );
+    });
+
+  it.effect(
+    "startup releases the capacity retry cancelled by real runtime reconciliation without spending another attempt",
+    () =>
+      withCapacityRecovery(
+        Effect.gen(function* () {
+          const input = yield* seedContinuity("capacity-restart-retrying");
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const pending = yield* awaitCapacityState(input.threadId, "pending");
+          yield* failCapacity(input.threadId, input.run);
+          yield* Fiber.join(pending);
+          yield* TestClock.adjust("20 seconds");
+          yield* ModelCapacityRecoveryWorker.sweep;
+          const before = yield* orchestrator.getThreadProjection(input.threadId);
+          assert.equal(before.thread.capacityRecovery?.status, "retrying");
+          const runtime = yield* ProviderRuntimeRecoveryService.ProviderRuntimeRecoveryService;
+          yield* runtime.reconcile("startup");
+          const cancelled = yield* orchestrator.getThreadProjection(input.threadId);
+          assert.equal(
+            cancelled.runs.find((run) => run.id === before.thread.capacityRecovery?.retryRunId)
+              ?.status,
+            "cancelled",
+          );
+          assert.equal(cancelled.thread.capacityRecovery?.status, "retrying");
+          const release = yield* awaitCapacityRelease(input.threadId);
+          yield* orchestrator.recoverDelegatedTasks;
+          yield* Fiber.join(release);
+          yield* orchestrator.recoverDelegatedTasks;
+          yield* ModelCapacityRecoveryWorker.sweep;
+          const after = yield* orchestrator.getThreadProjection(input.threadId);
+          assert.equal(after.thread.capacityRecovery?.status, "cancelled");
+          assert.equal(after.thread.capacityRecovery?.attemptsUsed, 1);
+          assert.isTrue(after.thread.capacityRecovery?.reactionsReleased);
+          assert.lengthOf(after.runs, 2);
+        }),
+      ),
+  );
+
+  it.effect(
+    "a refused capacity dispatch cancels its durable episode once and later due candidates still progress",
+    () =>
+      withCapacityRecovery(
+        Effect.gen(function* () {
+          const failed = yield* seedContinuity("capacity-dispatch-refusal", undefined, true);
+          const later = yield* seedContinuity("capacity-dispatch-later", undefined, true);
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          for (const input of [failed, later]) {
+            const pending = yield* awaitCapacityState(input.threadId, "pending");
+            yield* failCapacity(input.threadId, input.run);
+            yield* Fiber.join(pending);
+          }
+          const threads = yield* ThreadManagementService.ThreadManagementService;
+          let refusedDispatches = 0;
+          const sweep = ModelCapacityRecoveryWorker.sweep.pipe(
+            Effect.provideService(ThreadManagementService.ThreadManagementService, {
+              ...threads,
+              dispatch: (command) => {
+                if (
+                  command.type === "thread.capacity.retry" &&
+                  command.threadId === failed.threadId
+                ) {
+                  refusedDispatches++;
+                  return Effect.fail(
+                    new Orchestrator.OrchestratorDispatchError({
+                      commandId: command.commandId,
+                      commandType: command.type,
+                      cause: "Injected dispatch infrastructure refusal",
+                    }),
+                  );
+                }
+                return threads.dispatch(command);
+              },
+            }),
+          );
+          yield* sweep;
+          assert.equal(refusedDispatches, 0);
+          yield* TestClock.adjust("20 seconds");
+          const release = yield* awaitCapacityRelease(failed.threadId);
+          yield* sweep;
+          yield* Fiber.join(release);
+          yield* sweep;
+          assert.equal(refusedDispatches, 1);
+          const stopped = yield* orchestrator.getThreadProjection(failed.threadId);
+          assert.equal(stopped.thread.capacityRecovery?.status, "cancelled");
+          assert.equal(stopped.thread.capacityRecovery?.attemptsUsed, 0);
+          assert.lengthOf(stopped.runs, 1);
+          const progressed = yield* orchestrator.getThreadProjection(later.threadId);
+          assert.equal(progressed.thread.capacityRecovery?.status, "retrying");
+          assert.equal(progressed.thread.capacityRecovery?.attemptsUsed, 1);
+        }),
+      ),
+  );
+
+  it.effect(
+    "capacity refusal cannot cancel a continuation whose run was already allocated or is still active",
+    () =>
+      withCapacityRecovery(
+        Effect.gen(function* () {
+          const input = yield* seedContinuity("capacity-refusal-after-commit", undefined, true);
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const pending = yield* awaitCapacityState(input.threadId, "pending");
+          yield* failCapacity(input.threadId, input.run);
+          yield* Fiber.join(pending);
+          yield* TestClock.adjust("20 seconds");
+          yield* ModelCapacityRecoveryWorker.sweep;
+          const recovery = (yield* orchestrator.getThreadProjection(input.threadId)).thread
+            .capacityRecovery!;
+          for (const runId of [recovery.failedRunId, recovery.retryRunId!]) {
+            yield* orchestrator.dispatch({
+              type: "thread.capacity.abort",
+              commandId: CommandId.make(`${input.threadId}:abort:${runId}`),
+              threadId: input.threadId,
+              generation: recovery.generation,
+              runId,
+            });
+          }
+          const after = yield* orchestrator.getThreadProjection(input.threadId);
+          assert.equal(after.thread.capacityRecovery?.status, "retrying");
+          assert.equal(after.thread.capacityRecovery?.attemptsUsed, 1);
+          assert.lengthOf(after.runs, 2);
+        }),
+      ),
+  );
+
+  it.effect(
+    "a newer human run ending before the capacity sweep releases its own terminal reactions",
+    () =>
+      withCapacityRecovery(
+        Effect.gen(function* () {
+          const input = yield* seedContinuity("capacity-new-human-terminal", undefined, true);
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const pending = yield* awaitCapacityState(input.threadId, "pending");
+          yield* failCapacity(input.threadId, input.run);
+          yield* Fiber.join(pending);
+          const release = yield* awaitCapacityRelease(input.threadId);
+          yield* orchestrator.dispatch({
+            type: "message.dispatch",
+            commandId: CommandId.make(`${input.threadId}:new-human`),
+            threadId: input.threadId,
+            messageId: MessageId.make(`${input.threadId}:new-human`),
+            text: "A new authorized assignment",
+            createdBy: "user",
+            creationSource: "web",
+            attachments: [],
+            dispatchMode: { type: "start_immediately" },
+          });
+          const human = (yield* orchestrator.getThreadProjection(input.threadId)).runs.at(-1)!;
+          assert.equal(
+            (yield* orchestrator.getThreadProjection(input.threadId)).thread.capacityRecovery
+              ?.status,
+            "cancelled",
+          );
+          assert.notEqual((yield* orchestrator.getThreadShell(input.threadId))?.status, "waiting");
+          yield* finishRun(input.threadId, human);
+          yield* Fiber.join(release);
+          const after = yield* orchestrator.getThreadProjection(input.threadId);
+          assert.equal(after.thread.capacityRecovery?.status, "cancelled");
+          assert.isTrue(after.thread.capacityRecovery?.reactionsReleased);
+          assert.equal(after.runs.find((run) => run.id === human.id)?.status, "completed");
+          yield* TestClock.adjust("20 seconds");
+          yield* ModelCapacityRecoveryWorker.sweep;
+          assert.lengthOf((yield* orchestrator.getThreadProjection(input.threadId)).runs, 2);
+        }),
+      ),
+  );
+
+  it.effect(
+    "a refused terminal capacity reconciliation durably aborts retrying instead of suppressing later reactions",
+    () =>
+      withCapacityRecovery(
+        Effect.gen(function* () {
+          const input = yield* seedContinuity("capacity-terminal-refusal", undefined, true);
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const pending = yield* awaitCapacityState(input.threadId, "pending");
+          yield* failCapacity(input.threadId, input.run);
+          yield* Fiber.join(pending);
+          yield* TestClock.adjust("20 seconds");
+          yield* ModelCapacityRecoveryWorker.sweep;
+          const before = yield* orchestrator.getThreadProjection(input.threadId);
+          const retry = before.runs.find(
+            (run) => run.id === before.thread.capacityRecovery?.retryRunId,
+          )!;
+          const projections = yield* ProjectionStore.ProjectionStoreV2;
+          const original = projections.getThreadRecords;
+          let refused = false;
+          const spy = vi
+            .spyOn(projections, "getThreadRecords")
+            .mockImplementation((threadId, sections, options) => {
+              if (
+                !refused &&
+                threadId === input.threadId &&
+                sections.includes("checkpointScopes")
+              ) {
+                refused = true;
+                return Effect.fail(
+                  new ProjectionStore.ProjectionStoreReadError({
+                    threadId,
+                    cause: "Injected terminal projection refusal",
+                  }),
+                );
+              }
+              return original(threadId, sections, options);
+            });
+          yield* Effect.gen(function* () {
+            const release = yield* awaitCapacityRelease(input.threadId);
+            yield* finishRun(input.threadId, retry);
+            yield* Fiber.join(release);
+            assert.isTrue(refused);
+            const after = yield* orchestrator.getThreadProjection(input.threadId);
+            assert.equal(after.thread.capacityRecovery?.status, "cancelled");
+            assert.isTrue(after.thread.capacityRecovery?.reactionsReleased);
+            assert.equal(after.thread.capacityRecovery?.failedRunId, retry.id);
+            assert.equal(after.thread.capacityRecovery?.attemptsUsed, 1);
+            yield* ModelCapacityRecoveryWorker.sweep;
+            assert.lengthOf((yield* orchestrator.getThreadProjection(input.threadId)).runs, 2);
+          }).pipe(Effect.ensuring(Effect.sync(() => spy.mockRestore())));
+        }),
+      ),
+  );
+
+  it.effect(
+    "ordinary child completion still finalizes its parent after a queue promotion failure with capacity disabled",
+    () =>
+      Effect.gen(function* () {
+        const input = yield* seedContinuity("capacity-off-queue-isolation", undefined, true);
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const task = yield* seedLiveChild(input);
+        const childId = task.childThreadId!;
+        const childRun = (yield* orchestrator.getThreadProjection(childId)).runs[0]!;
+        const projections = yield* ProjectionStore.ProjectionStoreV2;
+        const original = projections.canStartQueuedRun;
+        let refused = false;
+        const spy = vi.spyOn(projections, "canStartQueuedRun").mockImplementation((threadId) => {
+          if (threadId === childId) {
+            refused = true;
+            return Effect.fail(
+              new ProjectionStore.ProjectionStoreReadError({
+                threadId,
+                cause: "Injected ordinary queue promotion refusal",
+              }),
+            );
+          }
+          return original(threadId);
+        });
+        yield* Effect.gen(function* () {
+          const events = yield* EventSink.EventSinkV2;
+          const done = yield* events
+            .stream({
+              afterSequence: yield* events.latestSequence(),
+              eventType: "subagent.updated",
+            })
+            .pipe(
+              Stream.filter(
+                (stored) =>
+                  stored.event.type === "subagent.updated" &&
+                  stored.event.payload.id === task.id &&
+                  stored.event.payload.status === "completed",
+              ),
+              Stream.take(1),
+              Stream.runCollect,
+              Effect.forkChild({ startImmediately: true }),
+            );
+          yield* finishRun(childId, childRun);
+          yield* Fiber.join(done);
+          assert.isTrue(refused);
+          const parent = yield* orchestrator.getThreadProjection(input.threadId);
+          assert.equal(parent.subagents.find((entry) => entry.id === task.id)?.status, "completed");
+          const sql = yield* SqlClient.SqlClient;
+          const receipts = yield* sql<{
+            count: number;
+          }>`SELECT count(*) AS count FROM orchestration_command_receipts WHERE aggregate_id = ${childId} AND command_type = ${"thread.capacity.reconcile"}`;
+          assert.equal(receipts[0]?.count, 0);
+        }).pipe(Effect.ensuring(Effect.sync(() => spy.mockRestore())));
+      }),
+  );
+
+  it.effect(
+    "owned unreleased capacity reactions heal on the next sweep after queue promotion fails",
+    () =>
+      withCapacityRecovery(
+        Effect.gen(function* () {
+          const input = yield* seedContinuity("capacity-owned-queue-isolation", undefined, true);
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const task = yield* seedLiveChild(input);
+          const childId = task.childThreadId!;
+          const childRun = (yield* orchestrator.getThreadProjection(childId)).runs[0]!;
+          const pending = yield* awaitCapacityState(childId, "pending");
+          yield* failCapacity(childId, childRun);
+          yield* Fiber.join(pending);
+          const recovery = (yield* orchestrator.getThreadProjection(childId)).thread
+            .capacityRecovery!;
+          const projections = yield* ProjectionStore.ProjectionStoreV2;
+          const original = projections.canStartQueuedRun;
+          const refused = yield* Deferred.make<void>();
+          const spy = vi.spyOn(projections, "canStartQueuedRun").mockImplementation((threadId) =>
+            threadId === childId
+              ? Effect.gen(function* () {
+                  yield* Deferred.succeed(refused, undefined);
+                  return yield* new ProjectionStore.ProjectionStoreReadError({
+                    threadId,
+                    cause: "Injected owned queue promotion refusal",
+                  });
+                })
+              : original(threadId),
+          );
+          yield* Effect.gen(function* () {
+            yield* orchestrator.dispatch({
+              type: "thread.capacity.cancel",
+              commandId: CommandId.make(`${childId}:cancel`),
+              threadId: childId,
+              generation: recovery.generation,
+            });
+            yield* Deferred.await(refused);
+            assert.isFalse(
+              (yield* orchestrator.getThreadProjection(childId)).thread.capacityRecovery
+                ?.reactionsReleased,
+            );
+            assert.equal(
+              (yield* orchestrator.getThreadProjection(input.threadId)).subagents.find(
+                (entry) => entry.id === task.id,
+              )?.status,
+              "waiting",
+            );
+          }).pipe(Effect.ensuring(Effect.sync(() => spy.mockRestore())));
+          yield* ModelCapacityRecoveryWorker.sweep;
+          assert.isTrue(
+            (yield* orchestrator.getThreadProjection(childId)).thread.capacityRecovery
+              ?.reactionsReleased,
+          );
+          assert.equal(
+            (yield* orchestrator.getThreadProjection(input.threadId)).subagents.find(
+              (entry) => entry.id === task.id,
+            )?.status,
+            "failed",
+          );
+        }),
+      ),
+  );
+
+  it.effect.each(["completed", "capacity-failed"] as const)(
+    "an older unreleased episode preserves its owner while a newer human run is %s",
+    (outcome) =>
+      withCapacityRecovery(
+        Effect.gen(function* () {
+          const input = yield* seedContinuity(`capacity-old-release-${outcome}`, undefined, true);
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const task = outcome === "completed" ? yield* seedLiveChild(input) : undefined;
+          const threadId = task?.childThreadId ?? input.threadId;
+          const source =
+            task === undefined
+              ? input.run
+              : (yield* orchestrator.getThreadProjection(threadId)).runs[0]!;
+          const pending = yield* awaitCapacityState(threadId, "pending");
+          yield* failCapacity(threadId, source);
+          yield* Fiber.join(pending);
+          const recovery = (yield* orchestrator.getThreadProjection(threadId)).thread
+            .capacityRecovery!;
+          const projections = yield* ProjectionStore.ProjectionStoreV2;
+          const original = projections.canStartQueuedRun;
+          const refused = yield* Deferred.make<void>();
+          const spy = vi.spyOn(projections, "canStartQueuedRun").mockImplementation((candidate) =>
+            candidate === threadId
+              ? Effect.gen(function* () {
+                  yield* Deferred.succeed(refused, undefined);
+                  return yield* new ProjectionStore.ProjectionStoreReadError({
+                    threadId,
+                    cause: "Injected queue release refusal",
+                  });
+                })
+              : original(candidate),
+          );
+          const originalMessage = projections.getRunMessage;
+          const deliverySpy = vi
+            .spyOn(projections, "getRunMessage")
+            .mockImplementation((candidate, runId) =>
+              candidate === threadId && runId === source.id
+                ? Effect.gen(function* () {
+                    yield* Deferred.succeed(refused, undefined);
+                    return yield* new ProjectionStore.ProjectionStoreReadError({
+                      threadId,
+                      cause: "Injected older terminal release refusal",
+                    });
+                  })
+                : originalMessage(candidate, runId),
+            );
+          let human!: OrchestrationV2Run;
+          let releaseCommandId: CommandId | null | undefined;
+          yield* Effect.gen(function* () {
+            yield* orchestrator.dispatch({
+              type: "thread.capacity.cancel",
+              commandId: CommandId.make(`${threadId}:old-cancel`),
+              threadId,
+              generation: recovery.generation,
+            });
+            yield* Deferred.await(refused);
+            releaseCommandId = (yield* orchestrator.getThreadProjection(threadId)).thread
+              .capacityRecovery?.releaseCommandId;
+            yield* orchestrator.dispatch({
+              type: "message.dispatch",
+              commandId: CommandId.make(`${threadId}:new-human`),
+              threadId,
+              messageId: MessageId.make(`${threadId}:new-human`),
+              text: "New authorized assignment",
+              createdBy: "user",
+              creationSource: "web",
+              attachments: [],
+              dispatchMode: { type: "start_immediately" },
+            });
+            human = (yield* orchestrator.getThreadProjection(threadId)).runs.at(-1)!;
+            if (outcome === "completed") {
+              const events = yield* EventSink.EventSinkV2;
+              const completed = yield* events.stream({ eventType: "subagent.updated" }).pipe(
+                Stream.filter(
+                  (stored) =>
+                    stored.event.type === "subagent.updated" &&
+                    stored.event.payload.id === task!.id &&
+                    stored.event.payload.status === "completed",
+                ),
+                Stream.take(1),
+                Stream.runCollect,
+                Effect.forkChild({ startImmediately: true }),
+              );
+              yield* finishRun(threadId, human);
+              yield* Fiber.join(completed);
+              assert.equal(
+                (yield* orchestrator.getThreadProjection(input.threadId)).subagents.find(
+                  (entry) => entry.id === task!.id,
+                )?.status,
+                "completed",
+              );
+            } else {
+              yield* failCapacity(threadId, human);
+              yield* orchestrator.dispatch({
+                type: "thread.capacity.reconcile",
+                commandId: CommandId.make(`${threadId}:new-reconcile-before-release`),
+                threadId,
+                runId: human.id,
+              });
+            }
+            const held = (yield* orchestrator.getThreadProjection(threadId)).thread
+              .capacityRecovery!;
+            assert.equal(held.generation, recovery.generation);
+            assert.equal(held.releaseCommandId, releaseCommandId);
+            assert.isFalse(held.reactionsReleased);
+          }).pipe(
+            Effect.ensuring(
+              Effect.sync(() => {
+                spy.mockRestore();
+                deliverySpy.mockRestore();
+              }),
+            ),
+          );
+          const before = yield* orchestrator.getThreadProjection(threadId);
+          yield* ModelCapacityRecoveryWorker.sweep;
+          const after = yield* orchestrator.getThreadProjection(threadId);
+          assert.lengthOf(after.runs, before.runs.length);
+          assert.equal(
+            after.thread.continuity?.checksRemaining,
+            before.thread.continuity?.checksRemaining,
+          );
+          if (outcome === "capacity-failed") {
+            assert.equal(after.thread.capacityRecovery?.status, "pending");
+            assert.equal(after.thread.capacityRecovery?.failedRunId, human.id);
+            assert.equal(after.thread.capacityRecovery?.authorityMessageId, human.userMessageId);
+            assert.equal(after.thread.capacityRecovery?.attemptsUsed, 0);
+            const events = yield* EventSink.EventSinkV2;
+            const oldAck = yield* events
+              .readByCommandId({
+                commandId: CommandId.make(
+                  `command:capacity:released:${recovery.generation}:${recovery.failedRunId}`,
+                ),
+              })
+              .pipe(Stream.runCollect);
+            assert.isTrue(
+              oldAck.some(
+                (stored) =>
+                  stored.event.type === "thread.metadata-updated" &&
+                  stored.event.payload.capacityRecovery?.generation === recovery.generation &&
+                  stored.event.payload.capacityRecovery.reactionsReleased,
+              ),
+            );
+            assert.notEqual(after.thread.capacityRecovery?.generation, recovery.generation);
+          } else {
+            assert.isTrue(after.thread.capacityRecovery?.reactionsReleased);
+            assert.equal(
+              (yield* orchestrator.getThreadProjection(input.threadId)).subagents.find(
+                (entry) => entry.id === task!.id,
+              )?.status,
+              "completed",
+            );
+          }
+        }),
+      ),
+  );
+
+  it.effect("a rejected startup abort receipt does not poison later terminal cleanup", () =>
+    withCapacityRecovery(
+      Effect.gen(function* () {
+        const input = yield* seedContinuity("capacity-startup-abort-receipt", undefined, true);
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const pending = yield* awaitCapacityState(input.threadId, "pending");
+        yield* failCapacity(input.threadId, input.run);
+        yield* Fiber.join(pending);
+        yield* TestClock.adjust("20 seconds");
+        yield* ModelCapacityRecoveryWorker.sweep;
+        const before = yield* orchestrator.getThreadProjection(input.threadId);
+        const runtime = yield* ProviderRuntimeRecoveryService.ProviderRuntimeRecoveryService;
+        yield* runtime.reconcile("startup");
+        const projections = yield* ProjectionStore.ProjectionStoreV2;
+        const original = projections.getThreadRecords;
+        const spy = vi
+          .spyOn(projections, "getThreadRecords")
+          .mockImplementation((threadId, sections, options) =>
+            threadId === input.threadId && sections.includes("checkpointScopes")
+              ? Effect.fail(
+                  new ProjectionStore.ProjectionStoreReadError({
+                    threadId,
+                    cause: "Injected startup reconciliation and abort refusal",
+                  }),
+                )
+              : original(threadId, sections, options),
+          );
+        yield* orchestrator.recoverDelegatedTasks.pipe(
+          Effect.ensuring(Effect.sync(() => spy.mockRestore())),
+        );
+        assert.equal(
+          (yield* orchestrator.getThreadProjection(input.threadId)).thread.capacityRecovery?.status,
+          "retrying",
+        );
+        const sql = yield* SqlClient.SqlClient;
+        const rejected = yield* sql<{
+          command_id: string;
+          status: string;
+        }>`SELECT command_id, status FROM orchestration_command_receipts WHERE aggregate_id = ${input.threadId} AND command_type = ${"thread.capacity.abort"}`;
+        assert.lengthOf(rejected, 1);
+        assert.equal(rejected[0]?.status, "rejected");
+        const release = yield* awaitCapacityRelease(input.threadId);
+        yield* orchestrator.recoverDelegatedTasks;
+        yield* Fiber.join(release);
+        const receipts = yield* sql<{
+          command_id: string;
+          status: string;
+        }>`SELECT command_id, status FROM orchestration_command_receipts WHERE aggregate_id = ${input.threadId} AND command_type = ${"thread.capacity.abort"}`;
+        assert.lengthOf(receipts, 2);
+        assert.isTrue(
+          receipts.some(
+            (receipt) =>
+              receipt.status === "accepted" && receipt.command_id !== rejected[0]?.command_id,
+          ),
+        );
+        const after = yield* orchestrator.getThreadProjection(input.threadId);
+        assert.isTrue(after.thread.capacityRecovery?.reactionsReleased);
+        assert.equal(after.thread.capacityRecovery?.attemptsUsed, 1);
+        assert.lengthOf(after.runs, before.runs.length);
+      }),
+    ),
+  );
+
+  it.effect(
+    "independent supervision advances the authoritative completed retry after release replay heals a queue failure",
+    () =>
+      withCapacityRecovery(
+        Effect.gen(function* () {
+          const input = yield* seedContinuity("capacity-release-continuity");
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const pending = yield* awaitCapacityState(input.threadId, "pending");
+          yield* failCapacity(input.threadId, input.run);
+          yield* Fiber.join(pending);
+          yield* TestClock.adjust("20 seconds");
+          yield* ModelCapacityRecoveryWorker.sweep;
+          const retrying = yield* orchestrator.getThreadProjection(input.threadId);
+          const retry = retrying.runs.find(
+            (run) => run.id === retrying.thread.capacityRecovery?.retryRunId,
+          )!;
+          const projections = yield* ProjectionStore.ProjectionStoreV2;
+          const original = projections.canStartQueuedRun;
+          const refused = yield* Deferred.make<void>();
+          const spy = vi.spyOn(projections, "canStartQueuedRun").mockImplementation((threadId) =>
+            threadId === input.threadId
+              ? Effect.gen(function* () {
+                  yield* Deferred.succeed(refused, undefined);
+                  return yield* new ProjectionStore.ProjectionStoreReadError({
+                    threadId,
+                    cause: "Injected successful retry queue refusal",
+                  });
+                })
+              : original(threadId),
+          );
+          yield* Effect.gen(function* () {
+            yield* finishRun(input.threadId, retry);
+            yield* Deferred.await(refused);
+            assert.isFalse(
+              (yield* orchestrator.getThreadProjection(input.threadId)).thread.capacityRecovery
+                ?.reactionsReleased,
+            );
+            yield* ModelCapacityRecoveryWorker.releasedContinuitySweep;
+            assert.equal(
+              (yield* orchestrator.getThreadProjection(input.threadId)).thread.continuity
+                ?.checksRemaining,
+              retrying.thread.continuity?.checksRemaining,
+            );
+          }).pipe(Effect.ensuring(Effect.sync(() => spy.mockRestore())));
+          yield* ModelCapacityRecoveryWorker.sweep;
+          const healed = yield* orchestrator.getThreadProjection(input.threadId);
+          assert.isTrue(healed.thread.capacityRecovery?.reactionsReleased);
+          const debugSql = yield* SqlClient.SqlClient;
+          const advanceReceipts = yield* debugSql<{
+            command_id: string;
+          }>`SELECT command_id FROM orchestration_command_receipts WHERE aggregate_id = ${input.threadId} AND command_type = ${"thread.continuity.advance"}`;
+          assert.lengthOf(
+            healed.runs,
+            retrying.runs.length,
+            JSON.stringify({ advanceReceipts, continuity: healed.thread.continuity }),
+          );
+          assert.equal(
+            healed.thread.continuity?.checksRemaining,
+            retrying.thread.continuity?.checksRemaining,
+          );
+          yield* ModelCapacityRecoveryWorker.releasedContinuitySweep;
+          const advanced = yield* orchestrator.getThreadProjection(input.threadId);
+          assert.equal(advanced.thread.continuity?.lastAdvancedRunId, retry.id);
+          assert.equal(advanced.thread.continuity?.authorityMessageId, input.authorityMessageId);
+          assert.equal(
+            advanced.thread.continuity?.checksRemaining,
+            healed.thread.continuity!.checksRemaining - 1,
+          );
+          assert.equal(
+            advanced.thread.continuity?.generation,
+            healed.thread.continuity?.generation,
+          );
+          assert.lengthOf(advanced.runs, healed.runs.length + 1);
+          const sql = yield* SqlClient.SqlClient;
+          const receiptsBefore = yield* sql<{
+            count: number;
+          }>`SELECT count(*) AS count FROM orchestration_command_receipts WHERE aggregate_id = ${input.threadId} AND command_type = ${"thread.continuity.advance"}`;
+          for (let tick = 0; tick < 5; tick++)
+            yield* ModelCapacityRecoveryWorker.releasedContinuitySweep;
+          const receiptsAfter = yield* sql<{
+            count: number;
+          }>`SELECT count(*) AS count FROM orchestration_command_receipts WHERE aggregate_id = ${input.threadId} AND command_type = ${"thread.continuity.advance"}`;
+          assert.equal(receiptsAfter[0]?.count, receiptsBefore[0]?.count);
+          assert.equal(
+            (yield* orchestrator.getThreadProjection(input.threadId)).thread.continuity
+              ?.checksRemaining,
+            advanced.thread.continuity?.checksRemaining,
+          );
+          assert.lengthOf(
+            (yield* orchestrator.getThreadProjection(input.threadId)).runs,
+            advanced.runs.length,
+          );
+        }),
+      ),
+  );
+
+  it.effect.each(["snooze", "queued", "pending-request"] as const)(
+    "released capacity supervision emits no receipts while %s holds completion, then advances once",
+    (hold) =>
+      withCapacityRecovery(
+        Effect.gen(function* () {
+          const input = yield* seedContinuity(`capacity-held-continuity-${hold}`);
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const events = yield* EventSink.EventSinkV2;
+          const pending = yield* awaitCapacityState(input.threadId, "pending");
+          yield* failCapacity(input.threadId, input.run);
+          yield* Fiber.join(pending);
+          yield* TestClock.adjust("20 seconds");
+          yield* ModelCapacityRecoveryWorker.sweep;
+          const retrying = yield* orchestrator.getThreadProjection(input.threadId);
+          const retry = retrying.runs.find(
+            (run) => run.id === retrying.thread.capacityRecovery?.retryRunId,
+          )!;
+          const now = yield* DateTime.now;
+          const request = {
+            id: RuntimeRequestId.make(`${input.threadId}:held-input`),
+            nodeId: retry.rootNodeId!,
+            providerTurnId: null,
+            nativeRequestRef: null,
+            kind: "user_input" as const,
+            status: "pending" as const,
+            responseCapability: { type: "message" as const },
+            createdAt: now,
+            resolvedAt: null,
+          };
+          let queued: OrchestrationV2Run | undefined;
+          if (hold === "queued") {
+            yield* orchestrator.dispatch({
+              type: "message.dispatch",
+              threadId: input.threadId,
+              commandId: CommandId.make(`${input.threadId}:held-queue`),
+              messageId: MessageId.make(`${input.threadId}:held-queue`),
+              text: "Queued server follow-up",
+              attachments: [],
+              createdBy: "agent",
+              creationSource: "server",
+              dispatchMode: { type: "queue_after_active" },
+            });
+            queued = (yield* orchestrator.getThreadProjection(input.threadId)).runs.find(
+              (run) => run.userMessageId === MessageId.make(`${input.threadId}:held-queue`),
+            )!;
+            yield* events.write({
+              events: [
+                {
+                  id: EventId.make(`${input.threadId}:hold`),
+                  type: "run.updated",
+                  threadId: input.threadId,
+                  runId: queued.id,
+                  occurredAt: now,
+                  payload: { ...queued, queueHeld: true },
+                },
+              ],
+            });
+          } else if (hold === "snooze") {
+            yield* events.write({
+              events: [
+                {
+                  id: EventId.make(`${input.threadId}:hold`),
+                  type: "thread.metadata-updated",
+                  threadId: input.threadId,
+                  occurredAt: now,
+                  payload: { ...retrying.thread, snoozedUntil: DateTime.add(now, { hours: 1 }) },
+                },
+              ],
+            });
+          } else {
+            yield* events.write({
+              events: [
+                {
+                  id: EventId.make(`${input.threadId}:hold`),
+                  type: "runtime-request.updated",
+                  threadId: input.threadId,
+                  occurredAt: now,
+                  payload: request,
+                },
+              ],
+            });
+          }
+          const release = yield* awaitCapacityRelease(input.threadId);
+          yield* finishRun(input.threadId, retry);
+          yield* Fiber.join(release);
+          const held = yield* orchestrator.getThreadProjection(input.threadId);
+          assert.isTrue(held.thread.capacityRecovery?.reactionsReleased);
+          const sql = yield* SqlClient.SqlClient;
+          const before = yield* sql<{
+            count: number;
+          }>`SELECT count(*) AS count FROM orchestration_command_receipts WHERE aggregate_id = ${input.threadId} AND command_type = ${"thread.continuity.advance"}`;
+          for (let tick = 0; tick < 5; tick++)
+            yield* ModelCapacityRecoveryWorker.releasedContinuitySweep;
+          const after = yield* sql<{
+            count: number;
+          }>`SELECT count(*) AS count FROM orchestration_command_receipts WHERE aggregate_id = ${input.threadId} AND command_type = ${"thread.continuity.advance"}`;
+          assert.equal(after[0]?.count, before[0]?.count);
+          const stillHeld = yield* orchestrator.getThreadProjection(input.threadId);
+          assert.lengthOf(stillHeld.runs, held.runs.length);
+          assert.equal(
+            stillHeld.thread.continuity?.checksRemaining,
+            held.thread.continuity?.checksRemaining,
+          );
+          assert.equal(
+            stillHeld.thread.continuity?.lastAdvancedRunId,
+            held.thread.continuity?.lastAdvancedRunId,
+          );
+          const advancedEvent = yield* events
+            .stream({ afterSequence: yield* events.latestSequence(), eventType: "run.created" })
+            .pipe(
+              Stream.filter((stored) => stored.event.threadId === input.threadId),
+              Stream.take(1),
+              Stream.runCollect,
+              Effect.forkChild({ startImmediately: true }),
+            );
+          if (hold === "queued") {
+            yield* orchestrator.dispatch({
+              type: "queued-run.cancel",
+              commandId: CommandId.make(`${input.threadId}:clear-hold`),
+              threadId: input.threadId,
+              runId: queued!.id,
+            });
+          } else if (hold === "snooze") {
+            yield* events.write({
+              events: [
+                {
+                  id: EventId.make(`${input.threadId}:clear-hold`),
+                  type: "thread.metadata-updated",
+                  threadId: input.threadId,
+                  occurredAt: yield* DateTime.now,
+                  payload: { ...stillHeld.thread, snoozedUntil: null },
+                },
+              ],
+            });
+          } else {
+            yield* events.write({
+              events: [
+                {
+                  id: EventId.make(`${input.threadId}:clear-hold`),
+                  type: "runtime-request.updated",
+                  threadId: input.threadId,
+                  occurredAt: yield* DateTime.now,
+                  payload: { ...request, status: "resolved", resolvedAt: yield* DateTime.now },
+                },
+              ],
+            });
+          }
+          yield* ModelCapacityRecoveryWorker.releasedContinuitySweep;
+          yield* Fiber.join(advancedEvent);
+          const advanced = yield* orchestrator.getThreadProjection(input.threadId);
+          assert.equal(advanced.thread.continuity?.generation, held.thread.continuity?.generation);
+          assert.equal(advanced.thread.continuity?.authorityMessageId, input.authorityMessageId);
+          assert.equal(advanced.thread.continuity?.lastAdvancedRunId, retry.id);
+          assert.equal(
+            advanced.thread.continuity?.checksRemaining,
+            held.thread.continuity!.checksRemaining - 1,
+          );
+          assert.lengthOf(advanced.runs, held.runs.length + 1);
+          const receiptsAdvanced = yield* sql<{
+            count: number;
+          }>`SELECT count(*) AS count FROM orchestration_command_receipts WHERE aggregate_id = ${input.threadId} AND command_type = ${"thread.continuity.advance"}`;
+          for (let tick = 0; tick < 5; tick++)
+            yield* ModelCapacityRecoveryWorker.releasedContinuitySweep;
+          const receiptsRepeated = yield* sql<{
+            count: number;
+          }>`SELECT count(*) AS count FROM orchestration_command_receipts WHERE aggregate_id = ${input.threadId} AND command_type = ${"thread.continuity.advance"}`;
+          assert.equal(receiptsRepeated[0]?.count, receiptsAdvanced[0]?.count);
+          assert.lengthOf(
+            (yield* orchestrator.getThreadProjection(input.threadId)).runs,
+            advanced.runs.length,
+          );
+          assert.equal(
+            (yield* orchestrator.getThreadProjection(input.threadId)).thread.continuity
+              ?.checksRemaining,
+            advanced.thread.continuity?.checksRemaining,
+          );
+        }),
+      ),
+  );
+
+  it.effect(
+    "capacity worker eligibility survives a backward clock step between its due read and serialized dispatch",
+    () =>
+      withCapacityRecovery(
+        Effect.gen(function* () {
+          const input = yield* seedContinuity("capacity-backward-clock", undefined, true);
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const pending = yield* awaitCapacityState(input.threadId, "pending");
+          yield* failCapacity(input.threadId, input.run);
+          yield* Fiber.join(pending);
+          yield* TestClock.adjust("20 seconds");
+          const dueNow = DateTime.toEpochMillis(yield* DateTime.now);
+          const threads = yield* ThreadManagementService.ThreadManagementService;
+          yield* ModelCapacityRecoveryWorker.sweep.pipe(
+            Effect.provideService(ThreadManagementService.ThreadManagementService, {
+              ...threads,
+              dispatch: (command) =>
+                command.type === "thread.capacity.retry" && command.threadId === input.threadId
+                  ? Effect.gen(function* () {
+                      yield* TestClock.setTime(dueNow - 60_000);
+                      return yield* threads.dispatch(command);
+                    })
+                  : threads.dispatch(command),
+            }),
+          );
+          const allocated = yield* orchestrator.getThreadProjection(input.threadId);
+          assert.equal(allocated.thread.capacityRecovery?.status, "retrying");
+          assert.equal(allocated.thread.capacityRecovery?.attemptsUsed, 1);
+          yield* TestClock.setTime(dueNow + 5_000);
+          yield* ModelCapacityRecoveryWorker.sweep;
+          assert.lengthOf((yield* orchestrator.getThreadProjection(input.threadId)).runs, 2);
+        }),
+      ),
+  );
+
+  it.effect(
+    "a transient rejected capacity abort receipt cannot poison a later refusal cleanup",
+    () =>
+      withCapacityRecovery(
+        Effect.gen(function* () {
+          const input = yield* seedContinuity("capacity-abort-receipt", undefined, true);
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const pending = yield* awaitCapacityState(input.threadId, "pending");
+          yield* failCapacity(input.threadId, input.run);
+          yield* Fiber.join(pending);
+          yield* TestClock.adjust("20 seconds");
+          const threads = yield* ThreadManagementService.ThreadManagementService;
+          const projections = yield* ProjectionStore.ProjectionStoreV2;
+          const original = projections.getThreadRecords;
+          const abortIds: CommandId[] = [];
+          const sweep = ModelCapacityRecoveryWorker.sweep.pipe(
+            Effect.provideService(ThreadManagementService.ThreadManagementService, {
+              ...threads,
+              dispatch: (command) => {
+                if (
+                  (command.type !== "thread.capacity.retry" &&
+                    command.type !== "thread.capacity.abort") ||
+                  command.threadId !== input.threadId
+                )
+                  return threads.dispatch(command);
+                if (command.type === "thread.capacity.retry")
+                  return Effect.fail(
+                    new Orchestrator.OrchestratorDispatchError({
+                      commandId: command.commandId,
+                      commandType: command.type,
+                      cause: "Injected continuation refusal",
+                    }),
+                  );
+                if (command.type !== "thread.capacity.abort") return threads.dispatch(command);
+                abortIds.push(command.commandId);
+                if (abortIds.length !== 1) return threads.dispatch(command);
+                const spy = vi
+                  .spyOn(projections, "getThreadRecords")
+                  .mockImplementation((threadId, sections, options) =>
+                    threadId === input.threadId && sections.includes("checkpointScopes")
+                      ? Effect.fail(
+                          new ProjectionStore.ProjectionStoreReadError({
+                            threadId,
+                            cause: "Injected transient abort projection refusal",
+                          }),
+                        )
+                      : original(threadId, sections, options),
+                  );
+                return threads
+                  .dispatch(command)
+                  .pipe(Effect.ensuring(Effect.sync(() => spy.mockRestore())));
+              },
+            }),
+          );
+          yield* sweep;
+          assert.equal(
+            (yield* orchestrator.getThreadProjection(input.threadId)).thread.capacityRecovery
+              ?.status,
+            "pending",
+          );
+          const sql = yield* SqlClient.SqlClient;
+          const receipts = yield* sql<{
+            status: string;
+          }>`SELECT status FROM orchestration_command_receipts WHERE command_id = ${abortIds[0]!}`;
+          assert.equal(receipts[0]?.status, "rejected");
+          const release = yield* awaitCapacityRelease(input.threadId);
+          yield* sweep;
+          yield* Fiber.join(release);
+          assert.lengthOf(abortIds, 2);
+          assert.notEqual(abortIds[0], abortIds[1]);
+          assert.equal(
+            (yield* orchestrator.getThreadProjection(input.threadId)).thread.capacityRecovery
+              ?.status,
+            "cancelled",
+          );
+          assert.lengthOf((yield* orchestrator.getThreadProjection(input.threadId)).runs, 1);
+        }),
+      ),
+  );
+
+  const restoreQueuedCapacityMessage = (threadId: ThreadId) =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const events = yield* EventSink.EventSinkV2;
+      const projection = yield* orchestrator.getThreadProjection(threadId);
+      const source = projection.runs[0]!;
+      const message = projection.messages.find((entry) => entry.id === source.userMessageId)!;
+      const now = yield* DateTime.now;
+      const messageId = MessageId.make(`${threadId}:queued`);
+      const runId = RunId.make(`${threadId}:queued`);
+      yield* events.write({
+        events: [
+          {
+            id: EventId.make(`${threadId}:queued-message`),
+            type: "message.updated",
+            threadId,
+            occurredAt: now,
+            payload: { ...message, id: messageId, text: "A queued follow-up", createdAt: now },
+          },
+          {
+            id: EventId.make(`${threadId}:queued-run`),
+            type: "run.updated",
+            threadId,
+            runId,
+            occurredAt: now,
+            payload: {
+              ...source,
+              id: runId,
+              ordinal: source.ordinal + 1,
+              userMessageId: messageId,
+              status: "queued",
+              queuePosition: 1,
+              queueHeld: false,
+              rootNodeId: null,
+              activeAttemptId: null,
+              startedAt: null,
+              completedAt: null,
+            },
+          },
+        ],
+      });
+    });
+
+  it.effect(
+    "cancelling an unstarted held queue head still promotes its successor with capacity disabled",
+    () =>
+      Effect.gen(function* () {
+        const input = yield* seedContinuity("capacity-off-unstarted-queue-cancel", undefined, true);
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        for (const suffix of ["head", "successor"])
+          yield* orchestrator.dispatch({
+            type: "message.dispatch",
+            commandId: CommandId.make(`${input.threadId}:${suffix}`),
+            threadId: input.threadId,
+            messageId: MessageId.make(`${input.threadId}:${suffix}`),
+            text: suffix,
+            attachments: [],
+            createdBy: "user",
+            creationSource: "web",
+            dispatchMode: { type: "queue_after_active" },
+          });
+        const projection = yield* orchestrator.getThreadProjection(input.threadId);
+        const head = projection.runs.find(
+          (run) => run.userMessageId === MessageId.make(`${input.threadId}:head`),
+        )!;
+        const successor = projection.runs.find(
+          (run) => run.userMessageId === MessageId.make(`${input.threadId}:successor`),
+        )!;
+        const events = yield* EventSink.EventSinkV2;
+        const now = yield* DateTime.now;
+        yield* events.write({
+          commandId: CommandId.make("command:runtime-reconcile:queue-head-fixture"),
+          events: [
+            {
+              id: EventId.make(`${input.threadId}:predecessor-completed`),
+              type: "run.updated",
+              threadId: input.threadId,
+              runId: input.run.id,
+              occurredAt: now,
+              payload: { ...input.run, status: "completed", startedAt: now, completedAt: now },
+            },
+            {
+              id: EventId.make(`${input.threadId}:held-head`),
+              type: "run.updated",
+              threadId: input.threadId,
+              runId: head.id,
+              occurredAt: now,
+              payload: { ...head, queueHeld: true },
+            },
+          ],
+        });
+        const promoted = yield* events
+          .stream({ afterSequence: yield* events.latestSequence(), eventType: "run.updated" })
+          .pipe(
+            Stream.filter(
+              (stored) =>
+                stored.event.type === "run.updated" &&
+                stored.event.payload.id === successor.id &&
+                ["preparing", "starting", "running"].includes(stored.event.payload.status),
+            ),
+            Stream.take(1),
+            Stream.runCollect,
+            Effect.forkChild({ startImmediately: true }),
+          );
+        yield* orchestrator.dispatch({
+          type: "queued-run.cancel",
+          commandId: CommandId.make(`${input.threadId}:cancel-head`),
+          threadId: input.threadId,
+          runId: head.id,
+        });
+        yield* Fiber.join(promoted);
+        const after = yield* orchestrator.getThreadProjection(input.threadId);
+        assert.equal(after.runs.find((run) => run.id === head.id)?.status, "cancelled");
+        assert.isNull(after.runs.find((run) => run.id === head.id)?.startedAt);
+        assert.notEqual(after.runs.find((run) => run.id === successor.id)?.status, "queued");
+      }),
+  );
+
+  it.effect(
+    "a completed capacity retry remains a completed child result when reconciliation is refused",
+    () =>
+      withCapacityRecovery(
+        Effect.gen(function* () {
+          const input = yield* seedContinuity("capacity-completed-child-abort", undefined, true);
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const task = yield* seedLiveChild(input);
+          const childId = task.childThreadId!;
+          const childRun = (yield* orchestrator.getThreadProjection(childId)).runs[0]!;
+          const pending = yield* awaitCapacityState(childId, "pending");
+          yield* failCapacity(childId, childRun);
+          yield* Fiber.join(pending);
+          yield* TestClock.adjust("20 seconds");
+          yield* ModelCapacityRecoveryWorker.sweep;
+          const retrying = yield* orchestrator.getThreadProjection(childId);
+          const retry = retrying.runs.find(
+            (run) => run.id === retrying.thread.capacityRecovery?.retryRunId,
+          )!;
+          const projections = yield* ProjectionStore.ProjectionStoreV2;
+          const original = projections.getThreadRecords;
+          let refused = false;
+          const spy = vi
+            .spyOn(projections, "getThreadRecords")
+            .mockImplementation((threadId, sections, options) => {
+              if (!refused && threadId === childId && sections.includes("checkpointScopes")) {
+                refused = true;
+                return Effect.fail(
+                  new ProjectionStore.ProjectionStoreReadError({
+                    threadId,
+                    cause: "Injected completed retry reconciliation refusal",
+                  }),
+                );
+              }
+              return original(threadId, sections, options);
+            });
+          yield* Effect.gen(function* () {
+            const release = yield* awaitCapacityRelease(childId);
+            yield* finishRun(childId, retry);
+            yield* Fiber.join(release);
+            assert.isTrue(refused);
+            assert.equal(
+              (yield* orchestrator.getThreadProjection(childId)).thread.capacityRecovery?.status,
+              "cancelled",
+            );
+            assert.equal(
+              (yield* orchestrator.getThreadProjection(input.threadId)).subagents.find(
+                (entry) => entry.id === task.id,
+              )?.status,
+              "completed",
+            );
+          }).pipe(Effect.ensuring(Effect.sync(() => spy.mockRestore())));
+        }),
+      ),
+  );
+
+  it.effect(
+    "restart continuations retain their original capacity generation and spent attempt budget",
+    () =>
+      withCapacityRecovery(
+        Effect.gen(function* () {
+          const input = yield* seedContinuity("capacity-restart-budget", undefined, true);
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const pending = yield* awaitCapacityState(input.threadId, "pending");
+          yield* failCapacity(input.threadId, input.run);
+          yield* Fiber.join(pending);
+          yield* TestClock.adjust("20 seconds");
+          yield* ModelCapacityRecoveryWorker.sweep;
+          const first = yield* orchestrator.getThreadProjection(input.threadId);
+          const recovery = first.thread.capacityRecovery!;
+          const retry = first.runs.find((run) => run.id === recovery.retryRunId)!;
+          const events = yield* EventSink.EventSinkV2;
+          const now = yield* DateTime.now;
+          yield* events.write({
+            commandId: CommandId.make("command:runtime-reconcile:capacity-budget"),
+            events: [
+              {
+                id: EventId.make(`${input.threadId}:runtime-cancelled`),
+                type: "run.updated",
+                threadId: input.threadId,
+                runId: retry.id,
+                occurredAt: now,
+                payload: { ...retry, status: "cancelled", completedAt: now },
+              },
+            ],
+          });
+          yield* orchestrator.recoverDelegatedTasks;
+          const sourceMessage = first.messages.find((entry) => entry.id === retry.userMessageId)!;
+          const restarted = {
+            ...retry,
+            id: RunId.make(`${input.threadId}:restart`),
+            ordinal: retry.ordinal + 1,
+            userMessageId: MessageId.make(`${input.threadId}:restart`),
+            status: "preparing" as const,
+            startedAt: null,
+            completedAt: null,
+            restartContinuationOfRunId: retry.id,
+          };
+          yield* events.write({
+            events: [
+              {
+                id: EventId.make(`${input.threadId}:restart-message`),
+                type: "message.updated",
+                threadId: input.threadId,
+                occurredAt: now,
+                payload: { ...sourceMessage, id: restarted.userMessageId },
+              },
+              {
+                id: EventId.make(`${input.threadId}:restart-run`),
+                type: "run.updated",
+                threadId: input.threadId,
+                runId: restarted.id,
+                occurredAt: now,
+                payload: restarted,
+              },
+            ],
+          });
+          const carried = yield* awaitCapacityState(input.threadId, "pending");
+          yield* failCapacity(input.threadId, restarted);
+          yield* Fiber.join(carried);
+          const after = yield* orchestrator.getThreadProjection(input.threadId);
+          assert.equal(after.thread.capacityRecovery?.generation, recovery.generation);
+          assert.equal(after.thread.capacityRecovery?.originalRunId, input.run.id);
+          assert.equal(after.thread.capacityRecovery?.attemptsUsed, 1);
+          assert.equal(after.thread.capacityRecovery?.authorityMessageId, input.authorityMessageId);
+          yield* TestClock.adjust("35 seconds");
+          yield* ModelCapacityRecoveryWorker.sweep;
+          assert.equal(
+            (yield* orchestrator.getThreadProjection(input.threadId)).thread.capacityRecovery
+              ?.attemptsUsed,
+            2,
+          );
+        }),
+      ),
+  );
+
+  it.effect(
+    "cancelling capacity preserves the provider failure queue hold and acknowledges reactions only after release",
+    () =>
+      withCapacityRecovery(
+        Effect.gen(function* () {
+          const input = yield* seedContinuity("capacity-cancel-queue");
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const pending = yield* awaitCapacityState(input.threadId, "pending");
+          yield* failCapacity(input.threadId, input.run);
+          yield* Fiber.join(pending);
+          yield* restoreQueuedCapacityMessage(input.threadId);
+          const recovery = (yield* orchestrator.getThreadProjection(input.threadId)).thread
+            .capacityRecovery!;
+          const release = yield* awaitCapacityRelease(input.threadId);
+          const cancelled = yield* orchestrator.dispatch({
+            type: "thread.capacity.cancel",
+            commandId: CommandId.make(`${input.threadId}:cancel`),
+            threadId: input.threadId,
+            generation: recovery.generation,
+          });
+          assert.isTrue(
+            cancelled.storedEvents.some(
+              (stored) =>
+                stored.event.type === "thread.metadata-updated" &&
+                stored.event.payload.capacityRecovery?.reactionsReleased === false,
+            ),
+          );
+          yield* Fiber.join(release);
+          const after = yield* orchestrator.getThreadProjection(input.threadId);
+          const queued = after.runs.find((run) => run.status === "queued");
+          assert.isDefined(queued);
+          assert.isTrue(queued?.queueHeld);
+          assert.isTrue(after.thread.capacityRecovery?.reactionsReleased);
+          yield* orchestrator.recoverDelegatedTasks;
+          assert.lengthOf((yield* orchestrator.getThreadProjection(input.threadId)).runs, 2);
+        }),
+      ),
+  );
+
+  it.effect(
+    "Stop records a durable capacity release and startup never promotes the stopped queue",
+    () =>
+      withCapacityRecovery(
+        Effect.gen(function* () {
+          const input = yield* seedContinuity("capacity-stop-crash");
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const pending = yield* awaitCapacityState(input.threadId, "pending");
+          yield* failCapacity(input.threadId, input.run);
+          yield* Fiber.join(pending);
+          yield* restoreQueuedCapacityMessage(input.threadId);
+          const commandId = CommandId.make(`${input.threadId}:stop`);
+          const release = yield* awaitCapacityRelease(input.threadId);
+          const result = yield* orchestrator.dispatch({
+            type: "thread.stop",
+            commandId,
+            threadId: input.threadId,
+          });
+          const stoppedEvent = result.storedEvents.find(
+            (stored) =>
+              stored.event.type === "thread.metadata-updated" &&
+              stored.event.payload.capacityRecovery?.status === "cancelled",
+          );
+          assert.isDefined(stoppedEvent);
+          if (stoppedEvent?.event.type === "thread.metadata-updated")
+            assert.equal(stoppedEvent.event.payload.capacityRecovery?.releaseCommandId, commandId);
+          yield* Fiber.join(release);
+          // Rewind just the durable ACK to represent a crash after Stop committed and before release completed.
+          const sql = yield* SqlClient.SqlClient;
+          yield* sql`UPDATE orchestration_v2_projection_threads SET payload_json = json_set(payload_json, '$.capacityRecovery.reactionsReleased', json('false')) WHERE thread_id = ${input.threadId}`;
+          const recovery = (yield* orchestrator.getThreadProjection(input.threadId)).thread
+            .capacityRecovery!;
+          yield* sql`DELETE FROM orchestration_command_receipts WHERE command_id = ${`command:capacity:released:${recovery.generation}:${recovery.failedRunId}`}`;
+          yield* orchestrator.recoverDelegatedTasks;
+          const after = yield* orchestrator.getThreadProjection(input.threadId);
+          assert.isTrue(after.thread.capacityRecovery?.reactionsReleased);
+          assert.isNull(after.thread.continuity);
+          assert.equal(after.runs.filter((run) => run.status === "queued").length, 1);
+          assert.isTrue(after.runs.find((run) => run.status === "queued")?.queueHeld);
+          assert.lengthOf(after.runs, 2);
+        }),
+      ),
+  );
+
+  it.effect.each(["cancel", "cancel-delivery-refusal", "complete-retry"] as const)(
+    "capacity %s releases claimed delegated delivery only after the recovery episode ends",
+    (outcome) =>
+      withCapacityRecovery(
+        Effect.gen(function* () {
+          const input = yield* seedContinuity(`capacity-delivery-${outcome}`);
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const task = yield* seedLiveChild(input);
+          const events = yield* EventSink.EventSinkV2;
+          const shifted = { ...input.run, ordinal: 2 };
+          yield* events.write({
+            events: [
+              {
+                id: EventId.make(`${input.threadId}:delivery-run-ordinal`),
+                type: "run.updated",
+                threadId: input.threadId,
+                runId: shifted.id,
+                occurredAt: yield* DateTime.now,
+                payload: shifted,
+              },
+            ],
+          });
+          const projection = yield* orchestrator.getThreadProjection(input.threadId);
+          const message = projection.messages.find(
+            (entry) => entry.id === input.authorityMessageId,
+          )!;
+          const ownerRunId = RunId.make(`${input.threadId}:delivery-owner`);
+          const ownerMessageId = MessageId.make(`${input.threadId}:delivery-owner`);
+          const now = yield* DateTime.now;
+          yield* events.write({
+            events: [
+              {
+                id: EventId.make(`${input.threadId}:owner-message`),
+                type: "message.updated",
+                threadId: input.threadId,
+                occurredAt: now,
+                payload: {
+                  ...message,
+                  id: ownerMessageId,
+                  text: "Original delegated assignment",
+                },
+              },
+              {
+                id: EventId.make(`${input.threadId}:delivery-message`),
+                type: "message.updated",
+                threadId: input.threadId,
+                occurredAt: now,
+                payload: {
+                  ...message,
+                  delegatedCompletion: {
+                    parentRunId: ownerRunId,
+                    generation: 1,
+                    taskIds: [task.id],
+                  },
+                },
+              },
+              {
+                id: EventId.make(`${input.threadId}:delivery-owner`),
+                type: "run.updated",
+                threadId: input.threadId,
+                runId: ownerRunId,
+                occurredAt: now,
+                payload: {
+                  ...input.run,
+                  id: ownerRunId,
+                  userMessageId: ownerMessageId,
+                  ordinal: 1,
+                  rootNodeId: null,
+                  activeAttemptId: null,
+                  status: "completed",
+                  startedAt: now,
+                  completedAt: now,
+                  delegatedCompletion: {
+                    disposition: "open",
+                    nextGeneration: 2,
+                    delivery: { generation: 1, messageId: message.id, taskIds: [task.id] },
+                  },
+                },
+              },
+              {
+                id: EventId.make(`${input.threadId}:claimed-result`),
+                type: "subagent.updated",
+                threadId: input.threadId,
+                runId: ownerRunId,
+                nodeId: task.id,
+                occurredAt: now,
+                payload: {
+                  ...task,
+                  runId: ownerRunId,
+                  status: "completed",
+                  completedAt: now,
+                  updatedAt: now,
+                  result: "The delegated task completed.",
+                  completionDelivery: { state: "claimed", observedByRunId: null },
+                },
+              },
+            ],
+          });
+          const pending = yield* awaitCapacityState(input.threadId, "pending");
+          yield* failCapacity(input.threadId, shifted);
+          yield* Fiber.join(pending);
+          yield* orchestrator.recoverDelegatedTasks;
+          assert.equal(
+            (yield* orchestrator.getThreadProjection(input.threadId)).subagents.find(
+              (entry) => entry.id === task.id,
+            )?.completionDelivery?.state,
+            "claimed",
+          );
+          if (outcome !== "complete-retry") {
+            const recovery = (yield* orchestrator.getThreadProjection(input.threadId)).thread
+              .capacityRecovery!;
+            const projections = yield* ProjectionStore.ProjectionStoreV2;
+            const original = projections.getRunMessage;
+            const refused = yield* Deferred.make<void>();
+            const spy =
+              outcome === "cancel-delivery-refusal"
+                ? vi.spyOn(projections, "getRunMessage").mockImplementation((threadId, runId) =>
+                    threadId === input.threadId && runId === shifted.id
+                      ? Effect.gen(function* () {
+                          yield* Deferred.succeed(refused, undefined);
+                          return yield* new ProjectionStore.ProjectionStoreReadError({
+                            threadId,
+                            cause: "Injected delegated delivery refusal",
+                          });
+                        })
+                      : original(threadId, runId),
+                  )
+                : undefined;
+            const release = yield* awaitCapacityRelease(input.threadId);
+            yield* Effect.gen(function* () {
+              yield* orchestrator.dispatch({
+                type: "thread.capacity.cancel",
+                commandId: CommandId.make(`${input.threadId}:cancel`),
+                threadId: input.threadId,
+                generation: recovery.generation,
+              });
+              if (spy !== undefined) {
+                yield* Deferred.await(refused);
+                const held = yield* orchestrator.getThreadProjection(input.threadId);
+                assert.isFalse(held.thread.capacityRecovery?.reactionsReleased);
+                assert.equal(
+                  held.subagents.find((entry) => entry.id === task.id)?.completionDelivery?.state,
+                  "claimed",
+                );
+              }
+            }).pipe(Effect.ensuring(Effect.sync(() => spy?.mockRestore())));
+            if (spy !== undefined) {
+              const held = yield* orchestrator.getThreadProjection(input.threadId);
+              yield* ModelCapacityRecoveryWorker.sweep;
+              const healed = yield* orchestrator.getThreadProjection(input.threadId);
+              assert.lengthOf(healed.runs, held.runs.length);
+              assert.equal(
+                healed.thread.capacityRecovery?.attemptsUsed,
+                held.thread.capacityRecovery?.attemptsUsed,
+              );
+              assert.equal(
+                healed.thread.continuity?.checksRemaining,
+                held.thread.continuity?.checksRemaining,
+              );
+            }
+            yield* Fiber.join(release);
+          } else {
+            yield* TestClock.adjust("20 seconds");
+            yield* ModelCapacityRecoveryWorker.sweep;
+            yield* orchestrator.recoverDelegatedTasks;
+            const retrying = yield* orchestrator.getThreadProjection(input.threadId);
+            assert.equal(
+              retrying.subagents.find((entry) => entry.id === task.id)?.completionDelivery?.state,
+              "claimed",
+            );
+            const retry = retrying.runs.find(
+              (run) => run.id === retrying.thread.capacityRecovery?.retryRunId,
+            )!;
+            const release = yield* awaitCapacityRelease(input.threadId);
+            yield* finishRun(input.threadId, retry);
+            yield* Fiber.join(release);
+          }
+          const after = yield* orchestrator.getThreadProjection(input.threadId);
+          assert.equal(
+            after.subagents.find((entry) => entry.id === task.id)?.completionDelivery?.state,
+            "delivered",
+          );
+          assert.isNull(
+            after.runs.find((run) => run.id === ownerRunId)?.delegatedCompletion?.delivery,
+          );
+          assert.isTrue(after.thread.capacityRecovery?.reactionsReleased);
+        }),
+      ),
+  );
+
+  it.effect(
+    "capacity child results stay unpublished during retries and publish once after completion",
+    () =>
+      withCapacityRecovery(
+        Effect.gen(function* () {
+          const parent = yield* seedContinuity("capacity-child");
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const task = yield* seedLiveChild(parent);
+          const childThreadId = task.childThreadId!;
+          const child = yield* orchestrator.getThreadProjection(childThreadId);
+          const childRun = child.runs[0]!;
+          const pending = yield* awaitCapacityState(childThreadId, "pending");
+          yield* failCapacity(childThreadId, childRun);
+          yield* Fiber.join(pending);
+          const waiting = (yield* orchestrator.getThreadProjection(parent.threadId)).subagents.find(
+            (entry) => entry.id === task.id,
+          )!;
+          assert.equal(waiting.status, "waiting");
+          assert.isNull(waiting.result);
+          assert.isNull(waiting.completedAt);
+          yield* TestClock.adjust("20 seconds");
+          yield* ModelCapacityRecoveryWorker.sweep;
+          const retrying = yield* orchestrator.getThreadProjection(childThreadId);
+          const retry = retrying.runs.find(
+            (run) => run.id === retrying.thread.capacityRecovery?.retryRunId,
+          )!;
+          assert.equal(retry.delegatedTaskId, task.id);
+          const events = yield* EventSink.EventSinkV2;
+          const published = yield* events
+            .stream({
+              afterSequence: yield* events.latestSequence(),
+              eventType: "subagent.updated",
+            })
+            .pipe(
+              Stream.filter(
+                (stored) =>
+                  stored.event.type === "subagent.updated" &&
+                  stored.event.payload.id === task.id &&
+                  stored.event.payload.status === "completed",
+              ),
+              Stream.take(1),
+              Stream.runCollect,
+              Effect.forkChild({ startImmediately: true }),
+            );
+          yield* finishRun(childThreadId, retry);
+          yield* Fiber.join(published);
+          yield* orchestrator.recoverDelegatedTasks;
+          const result = yield* orchestrator.getThreadProjection(parent.threadId);
+          assert.equal(result.subagents.find((entry) => entry.id === task.id)?.status, "completed");
+          assert.lengthOf(
+            result.contextTransfers.filter(
+              (entry) => entry.type === "subagent_result" && entry.sourceThreadId === childThreadId,
+            ),
+            1,
+          );
+        }),
+      ),
+  );
+
+  it.effect.each([
+    "usageLimitExceeded",
+    "rateLimitExceeded",
+    "unauthorized",
+    "internalServerError",
+    "contextWindowExceeded",
+    "-32001",
+  ] as const)("capacity recovery never retries terminal %s errors", (code) =>
+    withCapacityRecovery(
+      Effect.gen(function* () {
+        const input = yield* seedContinuity(`capacity-negative-${code}`);
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        yield* failCapacity(input.threadId, input.run, code);
+        yield* orchestrator.dispatch({
+          type: "thread.capacity.reconcile",
+          commandId: CommandId.make(`${input.threadId}:negative-reconcile`),
+          threadId: input.threadId,
+          runId: input.run.id,
+        });
+        yield* TestClock.adjust("2 minutes");
+        yield* ModelCapacityRecoveryWorker.sweep;
+        const projection = yield* orchestrator.getThreadProjection(input.threadId);
+        assert.isNull(projection.thread.capacityRecovery ?? null);
+        assert.lengthOf(projection.runs, 1);
+      }),
+    ),
+  );
+  it.effect(
+    "capacity recovery remains disabled by default and does not reopen completed continuity",
+    () =>
+      Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const disabled = yield* seedContinuity("capacity-disabled");
+        yield* failCapacity(disabled.threadId, disabled.run);
+        yield* orchestrator.dispatch({
+          type: "thread.capacity.reconcile",
+          commandId: CommandId.make(`${disabled.threadId}:negative`),
+          threadId: disabled.threadId,
+          runId: disabled.run.id,
+        });
+        assert.isNull(
+          (yield* orchestrator.getThreadProjection(disabled.threadId)).thread.capacityRecovery ??
+            null,
+        );
+        yield* withCapacityRecovery(
+          Effect.gen(function* () {
+            const completed = yield* seedContinuity("capacity-complete");
+            yield* orchestrator.dispatch({
+              type: "thread.continuity.report",
+              commandId: CommandId.make(`${completed.threadId}:complete`),
+              threadId: completed.threadId,
+              runId: completed.run.id,
+              status: "complete",
+              reason: "The assignment is verified complete.",
+            });
+            const before = (yield* orchestrator.getThreadProjection(completed.threadId)).thread
+              .continuity;
+            yield* failCapacity(completed.threadId, completed.run);
+            yield* orchestrator.dispatch({
+              type: "thread.capacity.reconcile",
+              commandId: CommandId.make(`${completed.threadId}:negative`),
+              threadId: completed.threadId,
+              runId: completed.run.id,
+            });
+            const after = yield* orchestrator.getThreadProjection(completed.threadId);
+            assert.isNull(after.thread.capacityRecovery ?? null);
+            assert.deepEqual(after.thread.continuity, before);
+          }),
+        );
+      }),
+  );
+
+  it.effect.each([
+    "new-human",
+    "model-options",
+    "runtime-mode",
+    "plan",
+    "snooze",
+    "archive",
+    "pending-input",
+    "paused-goal",
+    "pref-off",
+  ] as const)("%s cancels a pending capacity retry before it can start", (change) =>
+    withCapacityRecovery(
+      Effect.gen(function* () {
+        const input = yield* seedContinuity(`capacity-race-${change}`);
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const pending = yield* awaitCapacityState(input.threadId, "pending");
+        yield* failCapacity(input.threadId, input.run);
+        yield* Fiber.join(pending);
+        const events = yield* EventSink.EventSinkV2;
+        const now = yield* DateTime.now;
+        const before = yield* orchestrator.getThreadProjection(input.threadId);
+        if (change === "new-human") yield* sendHumanFollowup(input.threadId, "new-human");
+        else if (change === "pref-off")
+          yield* (yield* ServerSettings.ServerSettingsService).updateSettings({
+            autoResumeCapacityThreads: false,
+          });
+        else if (change === "paused-goal")
+          yield* events.write({
+            events: [
+              {
+                id: EventId.make(`${input.threadId}:guard`),
+                type: "provider-thread.updated",
+                threadId: input.threadId,
+                occurredAt: now,
+                payload: {
+                  ...before.providerThreads[0]!,
+                  goal: { objective: "Paused native objective", status: "paused" },
+                },
+              },
+            ],
+          });
+        else if (change === "pending-input")
+          yield* events.write({
+            events: [
+              {
+                id: EventId.make(`${input.threadId}:guard`),
+                type: "runtime-request.updated",
+                threadId: input.threadId,
+                occurredAt: now,
+                payload: {
+                  id: RuntimeRequestId.make(`${input.threadId}:question`),
+                  nodeId: input.run.rootNodeId!,
+                  providerTurnId: null,
+                  nativeRequestRef: null,
+                  kind: "user_input",
+                  status: "pending",
+                  responseCapability: { type: "message" },
+                  createdAt: now,
+                  resolvedAt: null,
+                },
+              },
+            ],
+          });
+        else
+          yield* events.write({
+            events: [
+              {
+                id: EventId.make(`${input.threadId}:guard`),
+                type: "thread.metadata-updated",
+                threadId: input.threadId,
+                occurredAt: now,
+                payload: {
+                  ...before.thread,
+                  ...(change === "model-options"
+                    ? {
+                        modelSelection: {
+                          ...before.thread.modelSelection,
+                          options: [{ id: "reasoningEffort", value: "high" }],
+                        },
+                      }
+                    : {}),
+                  ...(change === "runtime-mode"
+                    ? { runtimeMode: "approval-required" as const }
+                    : {}),
+                  ...(change === "plan" ? { interactionMode: "plan" as const } : {}),
+                  ...(change === "archive" ? { archivedAt: now } : {}),
+                  ...(change === "snooze" ? { snoozedUntil: DateTime.add(now, { hours: 1 }) } : {}),
+                },
+              },
+            ],
+          });
+        yield* TestClock.adjust("20 seconds");
+        yield* ModelCapacityRecoveryWorker.sweep;
+        const after = yield* orchestrator.getThreadProjection(input.threadId);
+        assert.equal(after.thread.capacityRecovery?.status, "cancelled");
+        assert.equal(after.thread.capacityRecovery?.attemptsUsed, 0);
+        assert.lengthOf(after.runs, change === "new-human" ? 2 : 1);
+      }),
+    ),
+  );
+
+  it.effect(
+    "a cancelled delegated owner prevents capacity continuation and published results never reopen",
+    () =>
+      withCapacityRecovery(
+        Effect.gen(function* () {
+          const parent = yield* seedContinuity("capacity-owner-stop");
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const task = yield* seedLiveChild(parent);
+          const childId = task.childThreadId!;
+          const run = (yield* orchestrator.getThreadProjection(childId)).runs[0]!;
+          const pending = yield* awaitCapacityState(childId, "pending");
+          yield* failCapacity(childId, run);
+          yield* Fiber.join(pending);
+          yield* orchestrator.dispatch({
+            type: "thread.stop",
+            commandId: CommandId.make(`${parent.threadId}:stop-child`),
+            threadId: parent.threadId,
+          });
+          const events = yield* EventSink.EventSinkV2;
+          const cancelled = yield* events
+            .stream({
+              afterSequence: yield* events.latestSequence(),
+              eventType: "subagent.updated",
+            })
+            .pipe(
+              Stream.filter(
+                (stored) =>
+                  stored.event.type === "subagent.updated" &&
+                  stored.event.payload.id === task.id &&
+                  stored.event.payload.status === "cancelled",
+              ),
+              Stream.take(1),
+              Stream.runCollect,
+              Effect.forkChild({ startImmediately: true }),
+            );
+          yield* TestClock.adjust("20 seconds");
+          yield* ModelCapacityRecoveryWorker.sweep;
+          yield* Fiber.join(cancelled);
+          const after = yield* orchestrator.getThreadProjection(childId);
+          assert.equal(after.thread.capacityRecovery?.status, "cancelled");
+          assert.lengthOf(after.runs, 1);
+          const stopped = (yield* orchestrator.getThreadProjection(parent.threadId)).subagents.find(
+            (entry) => entry.id === task.id,
+          )!;
+          assert.equal(stopped.status, "cancelled");
+          yield* orchestrator.dispatch({
+            type: "thread.capacity.reconcile",
+            commandId: CommandId.make(`${parent.threadId}:late-try`),
+            threadId: childId,
+            runId: run.id,
+          });
+          assert.lengthOf((yield* orchestrator.getThreadProjection(childId)).runs, 1);
+        }),
+      ),
+  );
+
+  const withAutoEnrollment = <A, E, R>(program: Effect.Effect<A, E, R>) =>
+    Effect.gen(function* () {
+      const settings = yield* ServerSettings.ServerSettingsService;
+      yield* settings.updateSettings({ workContinuityAutoEnroll: true });
+      return yield* program.pipe(
+        Effect.ensuring(
+          settings.updateSettings({ workContinuityAutoEnroll: false }).pipe(Effect.orDie),
+        ),
+      );
+    });
+  const sendHumanFollowup = (threadId: ThreadId, suffix: string) =>
+    Effect.flatMap(Orchestrator.OrchestratorV2, (orchestrator) =>
+      orchestrator.dispatch({
+        type: "message.dispatch",
+        commandId: CommandId.make(`${threadId}:${suffix}`),
+        threadId,
+        messageId: MessageId.make(`${threadId}:${suffix}`),
+        text: "What is the status?",
+        createdBy: "user",
+        creationSource: "web",
+        attachments: [],
+        dispatchMode: { type: "queue_after_active" },
+      }),
+    );
+
+  it.effect("disabled auto enrollment leaves accepted human messages unenrolled", () =>
+    Effect.gen(function* () {
+      const input = yield* seedContinuity("auto-off", undefined, true);
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      assert.isNull(
+        (yield* orchestrator.getThreadProjection(input.threadId)).thread.continuity ?? null,
+      );
+    }),
+  );
+
+  it.effect(
+    "automatic human enrollment spends exactly one check after a missing terminal report",
+    () =>
+      withAutoEnrollment(
+        Effect.gen(function* () {
+          const input = yield* seedContinuity("auto-on", undefined, true);
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const before = (yield* orchestrator.getThreadProjection(input.threadId)).thread
+            .continuity;
+          assert.equal(before?.authorityMessageId, input.authorityMessageId);
+          assert.equal(before?.checksRemaining, 3);
+          const events = yield* EventSink.EventSinkV2;
+          const started = yield* events
+            .stream({ afterSequence: yield* events.latestSequence(), eventType: "run.created" })
+            .pipe(
+              Stream.filter((stored) => stored.event.threadId === input.threadId),
+              Stream.take(1),
+              Stream.runCollect,
+              Effect.forkChild({ startImmediately: true }),
+            );
+          yield* finishRun(input.threadId, input.run);
+          yield* Fiber.join(started);
+          const after = yield* orchestrator.getThreadProjection(input.threadId);
+          assert.lengthOf(after.runs, 2);
+          assert.equal(after.thread.continuity?.checksRemaining, 2);
+          assert.equal(after.thread.continuity?.generation, before?.generation);
+          const continuation = after.runs.find((run) => run.id !== input.run.id)!;
+          yield* orchestrator.dispatch({
+            type: "thread.continuity.report",
+            commandId: CommandId.make(`${input.threadId}:continuation-complete`),
+            threadId: input.threadId,
+            runId: continuation.id,
+            status: "complete",
+            reason: "The continuation verified the enrolled assignment.",
+          });
+          const completed = (yield* orchestrator.getThreadProjection(input.threadId)).thread
+            .continuity;
+          assert.equal(completed?.status, "complete");
+          assert.equal(completed?.lastReportedRunId, continuation.id);
+          assert.equal(completed?.authorityMessageId, input.authorityMessageId);
+          assert.equal(completed?.checksRemaining, 2);
+        }),
+      ),
+  );
+
+  it.effect(
+    "enabling the setting alone does not enroll or wake existing work, but a queued human turn does",
+    () =>
+      Effect.gen(function* () {
+        const input = yield* seedContinuity("auto-queued", undefined, true);
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        yield* withAutoEnrollment(
+          Effect.gen(function* () {
+            const before = yield* orchestrator.getThreadProjection(input.threadId);
+            assert.isNull(before.thread.continuity ?? null);
+            assert.lengthOf(before.runs, 1);
+            yield* sendHumanFollowup(input.threadId, "queued");
+            const after = yield* orchestrator.getThreadProjection(input.threadId);
+            assert.equal(
+              after.thread.continuity?.authorityMessageId,
+              MessageId.make(`${input.threadId}:queued`),
+            );
+            assert.equal(after.thread.continuity?.checksRemaining, 3);
+            assert.lengthOf(after.runs, 2);
+          }),
+        );
+      }),
+  );
+
+  it.effect("an exhausted record is never replenished by a new human turn", () =>
+    withAutoEnrollment(
+      Effect.gen(function* () {
+        const input = yield* seedContinuity("auto-exhausted", 1);
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const projection = yield* orchestrator.getThreadProjection(input.threadId);
+        const events = yield* EventSink.EventSinkV2;
+        const now = yield* DateTime.now;
+        const exhausted = { ...projection.thread.continuity!, checksRemaining: 0 };
+        yield* events.write({
+          events: [
+            {
+              id: EventId.make(`${input.threadId}:exhausted`),
+              type: "thread.metadata-updated",
+              threadId: input.threadId,
+              occurredAt: now,
+              payload: { ...projection.thread, continuity: exhausted },
+            },
+          ],
+        });
+        yield* sendHumanFollowup(input.threadId, "status");
+        assert.deepEqual(
+          (yield* orchestrator.getThreadProjection(input.threadId)).thread.continuity,
+          exhausted,
+        );
+      }),
+    ),
+  );
+
+  it.effect("a status question preserves an enrolled assignment and its remaining allowance", () =>
+    withAutoEnrollment(
+      Effect.gen(function* () {
+        const input = yield* seedContinuity("auto-status", 1);
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const before = (yield* orchestrator.getThreadProjection(input.threadId)).thread.continuity;
+        yield* sendHumanFollowup(input.threadId, "status");
+        assert.deepEqual(
+          (yield* orchestrator.getThreadProjection(input.threadId)).thread.continuity,
+          before,
+        );
+      }),
+    ),
+  );
+
+  it.effect("a new accepted human assignment after complete receives its own three checks", () =>
+    withAutoEnrollment(
+      Effect.gen(function* () {
+        const input = yield* seedContinuity("auto-next-assignment", 1);
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        yield* orchestrator.dispatch({
+          type: "thread.continuity.report",
+          commandId: CommandId.make(`${input.threadId}:complete`),
+          threadId: input.threadId,
+          runId: input.run.id,
+          status: "complete",
+          reason: "First assignment verified.",
+        });
+        yield* finishRun(input.threadId, input.run);
+        const nextCommandId = CommandId.make(`${input.threadId}:next-job`);
+        const nextMessageId = MessageId.make(`${input.threadId}:next-job`);
+        yield* orchestrator.dispatch({
+          type: "message.dispatch",
+          commandId: nextCommandId,
+          threadId: input.threadId,
+          messageId: nextMessageId,
+          text: "Implement and verify the next independent job.",
+          createdBy: "user",
+          creationSource: "mobile",
+          attachments: [],
+          dispatchMode: { type: "start_immediately" },
+        });
+        const projection = yield* orchestrator.getThreadProjection(input.threadId);
+        assert.lengthOf(projection.runs, 2);
+        assert.equal(projection.thread.continuity?.generation, nextCommandId);
+        assert.equal(projection.thread.continuity?.authorityMessageId, nextMessageId);
+        assert.equal(projection.thread.continuity?.status, "active");
+        assert.equal(projection.thread.continuity?.maxChecks, 3);
+        assert.equal(projection.thread.continuity?.checksRemaining, 3);
+        assert.isNull(projection.thread.continuity?.lastAdvancedRunId);
+        assert.isNull(projection.thread.continuity?.lastReportedRunId);
+        yield* sendHumanFollowup(input.threadId, "status");
+        assert.deepEqual(
+          (yield* orchestrator.getThreadProjection(input.threadId)).thread.continuity,
+          projection.thread.continuity,
+        );
+      }),
+    ),
+  );
+
+  it.effect("Stop ends supervision without a sticky opt-out for the next human job", () =>
+    withAutoEnrollment(
+      Effect.gen(function* () {
+        const input = yield* seedContinuity("auto-after-stop");
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        yield* orchestrator.dispatch({
+          type: "thread.continuity.report",
+          commandId: CommandId.make(`${input.threadId}:input`),
+          threadId: input.threadId,
+          runId: input.run.id,
+          status: "needs_input",
+          reason: "Waiting for human clarification.",
+        });
+        yield* finishRun(input.threadId, input.run);
+        yield* orchestrator.dispatch({
+          type: "thread.stop",
+          commandId: CommandId.make(`${input.threadId}:stop`),
+          threadId: input.threadId,
+        });
+        const stopped = yield* orchestrator.getThreadProjection(input.threadId);
+        assert.isNull(stopped.thread.continuity);
+        assert.isFalse(stopped.thread.continuityAutoEnrollDisabled ?? false);
+        yield* advance(input, "late-after-stop");
+        assert.lengthOf((yield* orchestrator.getThreadProjection(input.threadId)).runs, 1);
+        const nextMessageId = MessageId.make(`${input.threadId}:new-job`);
+        yield* orchestrator.dispatch({
+          type: "message.dispatch",
+          commandId: CommandId.make(`${input.threadId}:new-job`),
+          threadId: input.threadId,
+          messageId: nextMessageId,
+          text: "Start and verify a new job.",
+          createdBy: "user",
+          creationSource: "web",
+          attachments: [],
+          dispatchMode: { type: "start_immediately" },
+        });
+        const next = yield* orchestrator.getThreadProjection(input.threadId);
+        assert.equal(next.thread.continuity?.authorityMessageId, nextMessageId);
+        assert.equal(next.thread.continuity?.checksRemaining, 3);
+      }),
+    ),
+  );
+
+  it.effect(
+    "cancelling the queued authority blocks supervision without spending or replacing its allowance",
+    () =>
+      Effect.gen(function* () {
+        const input = yield* seedContinuity("auto-queued-cancel", undefined, true);
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        yield* withAutoEnrollment(
+          Effect.gen(function* () {
+            yield* TestClock.adjust("1 millis");
+            yield* sendHumanFollowup(input.threadId, "queued-job");
+            const before = yield* orchestrator.getThreadProjection(input.threadId);
+            const queued = before.runs.find(
+              (run) => run.userMessageId === MessageId.make(`${input.threadId}:queued-job`),
+            )!;
+            const refused = yield* orchestrator
+              .dispatch({
+                type: "thread.continuity.report",
+                commandId: CommandId.make(`${input.threadId}:old-complete`),
+                threadId: input.threadId,
+                runId: input.run.id,
+                status: "complete",
+                reason: "The predecessor is done, not the queued job.",
+              })
+              .pipe(Effect.flip);
+            assert.instanceOf(refused, Orchestrator.OrchestratorDispatchError);
+            assert.deepEqual(
+              (yield* orchestrator.getThreadProjection(input.threadId)).thread.continuity,
+              before.thread.continuity,
+            );
+            const events = yield* EventSink.EventSinkV2;
+            const blockedEvent = yield* events
+              .stream({
+                afterSequence: yield* events.latestSequence(),
+                eventType: "thread.metadata-updated",
+              })
+              .pipe(
+                Stream.filter(
+                  (stored) =>
+                    stored.event.threadId === input.threadId &&
+                    stored.event.type === "thread.metadata-updated" &&
+                    stored.event.payload.continuity?.status === "blocked",
+                ),
+                Stream.take(1),
+                Stream.runCollect,
+                Effect.forkChild({ startImmediately: true }),
+              );
+            yield* orchestrator.dispatch({
+              type: "queued-run.cancel",
+              commandId: CommandId.make(`${input.threadId}:cancel-queue`),
+              threadId: input.threadId,
+              runId: queued.id,
+            });
+            yield* finishRun(input.threadId, { ...input.run, startedAt: input.run.requestedAt });
+            yield* Fiber.join(blockedEvent);
+            const blocked = yield* orchestrator.getThreadProjection(input.threadId);
+            assert.equal(blocked.runs.find((run) => run.id === queued.id)?.status, "cancelled");
+            assert.equal(blocked.thread.continuity?.status, "blocked");
+            assert.equal(
+              blocked.thread.continuity?.generation,
+              before.thread.continuity?.generation,
+            );
+            assert.equal(blocked.thread.continuity?.authorityMessageId, queued.userMessageId);
+            assert.equal(blocked.thread.continuity?.checksRemaining, 3);
+            assert.equal(blocked.thread.continuity?.lastAdvancedRunId, queued.id);
+            yield* sendHumanFollowup(input.threadId, "another-job");
+            assert.deepEqual(
+              (yield* orchestrator.getThreadProjection(input.threadId)).thread.continuity,
+              blocked.thread.continuity,
+            );
+            assert.lengthOf((yield* orchestrator.getThreadProjection(input.threadId)).runs, 3);
+          }),
+        );
+      }),
+  );
+
+  it.effect(
+    "an accepted queued human job receives fresh supervision when its completed predecessor yields the queue",
+    () =>
+      withAutoEnrollment(
+        Effect.gen(function* () {
+          const input = yield* seedContinuity("auto-promoted-job", 1);
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const original = (yield* orchestrator.getThreadProjection(input.threadId)).thread
+            .continuity;
+          yield* sendHumanFollowup(input.threadId, "queued-job");
+          const queuedProjection = yield* orchestrator.getThreadProjection(input.threadId);
+          const queued = queuedProjection.runs.find(
+            (run) => run.userMessageId === MessageId.make(`${input.threadId}:queued-job`),
+          )!;
+          assert.equal(queued.status, "queued");
+          assert.deepEqual(queuedProjection.thread.continuity, original);
+          yield* orchestrator.dispatch({
+            type: "thread.continuity.report",
+            commandId: CommandId.make(`${input.threadId}:first-complete`),
+            threadId: input.threadId,
+            runId: input.run.id,
+            status: "complete",
+            reason: "First job verified; queued job still remains.",
+          });
+          const events = yield* EventSink.EventSinkV2;
+          const promoted = yield* events
+            .stream({
+              afterSequence: yield* events.latestSequence(),
+              eventType: "thread.metadata-updated",
+            })
+            .pipe(
+              Stream.filter(
+                (stored) =>
+                  stored.event.threadId === input.threadId &&
+                  stored.event.type === "thread.metadata-updated" &&
+                  stored.event.payload.continuity?.authorityMessageId === queued.userMessageId,
+              ),
+              Stream.take(1),
+              Stream.runCollect,
+              Effect.forkChild({ startImmediately: true }),
+            );
+          yield* finishRun(input.threadId, input.run);
+          yield* Fiber.join(promoted);
+          const after = yield* orchestrator.getThreadProjection(input.threadId);
+          assert.equal(after.runs.find((run) => run.id === queued.id)?.status, "starting");
+          assert.equal(after.thread.continuity?.authorityMessageId, queued.userMessageId);
+          assert.equal(
+            after.thread.continuity?.generation,
+            CommandId.make(`command:system:start-queued:${queued.id}`),
+          );
+          assert.equal(after.thread.continuity?.status, "active");
+          assert.equal(after.thread.continuity?.maxChecks, 3);
+          assert.equal(after.thread.continuity?.checksRemaining, 3);
+          yield* orchestrator.dispatch({
+            type: "queue.resume",
+            commandId: CommandId.make(`${input.threadId}:resume-again`),
+            threadId: input.threadId,
+          });
+          assert.deepEqual(
+            (yield* orchestrator.getThreadProjection(input.threadId)).thread.continuity,
+            after.thread.continuity,
+          );
+        }),
+      ),
+  );
+
+  it.effect(
+    "agent continuity mutations preserve a human opt-out while human enable clears it",
+    () =>
+      withAutoEnrollment(
+        Effect.gen(function* () {
+          const input = yield* seedContinuity("auto-agent-optout");
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          yield* orchestrator.dispatch({
+            type: "thread.continuity.set",
+            creationSource: "web",
+            commandId: CommandId.make(`${input.threadId}:human-disable`),
+            threadId: input.threadId,
+            enabled: false,
+          });
+          const refused = yield* orchestrator
+            .dispatch({
+              type: "thread.continuity.set",
+              creationSource: "mcp",
+              commandId: CommandId.make(`${input.threadId}:agent-enable`),
+              threadId: input.threadId,
+              enabled: true,
+              authorityMessageId: input.authorityMessageId,
+            })
+            .pipe(Effect.flip);
+          assert.instanceOf(refused, Orchestrator.OrchestratorDispatchError);
+          yield* orchestrator.dispatch({
+            type: "thread.continuity.set",
+            creationSource: "mcp",
+            commandId: CommandId.make(`${input.threadId}:agent-disable`),
+            threadId: input.threadId,
+            enabled: false,
+          });
+          assert.isTrue(
+            (yield* orchestrator.getThreadProjection(input.threadId)).thread
+              .continuityAutoEnrollDisabled,
+          );
+          yield* orchestrator.dispatch({
+            type: "thread.continuity.set",
+            creationSource: "mobile",
+            commandId: CommandId.make(`${input.threadId}:human-enable`),
+            threadId: input.threadId,
+            enabled: true,
+            authorityMessageId: input.authorityMessageId,
+          });
+          assert.isFalse(
+            (yield* orchestrator.getThreadProjection(input.threadId)).thread
+              .continuityAutoEnrollDisabled,
+          );
+          yield* orchestrator.dispatch({
+            type: "thread.continuity.set",
+            creationSource: "mcp",
+            commandId: CommandId.make(`${input.threadId}:agent-disable-unopted`),
+            threadId: input.threadId,
+            enabled: false,
+          });
+          const disabled = yield* orchestrator.getThreadProjection(input.threadId);
+          assert.isNull(disabled.thread.continuity);
+          assert.isFalse(disabled.thread.continuityAutoEnrollDisabled);
+        }),
+      ),
+  );
+
+  it.effect.each(["paused", "blocked"] as const)(
+    "automatic enrollment preserves an existing %s record",
+    (disposition) =>
+      withAutoEnrollment(
+        Effect.gen(function* () {
+          const input = yield* seedContinuity(`auto-closed-${disposition}`);
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          yield* orchestrator.dispatch({
+            type: "thread.continuity.report",
+            commandId: CommandId.make(`${input.threadId}:report`),
+            threadId: input.threadId,
+            runId: input.run.id,
+            status: disposition,
+            reason: "Keep the existing disposition.",
+          });
+          const before = (yield* orchestrator.getThreadProjection(input.threadId)).thread
+            .continuity;
+          yield* sendHumanFollowup(input.threadId, "status");
+          assert.deepEqual(
+            (yield* orchestrator.getThreadProjection(input.threadId)).thread.continuity,
+            before,
+          );
+        }),
+      ),
+  );
+
+  it.effect.each(["server", "mcp", "provider"] as const)(
+    "human-shaped %s dispatch does not automatically enroll",
+    (source) =>
+      Effect.gen(function* () {
+        const input = yield* seedContinuity(`auto-source-${source}`, undefined, true);
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        yield* finishRun(input.threadId, input.run);
+        yield* withAutoEnrollment(
+          orchestrator.dispatch({
+            type: "message.dispatch",
+            commandId: CommandId.make(`${input.threadId}:synthetic`),
+            threadId: input.threadId,
+            messageId: MessageId.make(`${input.threadId}:synthetic`),
+            text: "Synthetic user-shaped message",
+            createdBy: "user",
+            creationSource: source,
+            attachments: [],
+            dispatchMode: { type: "start_immediately" },
+          }),
+        );
+        assert.isNull(
+          (yield* orchestrator.getThreadProjection(input.threadId)).thread.continuity ?? null,
+        );
+      }),
+  );
+  it.effect.each([
+    "plan",
+    "child",
+    "archive",
+    "snooze",
+    "paused-goal",
+    "scheduled",
+    "sender",
+  ] as const)("%s prevents automatic continuity enrollment", (exclusion) =>
+    Effect.gen(function* () {
+      const input = yield* seedContinuity(`auto-excluded-${exclusion}`, undefined, true);
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      yield* finishRun(input.threadId, input.run);
+      const projection = yield* orchestrator.getThreadProjection(input.threadId);
+      const events = yield* EventSink.EventSinkV2;
+      const now = yield* DateTime.now;
+      if (exclusion === "paused-goal") {
+        const providerThread = projection.providerThreads[0]!;
+        yield* events.write({
+          events: [
+            {
+              id: EventId.make(`${input.threadId}:guard`),
+              type: "provider-thread.updated",
+              threadId: input.threadId,
+              occurredAt: now,
+              payload: {
+                ...providerThread,
+                goal: { objective: "Existing native goal", status: "paused" },
+              },
+            },
+          ],
+        });
+      } else {
+        yield* events.write({
+          events: [
+            {
+              id: EventId.make(`${input.threadId}:guard`),
+              type: "thread.metadata-updated",
+              threadId: input.threadId,
+              occurredAt: now,
+              payload: {
+                ...projection.thread,
+                ...(exclusion === "plan" ? { interactionMode: "plan" as const } : {}),
+                ...(exclusion === "child"
+                  ? {
+                      lineage: {
+                        ...projection.thread.lineage,
+                        parentThreadId: input.threadId,
+                        relationshipToParent: "subagent" as const,
+                      },
+                    }
+                  : {}),
+                ...(exclusion === "archive" ? { archivedAt: now } : {}),
+                ...(exclusion === "snooze"
+                  ? { snoozedUntil: DateTime.add(now, { hours: 1 }) }
+                  : {}),
+              },
+            },
+          ],
+        });
+      }
+      yield* withAutoEnrollment(
+        orchestrator.dispatch({
+          type: "message.dispatch",
+          commandId: CommandId.make(`${input.threadId}:followup`),
+          threadId: input.threadId,
+          messageId: MessageId.make(`${input.threadId}:followup`),
+          text: "Human-shaped follow-up",
+          createdBy: "user",
+          creationSource: "web",
+          attachments: [],
+          dispatchMode: { type: "start_immediately" },
+          ...(exclusion === "scheduled"
+            ? { scheduledTaskId: ScheduledTaskId.make("auto-scheduled-fixture") }
+            : {}),
+          ...(exclusion === "sender"
+            ? { senderThreadId: ThreadId.make("auto-sender-fixture") }
+            : {}),
+        }),
+      );
+      assert.isNull(
+        (yield* orchestrator.getThreadProjection(input.threadId)).thread.continuity ?? null,
+      );
+    }),
+  );
+
+  it.effect(
+    "explicit disable remains sticky across human messages and explicit enable clears it",
+    () =>
+      withAutoEnrollment(
+        Effect.gen(function* () {
+          const input = yield* seedContinuity("auto-sticky");
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          yield* orchestrator.dispatch({
+            type: "thread.continuity.set",
+            creationSource: "web",
+            commandId: CommandId.make(`${input.threadId}:disable`),
+            threadId: input.threadId,
+            enabled: false,
+          });
+          yield* sendHumanFollowup(input.threadId, "status");
+          const disabled = yield* orchestrator.getThreadProjection(input.threadId);
+          assert.isNull(disabled.thread.continuity);
+          assert.isTrue(disabled.thread.continuityAutoEnrollDisabled);
+          assert.isTrue(
+            (yield* orchestrator.getThreadShell(input.threadId))?.continuityAutoEnrollDisabled,
+          );
+          const maintenance = yield* ProjectionMaintenance.ProjectionMaintenanceV2;
+          assert.isTrue((yield* maintenance.rebuild).valid);
+          const replayed = yield* orchestrator.getThreadProjection(input.threadId);
+          assert.isTrue(replayed.thread.continuityAutoEnrollDisabled);
+          assert.isNull(replayed.thread.continuity);
+          yield* sendHumanFollowup(input.threadId, "after-rebuild");
+          assert.isNull(
+            (yield* orchestrator.getThreadProjection(input.threadId)).thread.continuity,
+          );
+          yield* orchestrator.dispatch({
+            type: "thread.continuity.set",
+            creationSource: "web",
+            commandId: CommandId.make(`${input.threadId}:enable`),
+            threadId: input.threadId,
+            enabled: true,
+            authorityMessageId: input.authorityMessageId,
+          });
+          assert.isFalse(
+            (yield* orchestrator.getThreadProjection(input.threadId)).thread
+              .continuityAutoEnrollDisabled,
+          );
+        }),
+      ),
+  );
+
+  it.effect(
+    "persists one bounded continuation for an unreported completion despite duplicate delivery",
+    () =>
+      Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const input = yield* seedContinuity("dedupe");
+        yield* finishRun(input.threadId, input.run);
+        yield* advance(input, "first");
+        yield* advance(input, "duplicate");
+        const projection = yield* orchestrator.getThreadProjection(input.threadId);
+        assert.lengthOf(projection.runs, 2);
+        assert.lengthOf(projection.messages, 2);
+        assert.equal(projection.thread.continuity?.maxChecks, 3);
+        assert.equal(projection.thread.continuity?.checksRemaining, 2);
+        assert.equal(projection.thread.continuity?.lastAdvancedRunId, input.run.id);
+        const sql = yield* SqlClient.SqlClient;
+        const effects = yield* sql<{
+          count: number;
+        }>`SELECT COUNT(*) AS count FROM orchestration_v2_effect_outbox WHERE thread_id = ${input.threadId} AND effect_type = ${"provider-turn.start"}`;
+        assert.equal(effects[0]?.count, 2);
+      }),
+  );
+
+  it.effect("a committed terminal event starts recovery without an external nudge", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const events = yield* EventSink.EventSinkV2;
+      const input = yield* seedContinuity("terminal-hook");
+      const started = yield* events
+        .stream({ afterSequence: yield* events.latestSequence(), eventType: "run.created" })
+        .pipe(
+          Stream.filter((stored) => stored.event.threadId === input.threadId),
+          Stream.take(1),
+          Stream.runCollect,
+          Effect.forkChild({ startImmediately: true }),
+        );
+      yield* finishRun(input.threadId, input.run);
+      const committed = yield* Fiber.join(started);
+      assert.lengthOf(committed, 1);
+      const projection = yield* orchestrator.getThreadProjection(input.threadId);
+      assert.lengthOf(projection.runs, 2);
+      assert.equal(projection.thread.continuity?.checksRemaining, 2);
+    }),
+  );
+
+  it.effect("requires authority from a user request in the enrolled thread", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const source = yield* seedContinuity("authority-source");
+      const target = yield* seedContinuity("authority-target", 20);
+      const before = yield* orchestrator.getThreadProjection(target.threadId);
+      const refused = yield* orchestrator
+        .dispatch({
+          type: "thread.continuity.set",
+          creationSource: "web",
+          commandId: CommandId.make("continuity:foreign-authority"),
+          threadId: target.threadId,
+          enabled: true,
+          authorityMessageId: source.authorityMessageId,
+        })
+        .pipe(Effect.flip);
+      assert.instanceOf(refused, Orchestrator.OrchestratorDispatchError);
+      const after = yield* orchestrator.getThreadProjection(target.threadId);
+      assert.deepEqual(after.thread.continuity, before.thread.continuity);
+      assert.equal(after.thread.continuity?.maxChecks, 20);
+      assert.lengthOf(after.runs, 1);
+      const agentMessageId = MessageId.make(`${target.threadId}:agent-notification`);
+      yield* orchestrator.dispatch({
+        type: "message.dispatch",
+        commandId: CommandId.make(`${target.threadId}:agent-notification`),
+        threadId: target.threadId,
+        messageId: agentMessageId,
+        text: "A child event is evidence, not new authority.",
+        createdBy: "agent",
+        creationSource: "server",
+        attachments: [],
+        dispatchMode: { type: "queue_after_active" },
+      });
+      const agentAuthority = yield* orchestrator
+        .dispatch({
+          type: "thread.continuity.set",
+          creationSource: "web",
+          commandId: CommandId.make(`${target.threadId}:agent-authority`),
+          threadId: target.threadId,
+          enabled: true,
+          authorityMessageId: agentMessageId,
+        })
+        .pipe(Effect.flip);
+      assert.instanceOf(agentAuthority, Orchestrator.OrchestratorDispatchError);
+      assert.deepEqual(
+        (yield* orchestrator.getThreadProjection(target.threadId)).thread.continuity,
+        before.thread.continuity,
+      );
+    }),
+  );
+
+  it.effect("a completion report suppresses recovery and cannot be overwritten by an old run", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const input = yield* seedContinuity("complete-report");
+      yield* orchestrator.dispatch({
+        type: "thread.continuity.report",
+        commandId: CommandId.make(`${input.threadId}:report`),
+        threadId: input.threadId,
+        runId: input.run.id,
+        status: "complete",
+        reason: "The requested verification passed.",
+      });
+      yield* finishRun(input.threadId, input.run);
+      yield* advance(input, "reported");
+      assert.lengthOf((yield* orchestrator.getThreadProjection(input.threadId)).runs, 1);
+      yield* orchestrator.dispatch({
+        type: "message.dispatch",
+        commandId: CommandId.make(`${input.threadId}:new-request`),
+        threadId: input.threadId,
+        messageId: MessageId.make(`${input.threadId}:new-request`),
+        text: "Perform the next authorized unit.",
+        createdBy: "user",
+        creationSource: "web",
+        attachments: [],
+        dispatchMode: { type: "start_immediately" },
+      });
+      const refused = yield* orchestrator
+        .dispatch({
+          type: "thread.continuity.report",
+          commandId: CommandId.make(`${input.threadId}:stale-report`),
+          threadId: input.threadId,
+          runId: input.run.id,
+          status: "continue",
+          reason: "A late result from the older run.",
+        })
+        .pipe(Effect.flip);
+      assert.instanceOf(refused, Orchestrator.OrchestratorDispatchError);
+      assert.equal(
+        (yield* orchestrator.getThreadProjection(input.threadId)).thread.continuity?.status,
+        "complete",
+      );
+    }),
+  );
+
+  it.effect("Stop clears enrollment before a late terminal recovery can start work", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const input = yield* seedContinuity("stop");
+      yield* orchestrator.dispatch({
+        type: "thread.continuity.report",
+        commandId: CommandId.make(`${input.threadId}:input-report`),
+        threadId: input.threadId,
+        runId: input.run.id,
+        status: "needs_input",
+        reason: "Await the requested clarification.",
+      });
+      yield* finishRun(input.threadId, input.run);
+      const stopped = yield* orchestrator.dispatch({
+        type: "thread.stop",
+        commandId: CommandId.make(`${input.threadId}:stop`),
+        threadId: input.threadId,
+      });
+      assert.isTrue(
+        stopped.storedEvents.some((stored) => stored.event.type === "thread.metadata-updated"),
+      );
+      assert.isNull((yield* orchestrator.getThreadProjection(input.threadId)).thread.continuity);
+      yield* advance(input, "late-after-stop");
+      const projection = yield* orchestrator.getThreadProjection(input.threadId);
+      assert.lengthOf(projection.runs, 1);
+      assert.isNull(projection.thread.continuity);
+    }),
+  );
+
+  it.effect("Stop cancels an accepted continuation before its provider effect can execute", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const input = yield* seedContinuity("stop-pending-continuation");
+      yield* finishRun(input.threadId, input.run);
+      yield* advance(input, "accepted");
+      const continuation = (yield* orchestrator.getThreadProjection(input.threadId)).runs[1]!;
+      yield* orchestrator.dispatch({
+        type: "thread.stop",
+        commandId: CommandId.make(`${input.threadId}:stop`),
+        threadId: input.threadId,
+      });
+      yield* advance({ ...input, run: continuation }, "late-after-stop");
+      const projection = yield* orchestrator.getThreadProjection(input.threadId);
+      assert.lengthOf(projection.runs, 2);
+      assert.isNull(projection.thread.continuity);
+      assert.equal(
+        projection.runs.find((run) => run.id === continuation.id)?.status,
+        "interrupted",
+      );
+      const sql = yield* SqlClient.SqlClient;
+      const effects = yield* sql<{
+        status: string;
+      }>`SELECT status FROM orchestration_v2_effect_outbox
+          WHERE thread_id = ${input.threadId} AND effect_type = ${"provider-turn.start"}
+            AND json_extract(payload_json, '$.runId') = ${continuation.id}`;
+      assert.deepEqual(
+        effects.map((effect) => effect.status),
+        ["cancelled"],
+      );
+    }),
+  );
+
+  it.effect("supervision cannot resume a paused provider-native goal", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const events = yield* EventSink.EventSinkV2;
+      const input = yield* seedContinuity("paused-native-goal");
+      const providerThread = (yield* orchestrator.getThreadProjection(input.threadId))
+        .providerThreads[0]!;
+      yield* events.write({
+        events: [
+          {
+            id: EventId.make(`${input.threadId}:paused-goal`),
+            type: "provider-thread.updated",
+            threadId: input.threadId,
+            providerInstanceId: modelSelection.instanceId,
+            occurredAt: yield* DateTime.now,
+            payload: {
+              ...providerThread,
+              goal: { objective: "Finish the explicit native objective.", status: "paused" },
+            },
+          },
+        ],
+      });
+      yield* finishRun(input.threadId, input.run);
+      yield* advance(input, "native-paused");
+      const projection = yield* orchestrator.getThreadProjection(input.threadId);
+      assert.lengthOf(projection.runs, 1);
+      assert.equal(projection.thread.continuity?.checksRemaining, 3);
+      assert.equal(projection.providerThreads[0]?.goal?.status, "paused");
+    }),
+  );
+
+  it.effect("queued user work takes precedence over an automatic continuation", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const input = yield* seedContinuity("user-queue");
+      yield* orchestrator.dispatch({
+        type: "message.dispatch",
+        commandId: CommandId.make(`${input.threadId}:queue`),
+        threadId: input.threadId,
+        messageId: MessageId.make(`${input.threadId}:queue`),
+        text: "Use this updated requirement first.",
+        createdBy: "user",
+        creationSource: "web",
+        attachments: [],
+        dispatchMode: { type: "queue_after_active" },
+      });
+      yield* finishRun(input.threadId, input.run);
+      yield* advance(input, "queued-user");
+      const projection = yield* orchestrator.getThreadProjection(input.threadId);
+      assert.lengthOf(projection.runs, 2);
+      assert.lengthOf(projection.messages, 2);
+      assert.equal(projection.thread.continuity?.checksRemaining, 3);
+    }),
+  );
+
+  it.effect("a live pull request watch prevents synthetic continuation while waiting", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const input = yield* seedContinuity("live-wait");
+      const key = { host: "github.com", repository: "pingdotgg/t3code", number: 77 };
+      yield* orchestrator.dispatch({
+        type: "thread.pull-request.watch",
+        commandId: CommandId.make(`${input.threadId}:watch`),
+        threadId: input.threadId,
+        ...key,
+        watching: true,
+        link: { url: "https://github.com/pingdotgg/t3code/pull/77", source: "agent" },
+      });
+      yield* orchestrator.dispatch({
+        type: "thread.continuity.report",
+        commandId: CommandId.make(`${input.threadId}:report`),
+        threadId: input.threadId,
+        runId: input.run.id,
+        status: "waiting",
+        reason: "The linked pull request checks must finish.",
+        wait: { kind: "pull_request", ...key },
+      });
+      yield* finishRun(input.threadId, input.run);
+      yield* advance(input, "waiting");
+      const projection = yield* orchestrator.getThreadProjection(input.threadId);
+      assert.lengthOf(projection.runs, 1);
+      assert.equal(projection.thread.continuity?.status, "waiting");
+      assert.equal(projection.thread.continuity?.checksRemaining, 3);
+      assert.deepEqual(projection.thread.continuity?.wait, { kind: "pull_request", ...key });
+    }),
+  );
+
+  it.effect("a removed watch cannot leave the thread claiming a live wait", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const input = yield* seedContinuity("lost-wait");
+      const key = { host: "github.com", repository: "pingdotgg/t3code", number: 78 };
+      yield* orchestrator.dispatch({
+        type: "thread.pull-request.watch",
+        commandId: CommandId.make(`${input.threadId}:watch`),
+        threadId: input.threadId,
+        ...key,
+        watching: true,
+        link: { url: "https://github.com/pingdotgg/t3code/pull/78", source: "agent" },
+      });
+      yield* orchestrator.dispatch({
+        type: "thread.continuity.report",
+        commandId: CommandId.make(`${input.threadId}:report`),
+        threadId: input.threadId,
+        runId: input.run.id,
+        status: "waiting",
+        reason: "Waiting for linked checks.",
+        wait: { kind: "pull_request", ...key },
+      });
+      yield* orchestrator.dispatch({
+        type: "thread.pull-request.watch",
+        commandId: CommandId.make(`${input.threadId}:unwatch`),
+        threadId: input.threadId,
+        ...key,
+        watching: false,
+      });
+      yield* finishRun(input.threadId, input.run);
+      yield* advance(input, "lost-wait");
+      const projection = yield* orchestrator.getThreadProjection(input.threadId);
+      assert.lengthOf(projection.runs, 1);
+      assert.equal(projection.thread.continuity?.status, "blocked");
+      assert.isNull(projection.thread.continuity?.wait);
+      assert.equal(projection.thread.continuity?.checksRemaining, 3);
+    }),
+  );
+
+  it.effect("ending with a pending question defers recovery until its resolution event", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const events = yield* EventSink.EventSinkV2;
+      const input = yield* seedContinuity("question-wake");
+      const rootNodeId = input.run.rootNodeId;
+      if (rootNodeId === null)
+        return yield* Effect.die("The question fixture requires an allocated root node.");
+      const request = {
+        id: RuntimeRequestId.make(`${input.threadId}:question`),
+        nodeId: rootNodeId,
+        providerTurnId: null,
+        nativeRequestRef: null,
+        kind: "user_input" as const,
+        status: "pending" as const,
+        responseCapability: { type: "message" as const },
+        createdAt: yield* DateTime.now,
+        resolvedAt: null,
+      };
+      yield* events.write({
+        events: [
+          {
+            id: EventId.make(`${input.threadId}:question-pending`),
+            type: "runtime-request.updated",
+            threadId: input.threadId,
+            nodeId: rootNodeId,
+            occurredAt: yield* DateTime.now,
+            payload: request,
+          },
+        ],
+      });
+      yield* finishRun(input.threadId, input.run);
+      yield* advance(input, "pending");
+      assert.lengthOf((yield* orchestrator.getThreadProjection(input.threadId)).runs, 1);
+      const resumed = yield* events
+        .stream({ afterSequence: yield* events.latestSequence(), eventType: "run.created" })
+        .pipe(
+          Stream.filter((stored) => stored.event.threadId === input.threadId),
+          Stream.take(1),
+          Stream.runCollect,
+          Effect.forkChild({ startImmediately: true }),
+        );
+      yield* events.write({
+        events: [
+          {
+            id: EventId.make(`${input.threadId}:question-resolved`),
+            type: "runtime-request.updated",
+            threadId: input.threadId,
+            nodeId: rootNodeId,
+            occurredAt: yield* DateTime.now,
+            payload: { ...request, status: "resolved", resolvedAt: yield* DateTime.now },
+          },
+        ],
+      });
+      yield* Fiber.join(resumed);
+      const projection = yield* orchestrator.getThreadProjection(input.threadId);
+      assert.lengthOf(projection.runs, 2);
+      assert.equal(projection.thread.continuity?.checksRemaining, 2);
+    }),
+  );
+
+  it.effect(
+    "unwatching after the waiting run completes surfaces a lost wake without another nudge",
+    () =>
+      Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const events = yield* EventSink.EventSinkV2;
+        const input = yield* seedContinuity("lost-wait-after-end");
+        const key = { host: "github.com", repository: "pingdotgg/t3code", number: 79 };
+        yield* orchestrator.dispatch({
+          type: "thread.pull-request.watch",
+          commandId: CommandId.make(`${input.threadId}:watch`),
+          threadId: input.threadId,
+          ...key,
+          watching: true,
+          link: { url: "https://github.com/pingdotgg/t3code/pull/79", source: "agent" },
+        });
+        yield* orchestrator.dispatch({
+          type: "thread.continuity.report",
+          commandId: CommandId.make(`${input.threadId}:report`),
+          threadId: input.threadId,
+          runId: input.run.id,
+          status: "waiting",
+          reason: "Waiting for linked checks.",
+          wait: { kind: "pull_request", ...key },
+        });
+        yield* finishRun(input.threadId, input.run);
+        yield* advance(input, "initial-live-wait");
+        const blocked = yield* events
+          .stream({
+            afterSequence: yield* events.latestSequence(),
+            eventType: "thread.metadata-updated",
+          })
+          .pipe(
+            Stream.filter(
+              (stored) =>
+                stored.event.threadId === input.threadId &&
+                stored.event.type === "thread.metadata-updated" &&
+                stored.event.payload.continuity?.status === "blocked",
+            ),
+            Stream.take(1),
+            Stream.runCollect,
+            Effect.forkChild({ startImmediately: true }),
+          );
+        yield* orchestrator.dispatch({
+          type: "thread.pull-request.watch",
+          commandId: CommandId.make(`${input.threadId}:unwatch`),
+          threadId: input.threadId,
+          ...key,
+          watching: false,
+        });
+        yield* Fiber.join(blocked);
+        const projection = yield* orchestrator.getThreadProjection(input.threadId);
+        assert.lengthOf(projection.runs, 1);
+        assert.equal(projection.thread.continuity?.status, "blocked");
+        assert.isNull(projection.thread.continuity?.wait);
+        assert.equal(projection.thread.continuity?.checksRemaining, 3);
+      }),
+  );
+
+  it.effect(
+    "a second restart cutting an unstarted continuation preserves supervision until its descendant ends",
+    () =>
+      Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const threads = yield* ThreadManagementService.ThreadManagementService;
+        const events = yield* EventSink.EventSinkV2;
+        const sql = yield* SqlClient.SqlClient;
+        const outbox = yield* EffectOutbox.EffectOutboxV2;
+        const input = yield* seedContinuity("restart-recut-root");
+        const workerId = `${input.threadId}:restart-worker`;
+        const cancelForRestart = (run: OrchestrationV2Run, started: boolean) =>
+          Effect.gen(function* () {
+            const completedAt = DateTime.formatIso(yield* DateTime.now);
+            // Startup restores these persisted records before delivering live events.
+            yield* sql`UPDATE orchestration_v2_projection_runs
+                SET status = ${"cancelled"}, completed_at = ${completedAt},
+                  payload_json = json_set(payload_json, '$.status', ${"cancelled"},
+                    '$.startedAt', ${started ? completedAt : null}, '$.completedAt', ${completedAt})
+                WHERE run_id = ${run.id} AND thread_id = ${input.threadId}`;
+            yield* outbox.enqueue([
+              {
+                id: `effect:restart-continuation:${run.id}`,
+                commandId: CommandId.make(`${run.id}:restart`),
+                threadId: input.threadId,
+                request: { type: "provider-runtime.continue", sourceRunId: run.id },
+              },
+            ]);
+          });
+        const resumeAndSettle = (run: OrchestrationV2Run) =>
+          Effect.gen(function* () {
+            const effectId = `effect:restart-continuation:${run.id}`;
+            yield* sql`UPDATE orchestration_v2_effect_outbox SET status = ${"running"}, lease_owner = ${workerId} WHERE effect_id = ${effectId}`;
+            yield* continueRestartedRun({ threadId: input.threadId, sourceRunId: run.id });
+            assert.isTrue(yield* outbox.succeed({ effectId, workerId }));
+            yield* threads.recoverDelegatedTask(input.threadId, run.id);
+          });
+
+        yield* cancelForRestart(input.run, true);
+        yield* orchestrator.recoverDelegatedTasks;
+        yield* TestClock.adjust("1 millis");
+        yield* resumeAndSettle(input.run);
+        const first = (yield* orchestrator.getThreadProjection(input.threadId)).runs.find(
+          (run) => run.restartContinuationOfRunId === input.run.id,
+        );
+        assert.isDefined(first);
+        if (first === undefined)
+          return yield* Effect.die("Restart did not create its continuation.");
+        assert.equal(first.status, "starting");
+        assert.isNull(first.startedAt);
+        assert.equal(
+          Option.getOrThrow(yield* outbox.get(`effect:restart-continuation:${input.run.id}`))
+            .status,
+          "succeeded",
+        );
+
+        yield* TestClock.adjust("1 millis");
+        yield* cancelForRestart(first, false);
+        yield* orchestrator.recoverDelegatedTasks;
+        // A replayed first effect must also keep the second continuation's hold.
+        yield* threads.recoverDelegatedTask(input.threadId, input.run.id);
+        const held = yield* orchestrator.getThreadProjection(input.threadId);
+        assert.equal(held.thread.continuity?.status, "active");
+        assert.equal(held.thread.continuity?.checksRemaining, 3);
+        assert.isNull(held.thread.continuity?.lastAdvancedRunId);
+        assert.equal(held.thread.continuity?.generation, input.generation);
+        assert.lengthOf(held.runs, 2);
+        assert.equal(
+          Option.getOrThrow(yield* outbox.get(`effect:restart-continuation:${first.id}`)).status,
+          "pending",
+        );
+
+        yield* TestClock.adjust("1 millis");
+        yield* resumeAndSettle(first);
+        const resumed = yield* orchestrator.getThreadProjection(input.threadId);
+        const descendant = resumed.runs.find((run) => run.restartContinuationOfRunId === first.id);
+        assert.isDefined(descendant);
+        if (descendant === undefined) return yield* Effect.die("Second restart did not resume.");
+        assert.equal(resumed.thread.continuity?.status, "active");
+        assert.equal(resumed.thread.continuity?.checksRemaining, 3);
+        const checked = yield* events
+          .stream({ afterSequence: yield* events.latestSequence(), eventType: "run.created" })
+          .pipe(
+            Stream.filter((stored) => stored.event.threadId === input.threadId),
+            Stream.take(1),
+            Stream.runCollect,
+            Effect.forkChild({ startImmediately: true }),
+          );
+        yield* finishRun(input.threadId, descendant);
+        yield* Fiber.join(checked);
+        const after = yield* orchestrator.getThreadProjection(input.threadId);
+        assert.equal(after.thread.continuity?.status, "active");
+        assert.equal(after.thread.continuity?.checksRemaining, 2);
+        assert.equal(after.thread.continuity?.lastAdvancedRunId, descendant.id);
+        assert.equal(after.thread.continuity?.generation, input.generation);
+        assert.lengthOf(after.runs, 4);
+      }),
+  );
+
+  it.effect.each([false, true] as const)(
+    "startup cancellation respects pending restart ownership (%s)",
+    (pendingRestart) =>
+      Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const sql = yield* SqlClient.SqlClient;
+        const outbox = yield* EffectOutbox.EffectOutboxV2;
+        const input = yield* seedContinuity(`cancelled-startup-${pendingRestart}`);
+        const completedAt = DateTime.formatIso(yield* DateTime.now);
+        yield* sql`UPDATE orchestration_v2_projection_runs
+          SET status = ${"cancelled"}, completed_at = ${completedAt},
+            payload_json = json_set(payload_json, '$.status', ${"cancelled"}, '$.startedAt', ${completedAt}, '$.completedAt', ${completedAt})
+          WHERE run_id = ${input.run.id} AND thread_id = ${input.threadId}`;
+        if (pendingRestart)
+          yield* outbox.enqueue([
+            {
+              id: `effect:restart-continuation:${input.run.id}`,
+              commandId: CommandId.make(`${input.threadId}:restart`),
+              threadId: input.threadId,
+              request: { type: "provider-runtime.continue", sourceRunId: input.run.id },
+            },
+          ]);
+        yield* orchestrator.recoverDelegatedTasks;
+        const projection = yield* orchestrator.getThreadProjection(input.threadId);
+        assert.lengthOf(projection.runs, 1);
+        assert.equal(projection.thread.continuity?.status, pendingRestart ? "active" : "blocked");
+        assert.equal(projection.thread.continuity?.checksRemaining, 3);
+        assert.equal(
+          projection.thread.continuity?.lastAdvancedRunId,
+          pendingRestart ? null : input.run.id,
+        );
+      }),
+  );
+
+  it.effect("startup surfaces a supervised assignment cancelled before it ever started", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const sql = yield* SqlClient.SqlClient;
+      const input = yield* seedContinuity("cancelled-before-start");
+      const completedAt = DateTime.formatIso(yield* DateTime.now);
+      yield* sql`UPDATE orchestration_v2_projection_runs
+          SET status = ${"cancelled"}, completed_at = ${completedAt},
+            payload_json = json_set(payload_json, '$.status', ${"cancelled"}, '$.startedAt', NULL, '$.completedAt', ${completedAt})
+          WHERE run_id = ${input.run.id} AND thread_id = ${input.threadId}`;
+      yield* orchestrator.recoverDelegatedTasks;
+      const projection = yield* orchestrator.getThreadProjection(input.threadId);
+      assert.lengthOf(projection.runs, 1);
+      assert.equal(projection.thread.continuity?.status, "blocked");
+      assert.equal(projection.thread.continuity?.checksRemaining, 3);
+      assert.equal(projection.thread.continuity?.lastAdvancedRunId, input.run.id);
+    }),
+  );
+
+  it.effect(
+    "an unrelated cancelled queue item cannot replace the supervised executed context",
+    () =>
+      Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const sql = yield* SqlClient.SqlClient;
+        const input = yield* seedContinuity("unrelated-cancelled-queue");
+        const key = { host: "github.com", repository: "pingdotgg/t3code", number: 80 };
+        yield* orchestrator.dispatch({
+          type: "thread.pull-request.watch",
+          commandId: CommandId.make(`${input.threadId}:watch`),
+          threadId: input.threadId,
+          ...key,
+          watching: true,
+          link: { url: "https://github.com/pingdotgg/t3code/pull/80", source: "agent" },
+        });
+        yield* orchestrator.dispatch({
+          type: "thread.continuity.report",
+          commandId: CommandId.make(`${input.threadId}:report`),
+          threadId: input.threadId,
+          runId: input.run.id,
+          status: "waiting",
+          reason: "The executed request has a verified live dependency.",
+          wait: { kind: "pull_request", ...key },
+        });
+        yield* orchestrator.dispatch({
+          type: "message.dispatch",
+          commandId: CommandId.make(`${input.threadId}:unrelated`),
+          threadId: input.threadId,
+          messageId: MessageId.make(`${input.threadId}:unrelated`),
+          text: "A separate queued request that is subsequently cancelled.",
+          createdBy: "user",
+          creationSource: "web",
+          attachments: [],
+          dispatchMode: { type: "queue_after_active" },
+        });
+        const queued = (yield* orchestrator.getThreadProjection(input.threadId)).runs[1]!;
+        const completedAt = DateTime.formatIso(yield* DateTime.now);
+        yield* sql`UPDATE orchestration_v2_projection_runs
+          SET status = ${"cancelled"}, completed_at = ${completedAt},
+            payload_json = json_set(payload_json, '$.status', ${"cancelled"}, '$.startedAt', NULL, '$.completedAt', ${completedAt})
+          WHERE run_id = ${queued.id} AND thread_id = ${input.threadId}`;
+        yield* finishRun(input.threadId, input.run);
+        yield* advance(input, "original-context");
+        yield* orchestrator.recoverDelegatedTasks;
+        const projection = yield* orchestrator.getThreadProjection(input.threadId);
+        assert.lengthOf(projection.runs, 2);
+        assert.equal(projection.thread.continuity?.status, "waiting");
+        assert.equal(projection.thread.continuity?.lastReportedRunId, input.run.id);
+        assert.equal(projection.thread.continuity?.checksRemaining, 3);
+        assert.deepEqual(projection.thread.continuity?.wait, { kind: "pull_request", ...key });
+      }),
+  );
+
+  it.effect("a live run cannot reopen its completed disposition with a continue report", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const input = yield* seedContinuity("complete-is-final");
+      yield* orchestrator.dispatch({
+        type: "thread.continuity.report",
+        commandId: CommandId.make(`${input.threadId}:complete`),
+        threadId: input.threadId,
+        runId: input.run.id,
+        status: "complete",
+        reason: "The authorized work and its verification finished.",
+      });
+      const before = (yield* orchestrator.getThreadProjection(input.threadId)).thread.continuity;
+      const refused = yield* orchestrator
+        .dispatch({
+          type: "thread.continuity.report",
+          commandId: CommandId.make(`${input.threadId}:reopen`),
+          threadId: input.threadId,
+          runId: input.run.id,
+          status: "continue",
+          reason: "A late attempt to reopen the same run.",
+        })
+        .pipe(Effect.flip);
+      assert.instanceOf(refused, Orchestrator.OrchestratorDispatchError);
+      const projection = yield* orchestrator.getThreadProjection(input.threadId);
+      assert.deepEqual(projection.thread.continuity, before);
+      assert.equal(projection.thread.continuity?.generation, input.generation);
+      assert.equal(projection.thread.continuity?.checksRemaining, 3);
+      assert.lengthOf(projection.runs, 1);
+    }),
+  );
+
+  it.effect(
+    "a refused provider start commits only a blocked disposition without spending a check",
+    () =>
+      Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const input = yield* seedContinuity("refused-start");
+        const projects = yield* ProjectStore.ProjectStoreV2;
+        const getProject = projects.get;
+        const projectLookup = vi
+          .spyOn(projects, "get")
+          .mockImplementation((projectId, options) =>
+            projectId === ProjectId.make(`${input.threadId}:project`)
+              ? Effect.succeed(Option.none())
+              : getProject(projectId, options),
+          );
+        yield* Effect.gen(function* () {
+          yield* finishRun(input.threadId, input.run);
+          yield* advance(input, "refused");
+          const projection = yield* orchestrator.getThreadProjection(input.threadId);
+          assert.lengthOf(projection.runs, 1);
+          assert.lengthOf(projection.messages, 1);
+          assert.equal(projection.thread.continuity?.status, "blocked");
+          assert.equal(projection.thread.continuity?.checksRemaining, 3);
+          const sql = yield* SqlClient.SqlClient;
+          const effects = yield* sql<{
+            count: number;
+          }>`SELECT COUNT(*) AS count FROM orchestration_v2_effect_outbox WHERE thread_id = ${input.threadId} AND effect_type = ${"provider-turn.start"}`;
+          assert.equal(effects[0]?.count, 1);
+        }).pipe(Effect.ensuring(Effect.sync(() => projectLookup.mockRestore())));
+      }),
+  );
+
+  it.effect.each([false, true] as const)(
+    "a first live delegated child retains the parent's wait before a cohort exists (%s)",
+    (reported) =>
+      Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const input = yield* seedContinuity(`first-child-${reported}`);
+        const task = yield* seedLiveChild(input);
+        const parent = yield* orchestrator.getThreadProjection(input.threadId);
+        assert.isUndefined(parent.runs[0]?.delegatedCompletion);
+        if (reported)
+          yield* orchestrator.dispatch({
+            type: "thread.continuity.report",
+            commandId: CommandId.make(`${input.threadId}:report`),
+            threadId: input.threadId,
+            runId: input.run.id,
+            status: "waiting",
+            reason: "The delegated owner is running.",
+            wait: { kind: "delegated_task", taskId: task.id },
+          });
+        yield* finishRun(input.threadId, input.run);
+        yield* advance(input, "first-child-live");
+        const projection = yield* orchestrator.getThreadProjection(input.threadId);
+        assert.lengthOf(projection.runs, 1);
+        assert.equal(projection.thread.continuity?.status, "waiting");
+        assert.equal(projection.thread.continuity?.checksRemaining, 3);
+        assert.deepEqual(projection.thread.continuity?.wait, {
+          kind: "delegated_task",
+          taskId: task.id,
+        });
+      }),
+  );
+
+  it.effect.each(["pending", "claimed"] as const)(
+    "a terminal child's %s delivery retains waiting during pre-wake revalidation",
+    (deliveryState) =>
+      Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const events = yield* EventSink.EventSinkV2;
+        const input = yield* seedContinuity(`child-delivery-${deliveryState}`);
+        const task = yield* seedLiveChild(input);
+        yield* orchestrator.dispatch({
+          type: "thread.continuity.report",
+          commandId: CommandId.make(`${input.threadId}:report`),
+          threadId: input.threadId,
+          runId: input.run.id,
+          status: "waiting",
+          reason: "Waiting for the owned task's completion delivery.",
+          wait: { kind: "delegated_task", taskId: task.id },
+        });
+        yield* finishRun(input.threadId, input.run);
+        yield* advance(input, "child-live");
+        const ended = (yield* orchestrator.getThreadProjection(input.threadId)).runs[0]!;
+        const now = yield* DateTime.now;
+        const sql = yield* SqlClient.SqlClient;
+        const completedAt = DateTime.formatIso(now);
+        yield* sql`UPDATE orchestration_v2_projection_runs
+          SET status = ${"completed"}, completed_at = ${completedAt},
+            payload_json = json_set(payload_json, '$.status', ${"completed"}, '$.startedAt', ${completedAt}, '$.completedAt', ${completedAt})
+          WHERE thread_id = ${task.childThreadId}`;
+        yield* events.write({
+          events: [
+            {
+              id: EventId.make(`${input.threadId}:cohort`),
+              type: "run.updated",
+              threadId: input.threadId,
+              runId: input.run.id,
+              occurredAt: now,
+              payload: {
+                ...ended,
+                delegatedCompletion: {
+                  disposition: "open",
+                  nextGeneration: 2,
+                  delivery: {
+                    generation: 1,
+                    messageId: MessageId.make(`${input.threadId}:delivery`),
+                    taskIds: [task.id],
+                  },
+                },
+              },
+            },
+            {
+              id: EventId.make(`${input.threadId}:task-terminal`),
+              type: "subagent.updated",
+              threadId: input.threadId,
+              runId: input.run.id,
+              nodeId: task.id,
+              occurredAt: now,
+              payload: {
+                ...task,
+                status: "completed",
+                result: "The child finished its bounded work.",
+                completedAt: now,
+                updatedAt: now,
+                completionDelivery: { state: deliveryState, observedByRunId: null },
+              },
+            },
+          ],
+        });
+        yield* advance(input, "before-wake");
+        const projection = yield* orchestrator.getThreadProjection(input.threadId);
+        assert.lengthOf(projection.runs, 1);
+        assert.equal(projection.thread.continuity?.status, "waiting");
+        assert.equal(projection.thread.continuity?.checksRemaining, 3);
+        assert.equal(projection.subagents[0]?.completionDelivery?.state, deliveryState);
+      }),
+  );
+
+  it.effect.each(["succeeded", "failed"] as const)(
+    "retiring a %s restart effect revalidates the root's cancelled assignment",
+    (outcome) =>
+      Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const threads = yield* ThreadManagementService.ThreadManagementService;
+        const sql = yield* SqlClient.SqlClient;
+        const outbox = yield* EffectOutbox.EffectOutboxV2;
+        const input = yield* seedContinuity(`retired-restart-${outcome}`);
+        const completedAt = DateTime.formatIso(yield* DateTime.now);
+        yield* sql`UPDATE orchestration_v2_projection_runs
+          SET status = ${"cancelled"}, completed_at = ${completedAt},
+            payload_json = json_set(payload_json, '$.status', ${"cancelled"}, '$.startedAt', ${completedAt}, '$.completedAt', ${completedAt})
+          WHERE run_id = ${input.run.id} AND thread_id = ${input.threadId}`;
+        const effectId = `effect:restart-continuation:${input.run.id}`;
+        const workerId = `${input.threadId}:worker`;
+        yield* outbox.enqueue([
+          {
+            id: effectId,
+            commandId: CommandId.make(`${input.threadId}:restart`),
+            threadId: input.threadId,
+            request: { type: "provider-runtime.continue", sourceRunId: input.run.id },
+          },
+        ]);
+        yield* orchestrator.recoverDelegatedTasks;
+        assert.equal(
+          (yield* orchestrator.getThreadProjection(input.threadId)).thread.continuity?.status,
+          "active",
+        );
+        // Model this worker's claim; other fixtures' intentionally pending starts stay untouched.
+        yield* sql`UPDATE orchestration_v2_effect_outbox SET status = ${"running"}, lease_owner = ${workerId} WHERE effect_id = ${effectId}`;
+        const retired =
+          outcome === "succeeded"
+            ? yield* outbox.succeed({ effectId, workerId })
+            : yield* outbox.fail({
+                effectId,
+                workerId,
+                error: "The bounded restart attempts failed.",
+              });
+        assert.isTrue(retired);
+        yield* threads.recoverDelegatedTask(input.threadId, input.run.id);
+        const projection = yield* orchestrator.getThreadProjection(input.threadId);
+        assert.lengthOf(projection.runs, 1);
+        assert.equal(projection.thread.continuity?.status, "blocked");
+        assert.equal(projection.thread.continuity?.checksRemaining, 3);
+        assert.equal(Option.getOrThrow(yield* outbox.get(effectId)).status, outcome);
+      }),
+  );
+
+  it.effect.each(["paused", "blocked"] as const)(
+    "a %s disposition cannot be reopened through an otherwise valid waiting report",
+    (closedStatus) =>
+      Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const input = yield* seedContinuity(`closed-wait-${closedStatus}`);
+        const task = yield* seedLiveChild(input);
+        yield* orchestrator.dispatch({
+          type: "thread.continuity.report",
+          commandId: CommandId.make(`${input.threadId}:closed`),
+          threadId: input.threadId,
+          runId: input.run.id,
+          status: closedStatus,
+          reason: "The owner explicitly ended supervised execution.",
+        });
+        const before = (yield* orchestrator.getThreadProjection(input.threadId)).thread.continuity;
+        const refused = yield* orchestrator
+          .dispatch({
+            type: "thread.continuity.report",
+            commandId: CommandId.make(`${input.threadId}:reopen`),
+            threadId: input.threadId,
+            runId: input.run.id,
+            status: "waiting",
+            reason: "A live dependency does not reopen closed supervision.",
+            wait: { kind: "delegated_task", taskId: task.id },
+          })
+          .pipe(Effect.flip);
+        assert.instanceOf(refused, Orchestrator.OrchestratorDispatchError);
+        assert.deepEqual(
+          (yield* orchestrator.getThreadProjection(input.threadId)).thread.continuity,
+          before,
+        );
+      }),
+  );
+
+  it.effect("snooze clears supervision and unsnooze cannot silently reenable it", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const input = yield* seedContinuity("snooze-hold");
+      yield* orchestrator.dispatch({
+        type: "thread.snooze",
+        commandId: CommandId.make(`${input.threadId}:snooze`),
+        threadId: input.threadId,
+        snoozedUntil: "2099-07-25T09:00:00.000Z",
+      });
+      assert.isNull((yield* orchestrator.getThreadProjection(input.threadId)).thread.continuity);
+      yield* finishRun(input.threadId, input.run);
+      yield* orchestrator.dispatch({
+        type: "thread.unsnooze",
+        commandId: CommandId.make(`${input.threadId}:unsnooze`),
+        threadId: input.threadId,
+        reason: "user",
+      });
+      yield* advance(input, "after-unsnooze");
+      const projection = yield* orchestrator.getThreadProjection(input.threadId);
+      assert.isNull(projection.thread.continuity);
+      assert.lengthOf(projection.runs, 1);
+    }),
+  );
+
+  it.effect("startup repairs a missed completed run exactly once", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const input = yield* seedContinuity("startup");
+      const sql = yield* SqlClient.SqlClient;
+      const completedAt = DateTime.formatIso(yield* DateTime.now);
+      // Model startup's persisted terminal projection without a live event delivery.
+      yield* sql`UPDATE orchestration_v2_projection_runs
+        SET status = ${"completed"}, completed_at = ${completedAt},
+          payload_json = json_set(payload_json, '$.status', ${"completed"}, '$.completedAt', ${completedAt})
+        WHERE run_id = ${input.run.id} AND thread_id = ${input.threadId}`;
+      yield* orchestrator.recoverDelegatedTasks;
+      yield* orchestrator.recoverDelegatedTasks;
+      const projection = yield* orchestrator.getThreadProjection(input.threadId);
+      assert.lengthOf(projection.runs, 2);
+      assert.equal(projection.thread.continuity?.checksRemaining, 2);
+      assert.equal(projection.thread.continuity?.lastAdvancedRunId, input.run.id);
+    }),
+  );
+
+  it.effect("a wait without a live wake binding is refused without suppressing recovery", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const input = yield* seedContinuity("dead-wait");
+      const refused = yield* orchestrator
+        .dispatch({
+          type: "thread.continuity.report",
+          commandId: CommandId.make(`${input.threadId}:dead-wait`),
+          threadId: input.threadId,
+          runId: input.run.id,
+          status: "waiting",
+          reason: "Waiting for a nonexistent owner.",
+          wait: { kind: "delegated_task", taskId: NodeId.make("nonexistent-continuity-owner") },
+        })
+        .pipe(Effect.flip);
+      assert.instanceOf(refused, Orchestrator.OrchestratorDispatchError);
+      assert.equal(
+        (yield* orchestrator.getThreadProjection(input.threadId)).thread.continuity?.status,
+        "active",
+      );
+      yield* finishRun(input.threadId, input.run);
+      yield* advance(input, "unbound");
+      assert.lengthOf((yield* orchestrator.getThreadProjection(input.threadId)).runs, 2);
+    }),
+  );
+
+  it.effect("exhaustion is visible and failure or cancellation cannot trigger blind retries", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const exhausted = yield* seedContinuity("exhaustion", 1);
+      yield* finishRun(exhausted.threadId, exhausted.run);
+      yield* advance(exhausted, "first");
+      const continuation = (yield* orchestrator.getThreadProjection(exhausted.threadId)).runs[1]!;
+      yield* finishRun(exhausted.threadId, continuation);
+      yield* advance({ ...exhausted, run: continuation }, "exhausted");
+      const blocked = yield* orchestrator.getThreadProjection(exhausted.threadId);
+      assert.lengthOf(blocked.runs, 2);
+      assert.equal(blocked.thread.continuity?.checksRemaining, 0);
+      assert.equal(blocked.thread.continuity?.status, "blocked");
+      assert.isNotEmpty(blocked.thread.continuity?.reason);
+      for (const status of ["failed", "cancelled"] as const) {
+        const input = yield* seedContinuity(status);
+        yield* finishRun(input.threadId, input.run, status);
+        yield* advance(input, status);
+        const projection = yield* orchestrator.getThreadProjection(input.threadId);
+        assert.lengthOf(projection.runs, 1);
+        assert.equal(projection.thread.continuity?.checksRemaining, 3);
+        assert.equal(projection.thread.continuity?.status, "blocked");
+      }
+    }),
+  );
+});

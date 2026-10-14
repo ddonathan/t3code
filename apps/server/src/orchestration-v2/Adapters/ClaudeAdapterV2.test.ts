@@ -6448,6 +6448,109 @@ describe("ClaudeAdapterV2 background wake turns", () => {
     ),
   );
 
+  it.effect.each([
+    [false, true],
+    [true, true],
+    [false, false],
+  ])(
+    "retires only a correlated init-only wake without losing a buffered result, bufferedResult=%s, matchesPrompt=%s",
+    ([bufferedResult, matchesPrompt]) =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const harness = yield* makeWakeHarness;
+          const now = yield* DateTime.now;
+          const start = (name: string, ordinal: number, continuation = false) =>
+            harness.runtime.startTurn(
+              makeClaudeTestTurnInput({
+                threadId: harness.threadId,
+                providerThread: harness.providerThread,
+                now,
+                attemptId: RunAttemptId.make(name),
+                providerTurnOrdinal: ordinal,
+                text: continuation ? "Background task completed." : "Consume ready work.",
+                attachments: [],
+                ...(continuation
+                  ? { messageCreatedBy: "agent", messageCreationSource: "provider" }
+                  : { messageCreatedBy: "agent", messageCreationSource: "server" }),
+              }),
+            );
+          yield* start("attempt-consumed-init-root", 1);
+          yield* harness.offerAndWait(turnOneResult);
+          yield* Queue.take(harness.terminalReceipts);
+          // Exact live shape: idle init offers a wake, but a delegated prompt
+          // reaches the same native turn before it has emitted any output.
+          yield* harness.offerAndWait(wakeTurnInit);
+          yield* Queue.take(harness.continuationReceipts);
+          if (bufferedResult) {
+            yield* harness.offerAndWait(wakeAssistant);
+            yield* harness.offerAndWait(wakeResult);
+          }
+          yield* start("attempt-consumed-init-delegated", 2);
+          if (!matchesPrompt) {
+            // Confirm the current prompt before the foreign result arrives,
+            // so it reaches the retirement guard rather than the upstream
+            // pending-prompt routing guard. The nonce must still match here.
+            yield* harness.offerAndWait(
+              claudeSdkFrame({
+                type: "system",
+                subtype: "status",
+                status: "requesting",
+                session_id: WAKE_NATIVE_SESSION,
+                user_message_uuid: harness.promptUuid(1),
+              }),
+            );
+          }
+          const echoedUuid = matchesPrompt
+            ? harness.promptUuid(1)
+            : "00000000-0000-4000-8000-000000000a12";
+          yield* harness.offerAndWait(
+            claudeSdkFrame({
+              ...makeResultFrame({
+                uuid: "00000000-0000-4000-8000-000000000a11",
+                result: "Delegated work answered.",
+                origin: { kind: "task-notification" },
+                numTurns: 26,
+              }),
+              user_message_uuid: echoedUuid,
+              user_message_uuids: [echoedUuid],
+              queued_turn_count: 0,
+            }),
+          );
+          yield* Queue.take(harness.terminalReceipts);
+          yield* start("attempt-consumed-init-continuation", 3, true);
+          // No SDK frame or extra prompt is needed to end this continuation.
+          // Starting later real work is the observable active-turn invariant:
+          // the original bug refuses it because the init-only turn stays open.
+          const next = yield* Effect.exit(start("attempt-consumed-init-next", 4));
+          if (!matchesPrompt) {
+            assert.isTrue(Exit.isFailure(next), "foreign result must not retire the pending init");
+            assert.lengthOf(harness.offeredMessages, 2);
+            assert.lengthOf(harness.terminalEvents(), 2);
+            return;
+          }
+          assert.isTrue(
+            Exit.isSuccess(next),
+            "consumed wake must release the active turn without another provider frame",
+          );
+          yield* Queue.take(harness.terminalReceipts);
+          assert.lengthOf(harness.offeredMessages, 3);
+          assert.deepEqual(
+            harness.terminalEvents().map((event) => event.status),
+            ["completed", "completed", "completed"],
+          );
+          const wakeMessages = harness.events.filter(
+            (event) => event.type === "message.updated" && event.message.text === WAKE_RESULT_TEXT,
+          );
+          assert.lengthOf(wakeMessages, bufferedResult ? 1 : 0);
+          assert.lengthOf(harness.continuationRequests, 1);
+        }).pipe(
+          Effect.provide(
+            Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+          ),
+        ),
+      ),
+  );
+
   it.effect("terminalizes an agent server wake from a positive task-notification result", () =>
     Effect.scoped(
       Effect.gen(function* () {

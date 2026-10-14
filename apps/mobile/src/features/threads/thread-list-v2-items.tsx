@@ -72,6 +72,18 @@ interface StatusLabel {
   readonly iconTintClassName: string;
 }
 const STATUS_LABEL_BY_STATUS: Partial<Record<ThreadListV2Status, StatusLabel>> = {
+  retry_scheduled: {
+    label: "Retry scheduled",
+    icon: "clock",
+    className: "text-warning-foreground",
+    iconTintClassName: "accent-warning-foreground",
+  },
+  retrying: {
+    label: "Retrying",
+    icon: "circle.dashed",
+    className: "text-adaptive-sky-600-400",
+    iconTintClassName: "accent-adaptive-sky-600-400",
+  },
   approval: {
     label: "Approval",
     icon: "exclamationmark.shield",

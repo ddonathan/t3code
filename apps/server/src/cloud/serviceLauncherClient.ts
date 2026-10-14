@@ -100,10 +100,13 @@ export class ServiceLauncherClient extends Context.Service<
   ServiceLauncherClient,
   {
     readonly managed: boolean;
-    readonly requestUpdate: (input: {
-      readonly targetVersion: string;
-      readonly dbPath: string;
-    }) => Effect.Effect<string, ServiceLauncherClientError | ServiceLauncherRejectedError>;
+    readonly requestUpdate: (
+      input: {
+        readonly targetVersion: string;
+        readonly dbPath: string;
+      },
+      onLateRejection?: (error: ServiceLauncherRejectedError) => void,
+    ) => Effect.Effect<string, ServiceLauncherClientError | ServiceLauncherRejectedError>;
     readonly prepareTrial: Effect.Effect<
       ServerSelfUpdateOutcome | undefined,
       ServiceLauncherClientError
@@ -146,10 +149,45 @@ export const make = Effect.fn("cloud.service_launcher_client.make")(function* (o
   readonly currentVersion?: string;
 }) {
   const { host, context, managed } = yield* resolveStartup(options);
+  let acceptedRequest:
+    | {
+        readonly targetVersion: string;
+        readonly reject: (error: ServiceLauncherRejectedError) => void;
+      }
+    | undefined;
+  const onLateMessage = (...args: ReadonlyArray<unknown>) => {
+    const reply = decodeServiceLauncherParentMessage(args[0]);
+    if (reply?.type !== "update-rejected" || acceptedRequest === undefined) return;
+    const request = acceptedRequest;
+    acceptedRequest = undefined;
+    request.reject(
+      new ServiceLauncherRejectedError({
+        targetVersion: request.targetVersion,
+        reason: reply.reason,
+      }),
+    );
+  };
+  const onDisconnect = () => {
+    acceptedRequest = undefined;
+  };
+  if (managed)
+    yield* Effect.acquireRelease(
+      Effect.sync(() => {
+        host.on("message", onLateMessage);
+        host.on("disconnect", onDisconnect);
+      }),
+      () =>
+        Effect.sync(() => {
+          acceptedRequest = undefined;
+          host.off("message", onLateMessage);
+          host.off("disconnect", onDisconnect);
+        }),
+    );
 
   const exchange = (
     message: ServiceLauncherChildMessage,
     accept: (reply: ServiceLauncherParentMessage) => boolean,
+    onReply?: (reply: ServiceLauncherParentMessage) => void,
   ) =>
     Effect.callback<ServiceLauncherParentMessage, ServiceLauncherClientError>((resume) => {
       if (!managed) {
@@ -172,7 +210,10 @@ export const make = Effect.fn("cloud.service_launcher_client.make")(function* (o
       };
       const onMessage = (...args: ReadonlyArray<unknown>) => {
         const reply = decodeServiceLauncherParentMessage(args[0]);
-        if (reply !== undefined && accept(reply)) settle(Effect.succeed(reply));
+        if (reply !== undefined && accept(reply)) {
+          onReply?.(reply);
+          settle(Effect.succeed(reply));
+        }
       };
       const onDisconnect = () =>
         settle(Effect.fail(new ServiceLauncherClientError({ operation: "disconnect" })));
@@ -199,10 +240,17 @@ export const make = Effect.fn("cloud.service_launcher_client.make")(function* (o
       }),
     );
 
-  const requestUpdate = (input: { readonly targetVersion: string; readonly dbPath: string }) =>
+  const requestUpdate = (
+    input: { readonly targetVersion: string; readonly dbPath: string },
+    onLateRejection?: (error: ServiceLauncherRejectedError) => void,
+  ) =>
     exchange(
       { type: "request-update", ...input },
       (reply) => reply.type === "update-accepted" || reply.type === "update-rejected",
+      (reply) => {
+        if (reply.type === "update-accepted" && onLateRejection !== undefined)
+          acceptedRequest = { targetVersion: input.targetVersion, reject: onLateRejection };
+      },
     ).pipe(
       Effect.flatMap((reply) =>
         reply.type === "update-accepted"

@@ -361,6 +361,64 @@ export const OrchestrationV2LimitRecoveryUpdate = Schema.Struct({
 );
 export type OrchestrationV2LimitRecoveryUpdate = typeof OrchestrationV2LimitRecoveryUpdate.Type;
 
+export const OrchestrationV2WorkContinuityMaxChecks = PositiveInt.check(
+  Schema.isLessThanOrEqualTo(20),
+);
+export const OrchestrationV2WorkContinuityReason = TrimmedNonEmptyString.check(
+  Schema.isMaxLength(2_000),
+);
+export const OrchestrationV2WorkContinuityWait = Schema.Union([
+  Schema.Struct({ kind: Schema.Literal("delegated_task"), taskId: NodeId }),
+  Schema.Struct({ kind: Schema.Literal("pull_request"), ...ThreadPullRequestKey.fields }),
+]);
+export type OrchestrationV2WorkContinuityWait = typeof OrchestrationV2WorkContinuityWait.Type;
+export const OrchestrationV2WorkContinuityReportStatus = Schema.Literals([
+  "continue",
+  "waiting",
+  "needs_input",
+  "complete",
+  "paused",
+  "blocked",
+]);
+export const OrchestrationV2WorkContinuity = Schema.Struct({
+  generation: CommandId,
+  authorityMessageId: MessageId,
+  checksRemaining: NonNegativeInt,
+  maxChecks: OrchestrationV2WorkContinuityMaxChecks,
+  status: Schema.Literals(["active", "waiting", "needs_input", "complete", "paused", "blocked"]),
+  reason: Schema.String.check(Schema.isMaxLength(2_000)),
+  lastReportedRunId: Schema.NullOr(RunId),
+  lastAdvancedRunId: Schema.NullOr(RunId),
+  wait: Schema.optional(Schema.NullOr(OrchestrationV2WorkContinuityWait)),
+});
+export type OrchestrationV2WorkContinuity = typeof OrchestrationV2WorkContinuity.Type;
+
+export const OrchestrationV2CapacityRecovery = Schema.Struct({
+  generation: CommandId,
+  originalRunId: RunId,
+  authorityMessageId: MessageId,
+  failedRunId: RunId,
+  providerThreadId: ProviderThreadId,
+  modelSelection: ModelSelection,
+  runtimeMode: RuntimeMode,
+  interactionMode: ProviderInteractionMode,
+  reactionsReleased: Schema.Boolean,
+  releaseCommandId: Schema.optional(Schema.NullOr(CommandId)),
+  retryRunId: Schema.NullOr(RunId),
+  attemptsUsed: NonNegativeInt.check(Schema.isLessThanOrEqualTo(3)),
+  nextAttemptAt: Schema.NullOr(Schema.DateTimeUtc),
+  status: Schema.Literals(["pending", "retrying", "complete", "exhausted", "cancelled"]),
+  reason: TrimmedNonEmptyString,
+});
+export type OrchestrationV2CapacityRecovery = typeof OrchestrationV2CapacityRecovery.Type;
+
+export const OrchestrationV2CapacityRecoveryJson = OrchestrationV2CapacityRecovery.mapFields(
+  (fields) => ({
+    ...fields,
+    nextAttemptAt: Schema.NullOr(Schema.DateTimeUtcFromString),
+  }),
+);
+
 export const OrchestrationV2AppThread = Schema.Struct({
   ...OrchestrationV2CreationFields,
   id: ThreadId,
@@ -376,6 +434,8 @@ export const OrchestrationV2AppThread = Schema.Struct({
       pre-linking servers still decode. */
   linkedPullRequest: Schema.optional(Schema.NullOr(ThreadLinkedPullRequest)),
   pullRequests: Schema.optional(Schema.Array(ThreadPullRequestLink)),
+  continuity: Schema.optional(Schema.NullOr(OrchestrationV2WorkContinuity)),
+  continuityAutoEnrollDisabled: Schema.optional(Schema.Boolean),
   /** Pull request discovered from the thread's current branch. */
   branchPullRequest: Schema.optional(Schema.NullOr(ThreadLinkedPullRequest)),
   activeProviderThreadId: Schema.NullOr(ProviderThreadId),
@@ -407,6 +467,7 @@ export const OrchestrationV2AppThread = Schema.Struct({
   /** Manual wakes restart inactivity without changing the sidebar's sort position. */
   lastSnoozeWakeAt: Schema.optional(Schema.NullOr(Schema.DateTimeUtc)),
   limitRecovery: Schema.optional(Schema.NullOr(OrchestrationV2LimitRecovery)),
+  capacityRecovery: Schema.optional(Schema.NullOr(OrchestrationV2CapacityRecovery)),
   pinnedAt: Schema.optional(Schema.NullOr(Schema.DateTimeUtc)),
   autoSettleDisabledAt: Schema.optional(Schema.NullOr(Schema.DateTimeUtc)),
   // Fractional-index slot in the user-arranged pinned order. Optional so
@@ -546,6 +607,8 @@ export const OrchestrationV2Run = Schema.Struct({
   ordinal: PositiveInt,
   providerInstanceId: ProviderInstanceId,
   modelSelection: ModelSelection,
+  runtimeMode: Schema.optional(RuntimeMode),
+  interactionMode: Schema.optional(ProviderInteractionMode),
   providerThreadId: Schema.NullOr(ProviderThreadId),
   userMessageId: MessageId,
   rootNodeId: Schema.NullOr(NodeId),
@@ -1938,6 +2001,8 @@ export const OrchestrationV2ThreadShell = Schema.Struct({
   /** Pull request the user linked to this thread (#8160). */
   linkedPullRequest: Schema.optional(Schema.NullOr(ThreadLinkedPullRequest)),
   pullRequests: Schema.optional(Schema.Array(ThreadPullRequestLink)),
+  continuity: Schema.optional(Schema.NullOr(OrchestrationV2WorkContinuity)),
+  continuityAutoEnrollDisabled: Schema.optional(Schema.Boolean),
   /** Pull request discovered from the thread's current branch. */
   branchPullRequest: Schema.optional(Schema.NullOr(ThreadLinkedPullRequest)),
   lineage: OrchestrationV2AppThreadLineage,
@@ -1994,6 +2059,7 @@ export const OrchestrationV2ThreadShell = Schema.Struct({
   snoozedUntil: Schema.optional(Schema.NullOr(Schema.DateTimeUtc)),
   snoozedAt: Schema.optional(Schema.NullOr(Schema.DateTimeUtc)),
   limitRecovery: Schema.optional(Schema.NullOr(OrchestrationV2LimitRecovery)),
+  capacityRecovery: Schema.optional(Schema.NullOr(OrchestrationV2CapacityRecovery)),
   /** Omitted by servers that predate thread pinning. */
   pinnedAt: Schema.optional(Schema.NullOr(Schema.DateTimeUtc)),
   autoSettleDisabledAt: Schema.optional(Schema.NullOr(Schema.DateTimeUtc)),
@@ -2081,6 +2147,7 @@ export type OrchestrationV2StoredEvent = typeof OrchestrationV2StoredEvent.Type;
 
 export const OrchestrationV2AppThreadJson = OrchestrationV2AppThread.mapFields((fields) => ({
   ...fields,
+  capacityRecovery: Schema.optional(Schema.NullOr(OrchestrationV2CapacityRecoveryJson)),
   createdAt: Schema.DateTimeUtcFromString,
   updatedAt: Schema.DateTimeUtcFromString,
   archivedAt: Schema.NullOr(Schema.DateTimeUtcFromString),
@@ -2501,6 +2568,7 @@ export type OrchestrationV2LatestVisibleMessageSummaryJson =
 
 export const OrchestrationV2ThreadShellJson = OrchestrationV2ThreadShell.mapFields((fields) => ({
   ...fields,
+  capacityRecovery: Schema.optional(Schema.NullOr(OrchestrationV2CapacityRecoveryJson)),
   latestRunRequestedAt: Schema.optional(Schema.NullOr(Schema.DateTimeUtcFromString)),
   latestRunStartedAt: Schema.optional(Schema.NullOr(Schema.DateTimeUtcFromString)),
   latestRunCompletedAt: Schema.optional(Schema.NullOr(Schema.DateTimeUtcFromString)),
@@ -2765,6 +2833,37 @@ export const OrchestrationV2Command = Schema.Union([
     reason: Schema.Literal("user"),
   }),
   Schema.Struct({
+    type: Schema.Literal("thread.capacity.cancel"),
+    commandId: CommandId,
+    threadId: ThreadId,
+    generation: CommandId,
+  }),
+  Schema.Struct({
+    type: Schema.Literal("thread.continuity.set"),
+    creationSource: Schema.optional(OrchestrationV2CreationSource),
+    commandId: CommandId,
+    threadId: ThreadId,
+    enabled: Schema.Boolean,
+    authorityMessageId: Schema.optional(MessageId),
+    maxChecks: Schema.optional(OrchestrationV2WorkContinuityMaxChecks),
+  }).check(
+    Schema.makeFilter(
+      (command) =>
+        !command.enabled ||
+        command.authorityMessageId !== undefined ||
+        "Enabling continuity requires authorityMessageId.",
+    ),
+  ),
+  Schema.Struct({
+    type: Schema.Literal("thread.continuity.report"),
+    commandId: CommandId,
+    threadId: ThreadId,
+    runId: RunId,
+    status: OrchestrationV2WorkContinuityReportStatus,
+    reason: OrchestrationV2WorkContinuityReason,
+    wait: Schema.optional(Schema.NullOr(OrchestrationV2WorkContinuityWait)),
+  }),
+  Schema.Struct({
     type: Schema.Literal("thread.snooze"),
     commandId: CommandId,
     threadId: ThreadId,
@@ -2944,6 +3043,7 @@ export const OrchestrationV2Command = Schema.Union([
     sourcePlanRef: Schema.optional(Schema.Struct({ threadId: ThreadId, planId: PlanId })),
     restartContinuationOfRunId: Schema.optional(RunId),
     usageLimitContinuationOfRunId: Schema.optional(RunId),
+    capacityContinuationOfRunId: Schema.optional(RunId),
     manualContinuationOfRunId: Schema.optional(RunId),
     usageLimitRecoveryRequestId: Schema.optional(CommandId),
     /** Resolve untargeted delivery against the server's serialized thread state. */
@@ -3161,6 +3261,40 @@ export type OrchestrationV2Command = typeof OrchestrationV2Command.Type;
  * send them.
  */
 const OrchestrationV2InternalCommand = Schema.Union([
+  Schema.Struct({
+    type: Schema.Literal("thread.capacity.release"),
+    commandId: CommandId,
+    threadId: ThreadId,
+    generation: CommandId,
+    runId: RunId,
+  }),
+  Schema.Struct({
+    type: Schema.Literal("thread.capacity.abort"),
+    commandId: CommandId,
+    threadId: ThreadId,
+    generation: CommandId,
+    runId: RunId,
+  }),
+  Schema.Struct({
+    type: Schema.Literal("thread.capacity.reconcile"),
+    commandId: CommandId,
+    threadId: ThreadId,
+    runId: RunId,
+  }),
+  Schema.Struct({
+    type: Schema.Literal("thread.capacity.retry"),
+    commandId: CommandId,
+    threadId: ThreadId,
+    generation: CommandId,
+  }),
+
+  Schema.Struct({
+    type: Schema.Literal("thread.continuity.advance"),
+    commandId: CommandId,
+    threadId: ThreadId,
+    endedRunId: RunId,
+    generation: CommandId,
+  }),
   /**
    * Records what a pull request watch saw, and wakes the agent in the same transaction when
    * `wake` is set. Rejected once the watch started at `startedAt` has ended, and a wake is

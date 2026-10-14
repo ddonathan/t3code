@@ -4,7 +4,7 @@ import {
   ThreadId,
   type ContextMenuItem,
 } from "@t3tools/contracts";
-import { AsyncResult } from "effect/reactivity";
+import { Atom, AsyncResult } from "effect/reactivity";
 import { beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
 import type { ThreadActionMenuId } from "../components/threadActionMenu.logic";
@@ -34,6 +34,7 @@ function recordEffect(action: string) {
   state.completed.resolve();
 }
 
+vi.mock("../lib/utils", () => ({ randomUUID: () => "continuity-test-command" }));
 vi.mock("../components/CustomSnoozeDialog", () => ({ requestCustomSnooze: vi.fn() }));
 vi.mock("react", () => ({
   useCallback: (callback: unknown) => callback,
@@ -65,7 +66,10 @@ vi.mock("../state/entities", () => ({
   useProjects: () => [{ id: "project", environmentId: "secondary" }],
 }));
 vi.mock("../state/environments", () => ({ usePrimaryEnvironmentId: () => "primary" }));
-vi.mock("../state/threads", () => ({ threadEnvironment: { updateMetadata: "metadata" } }));
+vi.mock("../state/threads", () => ({
+  threadEnvironment: { updateMetadata: "metadata", setWorkContinuity: "continuity" },
+  environmentThreadDetails: { threadAtom: () => Atom.make(null) },
+}));
 vi.mock("../state/use-atom-command", () => ({
   useAtomCommand: () => async () => {
     recordEffect("metadata");

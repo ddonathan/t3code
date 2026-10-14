@@ -23,6 +23,32 @@ const decodeServerSettingsPatch = Schema.decodeUnknownSync(ServerSettingsPatch);
 const encodeServerSettings = Schema.encodeSync(ServerSettings);
 const decodeClaudeSettings = Schema.decodeUnknownSync(ClaudeSettings);
 
+describe("model capacity recovery setting", () => {
+  it("keeps capacity recovery independent from quota recovery and disabled on old settings", () => {
+    expect(decodeServerSettings({ autoResumeLimitedThreads: true }).autoResumeCapacityThreads).toBe(
+      false,
+    );
+    expect(decodeServerSettingsPatch({ autoResumeCapacityThreads: true })).toEqual({
+      autoResumeCapacityThreads: true,
+    });
+  });
+});
+
+describe("work continuity auto enrollment", () => {
+  it("keeps automatic enrollment disabled when decoding old settings", () => {
+    expect(decodeServerSettings({}).workContinuityAutoEnroll).toBe(false);
+  });
+  it("round-trips the environment enrollment toggle without changing other settings", () => {
+    expect(decodeServerSettingsPatch({ workContinuityAutoEnroll: true })).toEqual({
+      workContinuityAutoEnroll: true,
+    });
+    expect(
+      encodeServerSettings(decodeServerSettings({ workContinuityAutoEnroll: true })),
+    ).toMatchObject({ workContinuityAutoEnroll: true });
+    expect(() => decodeServerSettingsPatch({ workContinuityAutoEnroll: "true" })).toThrow();
+  });
+});
+
 describe("ServerSettings response streaming", () => {
   it("defaults to paragraph buffering", () => {
     expect(decodeServerSettings({}).responseStreamingMode).toBe("paragraph");

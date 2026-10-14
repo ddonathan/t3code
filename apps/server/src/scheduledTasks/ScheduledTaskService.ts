@@ -396,6 +396,7 @@ export const layer = Layer.effect(
     const threadManagement = yield* ThreadManagementService.ThreadManagementService;
     const secretRequests = yield* SecretRequests.SecretRequests;
     const scheduler = yield* Scheduler.Scheduler;
+    const serviceScope = yield* Effect.scope;
     const readWebhookOrigin = yield* ScheduledTaskWebhookOrigin;
     // Webhook deliveries for one task dispatch in arrival order rather than
     // being dropped while an earlier delivery is still dispatching.
@@ -915,11 +916,16 @@ export const layer = Layer.effect(
               ? rescheduleMissedRun(task, now)
               : runTask(task, "scheduled"),
           ).pipe(
-            Effect.catch((cause) =>
-              Effect.logWarning("Scheduled task run failed", { taskId: task.id, cause }),
+            Effect.catchCause((cause) =>
+              Cause.hasInterruptsOnly(cause)
+                ? Effect.void
+                : Effect.logWarning("Scheduled task run failed", { taskId: task.id, cause }),
             ),
+            // A task keeps its own reservation until dispatch settles; the
+            // poll must release its scheduler permit even if dispatch stalls.
+            Effect.forkIn(serviceScope),
           ),
-        { concurrency: 1, discard: true },
+        { discard: true },
       );
     });
 
@@ -1368,10 +1374,6 @@ export const layer = Layer.effect(
             : [raced, permits];
         });
       });
-
-    // Detached from the request so the HTTP response does not wait for the
-    // run; scoped to the service so shutdown interrupts it.
-    const serviceScope = yield* Effect.scope;
 
     /**
      * Records one handled request on the span and in metrics. `outcome` is

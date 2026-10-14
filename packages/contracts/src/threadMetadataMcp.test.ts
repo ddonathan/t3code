@@ -1,6 +1,7 @@
 import { assert, describe, it } from "@effect/vitest";
 import * as Schema from "effect/Schema";
 
+import { CommandId } from "./baseSchemas.ts";
 import { ThreadMetadataMcpUpdateInput } from "./threadMetadataMcp.ts";
 
 const decodeUpdate = Schema.decodeUnknownSync(ThreadMetadataMcpUpdateInput);
@@ -97,4 +98,18 @@ describe("ThreadMetadataMcpUpdateInput", () => {
       );
     }
   });
+});
+
+it("requires generation only for the plain-object capacity cancellation action", () => {
+  assert.deepEqual(
+    decodeUpdate({ action: "cancel_capacity_retry", generation: "capacity:episode" }),
+    { action: "cancel_capacity_retry", generation: CommandId.make("capacity:episode") },
+  );
+  for (const input of [
+    { action: "cancel_capacity_retry" },
+    { action: "cancel_capacity_retry", generation: "capacity:episode", title: "Mixed" },
+    { action: "rename", title: "Valid", generation: "capacity:episode" },
+    { action: "regenerate_title", generation: "capacity:episode" },
+  ])
+    assert.throws(() => decodeUpdate(input));
 });

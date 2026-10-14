@@ -10,6 +10,8 @@ import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as Cause from "effect/Cause";
 import * as Config from "effect/Config";
 import * as Context from "effect/Context";
+import * as Deferred from "effect/Deferred";
+import * as Fiber from "effect/Fiber";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as HashSet from "effect/HashSet";
@@ -54,6 +56,7 @@ export class ServerSelfUpdate extends Context.Service<
         stage: ServerSelfUpdateProgressStage,
       ) => Effect.Effect<void, ServerSelfUpdateError>,
       onHandoffAccepted?: () => Effect.Effect<void>,
+      onHandoffRejected?: () => Effect.Effect<void, ServerSelfUpdateError>,
     ) => Effect.Effect<ServerSelfUpdateResult, ServerSelfUpdateError>;
     readonly commitDesktopUpdate: (
       requestId: string,
@@ -118,6 +121,7 @@ export const withRunningThreadContinuation = Effect.fn(
             Effect.sync(() => {
               handoffAccepted = true;
             }),
+          () => (prepared ? input.clear(continuationThreadIds) : Effect.void),
         )
         .pipe(
           Effect.tap((result) => {
@@ -185,6 +189,7 @@ export const make = Effect.fn("cloud.server_self_update.make")(function* () {
     yield* Config.String(CLI_RELEASE_BASE_URL_ENV).pipe(Config.option),
   );
   const inFlight = yield* Ref.make(false);
+  const scope = yield* Effect.scope;
 
   const capability: ServerSelfUpdateCapability | null =
     serverConfig.mode === "desktop" ? "desktop-managed" : launcher.managed ? "boot-service" : null;
@@ -195,7 +200,12 @@ export const make = Effect.fn("cloud.server_self_update.make")(function* () {
 
   const update: ServerSelfUpdate["Service"]["update"] = Effect.fn(
     "cloud.server_self_update.update",
-  )(function* (input, reportProgress = () => Effect.void, onHandoffAccepted = () => Effect.void) {
+  )(function* (
+    input,
+    reportProgress = () => Effect.void,
+    onHandoffAccepted = () => Effect.void,
+    onHandoffRejected = () => Effect.void,
+  ) {
     if (capability === "desktop-managed") {
       // input.targetVersion is meaningless here: the desktop app's own
       // update feed decides what it downloads, and the result carries what
@@ -220,6 +230,29 @@ export const make = Effect.fn("cloud.server_self_update.make")(function* () {
     if (yield* Ref.getAndSet(inFlight, true)) {
       return yield* failWith("A server update is already in progress.");
     }
+
+    const lateRejection =
+      yield* Deferred.make<ServiceLauncherClient.ServiceLauncherRejectedError>();
+    let handoffAccepted = false;
+    const rejectionWatcher = yield* Effect.forkIn(
+      Deferred.await(lateRejection).pipe(
+        Effect.flatMap((error) =>
+          Effect.logWarning(
+            "Service launcher rejected an accepted update; retaining current server",
+            { targetVersion: error.targetVersion, reason: error.reason },
+          ),
+        ),
+        Effect.andThen(Effect.suspend(onHandoffRejected)),
+        Effect.andThen(Ref.set(inFlight, false)),
+        Effect.catch((error) =>
+          Effect.logError(
+            "Late handoff rejection cleanup failed; further updates remain blocked",
+            error,
+          ),
+        ),
+      ),
+      scope,
+    );
 
     return yield* Effect.gen(function* () {
       yield* reportProgress("downloading");
@@ -312,17 +345,25 @@ export const make = Effect.fn("cloud.server_self_update.make")(function* () {
 
       yield* reportProgress("installing");
       const updateId = yield* Effect.uninterruptible(
-        launcher.requestUpdate({ targetVersion, dbPath: serverConfig.dbPath }).pipe(
-          Effect.mapError((error) =>
-            failWith(
-              error._tag === "ServiceLauncherRejectedError"
-                ? error.reason
-                : "Could not ask the service launcher to activate the prepared update.",
-              error,
+        launcher
+          .requestUpdate({ targetVersion, dbPath: serverConfig.dbPath }, (error) => {
+            Deferred.doneUnsafe(lateRejection, Effect.succeed(error));
+          })
+          .pipe(
+            Effect.mapError((error) =>
+              failWith(
+                error._tag === "ServiceLauncherRejectedError"
+                  ? error.reason
+                  : "Could not ask the service launcher to activate the prepared update.",
+                error,
+              ),
+            ),
+            Effect.tap(() =>
+              Effect.sync(() => {
+                handoffAccepted = true;
+              }).pipe(Effect.andThen(onHandoffAccepted())),
             ),
           ),
-          Effect.tap(() => onHandoffAccepted()),
-        ),
       );
 
       yield* Effect.logInfo("Server update prepared; handing off to the service launcher.", {
@@ -331,7 +372,13 @@ export const make = Effect.fn("cloud.server_self_update.make")(function* () {
         runtimePath: paths.entryPath,
       });
       return { targetVersion, method: "boot-service" as const, updateId };
-    }).pipe(Effect.onError(() => Ref.set(inFlight, false)));
+    }).pipe(
+      Effect.onError(() =>
+        handoffAccepted
+          ? Effect.void
+          : Fiber.interrupt(rejectionWatcher).pipe(Effect.andThen(Ref.set(inFlight, false))),
+      ),
+    );
   });
 
   return ServerSelfUpdate.of({

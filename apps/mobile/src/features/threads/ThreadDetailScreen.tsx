@@ -1,5 +1,6 @@
 import { useAtomValue } from "@effect/atom-react";
 import { useChildThreadInputs, useThreadReportedModelSelection } from "../../state/entities";
+import { CapacityRecoveryCard } from "./CapacityRecoveryCard";
 import { UsageLimitRecoveryCard } from "./UsageLimitRecoveryCard";
 import { useNavigation } from "@react-navigation/native";
 import type { WorktreeSetupCardProps } from "./worktree-setup-card";
@@ -1294,6 +1295,11 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
                       />
                     </Animated.View>
                   ) : null}
+                  <CapacityRecoveryCard
+                    key={props.selectedThread.capacityRecovery?.generation}
+                    thread={props.selectedThread}
+                    environmentId={props.environmentId}
+                  />
                   <UsageLimitRecoveryCard
                     key={props.selectedThread.latestRun?.runId}
                     thread={props.selectedThread}

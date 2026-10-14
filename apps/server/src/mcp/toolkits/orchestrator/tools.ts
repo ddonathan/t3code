@@ -1,5 +1,7 @@
 import {
   OrchestratorMcpCapabilitiesResult,
+  OrchestratorMcpWorkContinuityInput,
+  OrchestratorMcpWorkContinuityResult,
   OrchestrationV2StopWorkflowInput,
   OrchestratorMcpCreateThreadsInput,
   OrchestratorMcpCreateThreadsResult,
@@ -192,7 +194,7 @@ export const CreateThreadsTool = Tool.make("create_threads", {
 
 const ThreadListTool = Tool.make("t3_thread_list", {
   description:
-    "List T3 threads in a project, newest first. Omit projectId for the calling thread's project. Filter by durable run status, title, or settled state (settled=true lists threads the user or auto-settlement moved out of the active list), or snoozed state, and paginate with the returned cursor. A snoozed thread wakes early when it asks for something, fails, or completes. To link a thread for the user, write `[title](t3-thread://v1/<threadId>)` with the threadId exactly as returned, not URL-encoded; T3 Code shows the thread's current title.",
+    "List T3 threads in a project, newest first. Omit projectId for the calling thread's project. Filter by effective execution status, title, or settled state (settled=true lists threads the user or auto-settlement moved out of the active list), or snoozed state, and paginate with the returned cursor. Status describes execution, not completion of the user's objective. An owned deadline-backed capacityRecovery reports waiting while runStatus preserves the failed attempt; stale recovery records do not establish active work. goal is the active provider thread's reported native goal, or null when that thread reports none; older servers may omit it. An active goal does not by itself prove work is running. goalTextTruncated flags clipped list summaries; use t3_thread_read for full goal text. A snoozed thread wakes early when it asks for something, fails, or completes. To link a thread for the user, write `[title](t3-thread://v1/<threadId>)` with the threadId exactly as returned, not URL-encoded; T3 Code shows the thread's current title.",
   parameters: OrchestratorMcpThreadListInput,
   success: OrchestratorMcpThreadListResult,
   failure: OrchestratorMcpFailure,
@@ -206,7 +208,7 @@ const ThreadListTool = Tool.make("t3_thread_list", {
 
 const ThreadReadTool = Tool.make("t3_thread_read", {
   description:
-    "Read durable state and a paginated timeline from any T3 thread in this environment. The default messages view returns user messages, assistant messages, and proposed plans; activity returns all summarized timeline items. Reading an untruncated terminal assistant result from this parent thread's direct app-owned child acknowledges that child's automatic completion delivery. Continue with afterPosition=nextPosition. Recover long item text with itemId and textOffset=nextTextOffset until nextTextOffset is null; offsets count UTF-16 code units. The thread also reports its snooze state. To link a thread for the user, write `[title](t3-thread://v1/<threadId>)` with the threadId exactly as returned, not URL-encoded; T3 Code shows the thread's current title.",
+    "Read durable state and a paginated timeline from any T3 thread in this environment. The default messages view returns user messages, assistant messages, and proposed plans; activity returns all summarized timeline items. Reading an untruncated terminal assistant result from this parent thread's direct app-owned child acknowledges that child's automatic completion delivery. Continue with afterPosition=nextPosition. Recover long item text with itemId and textOffset=nextTextOffset until nextTextOffset is null; offsets count UTF-16 code units. The thread also reports its snooze state. Status describes execution, not completion of the user's objective. An owned deadline-backed capacityRecovery reports waiting while runStatus preserves the failed attempt; stale recovery records do not establish active work. goal is the active provider thread's reported native goal, or null when that thread reports none; older servers may omit it. Check activeRunId and pending work before claiming an active goal is running. To link a thread for the user, write `[title](t3-thread://v1/<threadId>)` with the threadId exactly as returned, not URL-encoded; T3 Code shows the thread's current title.",
   parameters: OrchestratorMcpThreadReadInput,
   success: OrchestratorMcpThreadReadResult,
   failure: OrchestratorMcpFailure,
@@ -222,7 +224,7 @@ const ThreadReadTool = Tool.make("t3_thread_read", {
 
 export const ThreadUpdateTool = Tool.make("t3_thread_update", {
   description:
-    "Update metadata for a thread. Omit threadId to update this thread. Use action='rename' with title, action='regenerate_title' with no extra field, action='link_pull_request' with pullRequest, or action='unlink_pull_request'. Workspace and branch changes are intentionally not supported. clientRequestId makes retries idempotent.",
+    "Update metadata for a thread. Omit threadId to update this thread. Use action='rename' with title, action='regenerate_title' with no extra field, action='link_pull_request' with pullRequest, action='unlink_pull_request', or action='cancel_capacity_retry' with generation from thread read/list. Cancellation stops only that pending capacity episode, leaves any current or newer human run alone, and reports capacityCancellation plus current capacityRecovery. not_pending means a retry already started or the episode otherwise closed; no cancellation is claimed. Workspace and branch changes are intentionally not supported. clientRequestId makes retries idempotent.",
   parameters: ThreadMetadataMcpUpdateInput,
   success: ThreadMetadataMcpUpdateResult,
   failure: OrchestratorMcpFailure,
@@ -248,7 +250,7 @@ const ThreadSendTool = Tool.make("t3_thread_send", {
 
 const ThreadWaitTool = Tool.make("t3_thread_wait", {
   description:
-    "Wait for a T3 thread run to reach a terminal durable state. Without runId, the latest run at call time is selected; an idle thread returns immediately. Timeout does not interrupt work, so call again or use t3_thread_read/list after timedOut=true. Waiting reports status only and does not acknowledge a delegated result.",
+    "Wait for a T3 thread run and its owned model-capacity retry chain to reach a terminal durable state. Without runId, the latest run at call time is selected; an idle thread returns immediately. A current deadline-backed capacityRecovery keeps waiting and follows the actual active retry within the same timeout. status is waiting during that hold, runStatus preserves the actual failed attempt, and capacityRecovery identifies the retry owner; stale or deadline-less records do not extend the wait. Timeout does not interrupt work, so call again or use t3_thread_read/list after timedOut=true. Waiting reports status only and does not acknowledge a delegated result.",
   parameters: OrchestratorMcpThreadWaitInput,
   success: OrchestratorMcpThreadWaitResult,
   failure: OrchestratorMcpFailure,
@@ -272,6 +274,16 @@ const ThreadInterruptTool = Tool.make("t3_thread_interrupt", {
   .annotate(Tool.Title, "Interrupt a T3 thread")
   .annotate(Tool.Destructive, true);
 
+const WorkContinuityTool = Tool.make("t3_work_continuity", {
+  description:
+    "Enable or disable bounded, durable supervision of an existing user-authorized assignment in the calling thread, or report its current disposition. All actions are restricted to the calling thread; OAuth clients without a calling thread must use the client controls. Enable requires the id of a real user authority message, with maxChecks defaulting to 3 (1–20). It grants no new scope and does not create or resume a native goal. Report requires the active runId; reports for another thread or a stale run are rejected. Report continue while keeping authorized work moving; use waiting only with a registered delegated_task or pull_request dependency. Missing reports at completion trigger a bounded continuation check. Complete is the agent's judgment, not independent acceptance. Stop clears supervision. Use clientRequestId to retry safely. Read/list continuity exposes current disposition and remaining checks separately from execution status.",
+  parameters: OrchestratorMcpWorkContinuityInput,
+  success: OrchestratorMcpWorkContinuityResult,
+  failure: OrchestratorMcpFailure,
+  failureMode: "return",
+  dependencies,
+}).annotate(Tool.Title, "Manage work continuity");
+
 export const OrchestratorToolkit = Toolkit.make(
   OrchestratorCapabilitiesTool,
   DelegateTaskTool,
@@ -290,4 +302,5 @@ export const OrchestratorToolkit = Toolkit.make(
   ThreadSendTool,
   ThreadWaitTool,
   ThreadInterruptTool,
+  WorkContinuityTool,
 );

@@ -72,6 +72,23 @@ describe("branding", () => {
 });
 
 describe("branding logic", () => {
+  it("keeps local continuity servers on Nightly without matching unrelated suffixes", () => {
+    expect(
+      resolveServerBackedAppDisplayName({
+        baseName: "T3 Code",
+        fallbackDisplayName: "T3 Code (Alpha)",
+        fallbackStageLabel: "Alpha",
+        primaryServerVersion: "0.0.46-nightly.20261013.3053.continuity.45",
+      }),
+    ).toBe("T3 Code (Nightly)");
+    expect(
+      resolveServerBackedAppStageLabel({
+        primaryServerVersion: "0.0.46-nightly.20261013.3053.other.45",
+        fallbackStageLabel: "Alpha",
+      }),
+    ).toBe("Alpha");
+  });
+
   it("returns Nightly for nightly primary server versions", () => {
     expect(
       resolveServerBackedAppStageLabel({

@@ -30,20 +30,6 @@ const EMPTY_THREAD_REFS_BY_PROJECT: ReadonlyMap<
   ReadonlyArray<ScopedThreadRef>
 > = new Map();
 
-// An async question outlives the subagent's run, but once that run ends the
-// parent is no longer waiting on the answer, so it stops counting as input.
-// The activity run stays set when a follow-up is queued behind a blocked run;
-// older servers omit it, so fall back to the latest run's status.
-const isChildRunLive = (
-  thread: Pick<OrchestrationV2ThreadShell, "activityRunStatus" | "status">,
-) =>
-  thread.activityRunStatus !== undefined
-    ? thread.activityRunStatus !== null
-    : thread.status === "preparing" ||
-      thread.status === "starting" ||
-      thread.status === "running" ||
-      thread.status === "waiting";
-
 export function createEnvironmentThreadShellAtoms(input: {
   readonly catalogValueAtom: Atom.Atom<EnvironmentCatalogState>;
   readonly snapshotAtom: (
@@ -86,6 +72,51 @@ export function createEnvironmentThreadShellAtoms(input: {
       return new Map(threads.map((thread) => [thread.id, thread] as const));
     }).pipe(Atom.withLabel(`environment-thread-index:${environmentId}`)),
   );
+
+  const environmentChildInputAncestorsAtom = Atom.family((environmentId: EnvironmentId) =>
+    Atom.make((get): ReadonlySet<ThreadId> => {
+      const threads = get(environmentThreadIndexAtom(environmentId));
+      const ancestors = new Set<ThreadId>();
+      for (const child of threads.values()) {
+        if (
+          child.archivedAt !== null ||
+          child.pendingRuntimeRequest?.kind !== "user_input" ||
+          isProviderNativeSubagentThread(child)
+        )
+          continue;
+        let current = child;
+        const seen = new Set<ThreadId>([child.id]);
+        while (current.lineage.relationshipToParent === "subagent") {
+          const parentId = current.lineage.parentThreadId;
+          if (parentId === null || seen.has(parentId)) break;
+          seen.add(parentId);
+          const parent = threads.get(parentId);
+          if (parent === undefined || parent.archivedAt !== null) break;
+          ancestors.add(parentId);
+          current = parent;
+        }
+      }
+      return ancestors;
+    }).pipe(Atom.withLabel(`environment-child-input-ancestors:${environmentId}`)),
+  );
+
+  const inputListShells = new WeakMap<EnvironmentThreadShell, EnvironmentThreadShell>();
+  // List attention includes hidden descendants. Point reads keep the parent's own
+  // request state so its composer still offers the child question's navigation.
+  const listThread = (
+    environmentId: EnvironmentId,
+    source: OrchestrationV2ThreadShell,
+    childInputAncestors: ReadonlySet<ThreadId>,
+  ) => {
+    const thread = scopedThread(environmentId, source);
+    if (thread.hasPendingUserInput || !childInputAncestors.has(source.id)) return thread;
+    let withChildInput = inputListShells.get(thread);
+    if (withChildInput === undefined) {
+      withChildInput = { ...thread, hasPendingUserInput: true };
+      inputListShells.set(thread, withChildInput);
+    }
+    return withChildInput;
+  };
 
   const environmentThreadRefsAtom = Atom.family((environmentId: EnvironmentId) => {
     let previous: ReadonlyArray<ScopedThreadRef> = [];
@@ -177,7 +208,6 @@ export function createEnvironmentThreadShellAtoms(input: {
           pending.push(child.id);
           if (
             child.pendingRuntimeRequest?.kind === "user_input" &&
-            isChildRunLive(child) &&
             !isProviderNativeSubagentThread(child)
           ) {
             next.push(scopedThread(ref.environmentId, child));
@@ -219,7 +249,13 @@ export function createEnvironmentThreadShellAtoms(input: {
           seen.add(key);
           const thread = threads.get(ref.threadId);
           if (thread !== undefined) {
-            next.push(scopedThread(ref.environmentId, thread));
+            next.push(
+              listThread(
+                ref.environmentId,
+                thread,
+                get(environmentChildInputAncestorsAtom(ref.environmentId)),
+              ),
+            );
           }
         }
       }
@@ -248,8 +284,9 @@ export function createEnvironmentThreadShellAtoms(input: {
   const threadShellsAtom = Atom.make((get) => {
     const next: EnvironmentThreadShell[] = [];
     for (const environmentId of enabledEnvironmentIds(get(input.catalogValueAtom))) {
+      const childInputAncestors = get(environmentChildInputAncestorsAtom(environmentId));
       for (const thread of get(environmentThreadsAtom(environmentId))) {
-        next.push(scopedThread(environmentId, thread));
+        next.push(listThread(environmentId, thread, childInputAncestors));
       }
     }
     if (arrayElementsEqual(previousThreadShells, next)) {
@@ -263,10 +300,11 @@ export function createEnvironmentThreadShellAtoms(input: {
   const navigationThreadShellsAtom = Atom.make((get) => {
     const next: EnvironmentThreadShell[] = [];
     for (const environmentId of enabledEnvironmentIds(get(input.catalogValueAtom))) {
+      const childInputAncestors = get(environmentChildInputAncestorsAtom(environmentId));
       for (const thread of get(environmentThreadsAtom(environmentId))) {
         if (thread.archivedAt !== null || thread.lineage.relationshipToParent === "subagent")
           continue;
-        next.push(scopedThread(environmentId, thread));
+        next.push(listThread(environmentId, thread, childInputAncestors));
       }
     }
     if (arrayElementsEqual(previousNavigationShells, next)) return previousNavigationShells;

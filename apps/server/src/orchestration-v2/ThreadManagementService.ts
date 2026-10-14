@@ -64,6 +64,8 @@ export function withCreationProvenance(
   provenance: ThreadManagementProvenance,
 ): OrchestrationV2Command {
   switch (command.type) {
+    case "thread.continuity.set":
+      return { ...command, creationSource: provenance.creationSource };
     case "thread.create":
     case "message.dispatch":
     case "thread.fork":
@@ -151,6 +153,8 @@ export interface ThreadManagementWaitInput {
 export interface ThreadManagementWaitResult {
   readonly threadId: ThreadId;
   readonly run: OrchestrationV2Run | null;
+  readonly status: OrchestrationV2ThreadShell["status"];
+  readonly capacityRecovery: NonNullable<OrchestrationV2ThreadShell["capacityRecovery"]> | null;
   readonly timedOut: boolean;
 }
 
@@ -466,6 +470,29 @@ export function isActiveRun(run: OrchestrationV2Run): boolean {
     run.status === "running" ||
     run.status === "waiting"
   );
+}
+
+export function capacityRecoveryDisposition(
+  recovery: OrchestrationV2ThreadShell["capacityRecovery"],
+  latestRunId: OrchestrationV2ThreadShell["latestRunId"],
+  activeRunId: OrchestrationV2ThreadShell["activeRunId"],
+  status: OrchestrationV2ThreadShell["status"],
+): "pending" | "retrying" | null {
+  if (
+    recovery == null ||
+    (latestRunId !== recovery.failedRunId && latestRunId !== recovery.retryRunId)
+  )
+    return null;
+  if (recovery.status === "pending" && recovery.nextAttemptAt !== null && status === "failed")
+    return "pending";
+  if (
+    recovery.status === "retrying" &&
+    recovery.retryRunId !== null &&
+    activeRunId === recovery.retryRunId &&
+    ["preparing", "starting", "running", "waiting"].includes(status)
+  )
+    return "retrying";
+  return null;
 }
 
 export function isTerminalRunStatus(
@@ -825,8 +852,6 @@ const make = Effect.gen(function* () {
           threadId: input.threadId,
           cause,
         });
-      // Taken before the first read, so a run update between that read and
-      // the subscription below still replays.
       const afterSequence = yield* orchestrator
         .getThreadEventSequence(input.threadId)
         .pipe(Effect.mapError(loadError));
@@ -842,67 +867,119 @@ const make = Effect.gen(function* () {
         });
       }
       if (selectedRun === undefined) {
-        return { threadId: input.threadId, run: null, timedOut: false };
-      }
-      if (isTerminalRunStatus(selectedRun.status)) {
-        return { threadId: input.threadId, run: selectedRun, timedOut: false };
-      }
-
-      // Re-read the run only when the thread records a run update or its
-      // deletion, instead of polling the projection for up to an hour. Each
-      // stream keeps one event type, so transcript events never fill its buffer.
-      const wait = Stream.merge(
-        orchestrator.streamStoredEventsFrom({
+        return {
           threadId: input.threadId,
-          afterSequence,
-          eventType: "run.updated",
-        }),
-        orchestrator.streamStoredEventsFrom({
-          threadId: input.threadId,
-          afterSequence,
-          eventType: "thread.deleted",
-        }),
-      ).pipe(
-        Stream.mapError(loadError),
-        Stream.filter(
-          (stored) =>
-            stored.event.type !== "run.updated" || stored.event.payload.id === selectedRun.id,
-        ),
-        Stream.mapEffect(() =>
-          getProjectThreadRecords(input, ["runs"], { runIds: [selectedRun.id] }).pipe(
-            Effect.flatMap((current) => {
-              const run = current.runs.find((candidate) => candidate.id === selectedRun.id);
-              return run === undefined
-                ? Effect.fail(
-                    new ThreadManagementRunNotFoundError({
-                      threadId: input.threadId,
-                      runId: selectedRun.id,
-                    }),
-                  )
-                : Effect.succeed(run);
-            }),
-          ),
-        ),
-        Stream.filter((run) => isTerminalRunStatus(run.status)),
-        Stream.runHead,
-        Effect.timeoutOption(Duration.millis(Math.max(1, input.timeoutMs))),
-      );
-      const waited = Option.flatten(yield* wait);
-      if (Option.isSome(waited)) {
-        return { threadId: input.threadId, run: waited.value, timedOut: false };
+          run: null,
+          status: "idle" as const,
+          capacityRecovery: target.thread.capacityRecovery ?? null,
+          timedOut: false,
+        };
       }
-      const current = yield* getProjectThreadRecords(input, ["runs"], { runIds: [selectedRun.id] });
-      const run = current.runs.find((candidate) => candidate.id === selectedRun.id);
-      if (run === undefined) {
-        return yield* new ThreadManagementRunNotFoundError({
-          threadId: input.threadId,
-          runId: selectedRun.id,
+      let trackedRunId = selectedRun.id;
+      let recoveryGeneration: CommandId | undefined;
+      const outcome = (current: ProjectionRecords<"runs">) =>
+        Effect.gen(function* () {
+          let run = current.runs.find((candidate) => candidate.id === trackedRunId);
+          if (run === undefined)
+            return yield* new ThreadManagementRunNotFoundError({
+              threadId: input.threadId,
+              runId: trackedRunId,
+            });
+          const recovery = current.thread.capacityRecovery ?? null;
+          const latest = latestRun(current);
+          const active = latestActiveRun(current);
+          const disposition = capacityRecoveryDisposition(
+            recovery,
+            latest?.id ?? null,
+            active?.id ?? null,
+            active?.status ?? latest?.status ?? "idle",
+          );
+          const followsRecovery =
+            recovery !== null &&
+            (disposition !== null || recoveryGeneration !== undefined) &&
+            (recoveryGeneration === undefined || recovery.generation === recoveryGeneration) &&
+            (latest?.id === recovery.failedRunId || latest?.id === recovery.retryRunId) &&
+            [recovery.originalRunId, recovery.failedRunId, recovery.retryRunId].includes(
+              trackedRunId,
+            );
+          const ownsRecovery = disposition !== null && followsRecovery;
+          if (followsRecovery && recovery !== null) {
+            recoveryGeneration = recovery.generation;
+            // A retry can finish before its creation/update reaches this waiter.
+            // Keep following its durable owner after the record becomes terminal.
+            const nextRunId =
+              recovery.status === "pending"
+                ? recovery.failedRunId
+                : (recovery.retryRunId ?? recovery.failedRunId);
+            const nextRun = current.runs.find((candidate) => candidate.id === nextRunId);
+            if (nextRun !== undefined) {
+              trackedRunId = nextRun.id;
+              run = nextRun;
+            }
+          }
+          return {
+            threadId: input.threadId,
+            run,
+            status: ownsRecovery && disposition === "pending" ? ("waiting" as const) : run.status,
+            capacityRecovery: recovery,
+            timedOut: ownsRecovery || !isTerminalRunStatus(run.status),
+          };
         });
-      }
-      // The run may have reached a terminal status while the timeout was
-      // winning the race; the final projection read decides what actually
-      // happened, so only a still-active run counts as timed out.
-      return { threadId: input.threadId, run, timedOut: !isTerminalRunStatus(run.status) };
+      const initial = yield* outcome(target);
+      if (!initial.timedOut) return initial;
+
+      // Subscribe before re-reading every relevant durable transition. Capacity
+      // metadata and retry creation can move ownership without updating the failed run.
+      const events = Stream.merge(
+        Stream.merge(
+          orchestrator.streamStoredEventsFrom({
+            threadId: input.threadId,
+            afterSequence,
+            eventType: "run.updated",
+          }),
+          orchestrator.streamStoredEventsFrom({
+            threadId: input.threadId,
+            afterSequence,
+            eventType: "thread.deleted",
+          }),
+        ),
+        Stream.merge(
+          orchestrator.streamStoredEventsFrom({
+            threadId: input.threadId,
+            afterSequence,
+            eventType: "thread.metadata-updated",
+          }),
+          orchestrator.streamStoredEventsFrom({
+            threadId: input.threadId,
+            afterSequence,
+            eventType: "run.created",
+          }),
+        ),
+      );
+      const waited = Option.flatten(
+        yield* events.pipe(
+          Stream.mapError(loadError),
+          Stream.filter(
+            (stored) =>
+              stored.event.type === "thread.deleted" ||
+              (stored.event.type === "run.updated" &&
+                (stored.event.payload.id === trackedRunId || recoveryGeneration !== undefined)) ||
+              (stored.event.type === "run.created" && recoveryGeneration !== undefined) ||
+              (stored.event.type === "thread.metadata-updated" &&
+                (recoveryGeneration !== undefined || "capacityRecovery" in stored.event.payload)),
+          ),
+          Stream.mapEffect(() =>
+            getProjectThreadRecords(input, ["runs"]).pipe(Effect.flatMap(outcome)),
+          ),
+          Stream.filter((result) => !result.timedOut),
+          Stream.runHead,
+          Effect.timeoutOption(Duration.millis(Math.max(1, input.timeoutMs))),
+        ),
+      );
+      if (Option.isSome(waited)) return waited.value;
+      // A timeout can race the final terminal event; current durable ownership
+      // decides whether this is still waiting, while run preserves raw failure evidence.
+      return yield* getProjectThreadRecords(input, ["runs"]).pipe(Effect.flatMap(outcome));
     });
 
   const settleAfterRun: ThreadManagementServiceShape["settleAfterRun"] = Effect.fn(

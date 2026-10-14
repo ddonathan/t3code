@@ -5,6 +5,8 @@ import {
   NodeId,
   type OrchestrationV2Command,
   type OrchestrationV2Run,
+  type OrchestrationV2CapacityRecovery,
+  EventId,
   type OrchestrationV2Subagent,
   type OrchestrationV2ProviderThread,
   ProviderThreadId,
@@ -40,6 +42,7 @@ import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter"
 import * as ThreadManagementService from "./ThreadManagementService.ts";
 import * as ThreadCommandExecutor from "./ThreadCommandExecutor.ts";
 import { DispatchModeLimit, type DispatchModeRefusal } from "./DispatchModeLimit.ts";
+import { idleThreadProjection, liveThreadShell } from "../mcp/McpToolAccess.testkit.ts";
 
 it("stamps authoritative provenance on commands that create threads or messages", () => {
   const command: OrchestrationV2Command = {
@@ -70,6 +73,46 @@ it("stamps authoritative provenance on commands that create threads or messages"
     creationSource: "web",
   });
 });
+
+it("client provenance cannot grant capacity continuation the agent identity", () => {
+  const command: OrchestrationV2Command = {
+    type: "message.dispatch",
+    createdBy: "agent",
+    creationSource: "server",
+    commandId: CommandId.make("spoofed-capacity-command"),
+    threadId: ThreadId.make("spoofed-capacity-thread"),
+    messageId: MessageId.make("spoofed-capacity-message"),
+    text: "Continue",
+    attachments: [],
+    capacityContinuationOfRunId: RunId.make("failed-capacity-run"),
+    dispatchMode: { type: "start_immediately" },
+  };
+  expect(
+    ThreadManagementService.withCreationProvenance(command, {
+      createdBy: "user",
+      creationSource: "server",
+    }),
+  ).toMatchObject({ createdBy: "user", creationSource: "server" });
+});
+
+it.each([undefined, "mcp"] as const)(
+  "client intake stamps continuity control provenance over legacy or supplied %s origin",
+  (creationSource) => {
+    const command: OrchestrationV2Command = {
+      type: "thread.continuity.set",
+      commandId: CommandId.make("continuity-provenance"),
+      threadId: ThreadId.make("continuity-provenance"),
+      enabled: false,
+      ...(creationSource === undefined ? {} : { creationSource }),
+    };
+    expect(
+      ThreadManagementService.withCreationProvenance(command, {
+        createdBy: "user",
+        creationSource: "mobile",
+      }),
+    ).toMatchObject({ creationSource: "mobile" });
+  },
+);
 
 it("leaves commands that do not create durable authored content unchanged", () => {
   const command: OrchestrationV2Command = {
@@ -571,6 +614,339 @@ it.effect("preserves failed legacy materialization when reading checkpoint conte
     expect(error).toMatchObject({ threadId, cause: importError });
   }).pipe(Effect.provide(layerTest));
 });
+
+function capacityWaitFixture(now: DateTime.Utc) {
+  const threadId = ThreadId.make("thread:capacity-wait");
+  const shell = liveThreadShell(threadId, { activeRunId: null });
+  const run: OrchestrationV2Run = {
+    id: RunId.make("run:capacity-wait:failed"),
+    threadId,
+    ordinal: 1,
+    providerInstanceId: shell.providerInstanceId,
+    modelSelection: shell.modelSelection,
+    providerThreadId: ProviderThreadId.make("provider-thread:capacity-wait"),
+    userMessageId: MessageId.make("message:capacity-wait:authority"),
+    rootNodeId: null,
+    activeAttemptId: null,
+    status: "failed",
+    requestedAt: now,
+    startedAt: now,
+    completedAt: now,
+    checkpointId: null,
+    contextHandoffId: null,
+  };
+  const recovery: OrchestrationV2CapacityRecovery = {
+    generation: CommandId.make("capacity-wait:generation"),
+    originalRunId: run.id,
+    authorityMessageId: run.userMessageId,
+    failedRunId: run.id,
+    retryRunId: null,
+    providerThreadId: ProviderThreadId.make("provider-thread:capacity-wait"),
+    modelSelection: shell.modelSelection,
+    runtimeMode: "full-access",
+    interactionMode: "default",
+    reactionsReleased: false,
+    attemptsUsed: 0,
+    nextAttemptAt: DateTime.add(now, { seconds: 15 }),
+    status: "pending",
+    reason: "Waiting for model capacity.",
+  };
+  return {
+    run,
+    recovery,
+    projection: {
+      ...idleThreadProjection(shell),
+      thread: { ...idleThreadProjection(shell).thread, capacityRecovery: recovery },
+      runs: [run],
+    },
+  };
+}
+
+it.effect.each(["pending", "retrying"] as const)(
+  "waitForThread keeps %s owned capacity work inside its original timeout",
+  (phase) =>
+    Effect.gen(function* () {
+      const fixture = capacityWaitFixture(yield* DateTime.now);
+      const retry: OrchestrationV2Run = {
+        ...fixture.run,
+        id: RunId.make("capacity-wait:active-retry"),
+        ordinal: 2,
+        status: "running",
+        completedAt: null,
+      };
+      const projection =
+        phase === "pending"
+          ? fixture.projection
+          : {
+              ...fixture.projection,
+              thread: {
+                ...fixture.projection.thread,
+                capacityRecovery: {
+                  ...fixture.recovery,
+                  status: "retrying" as const,
+                  retryRunId: retry.id,
+                  attemptsUsed: 1,
+                  nextAttemptAt: null,
+                },
+              },
+              runs: [fixture.run, retry],
+            };
+      const read = yield* Deferred.make<void>();
+      const layer = ThreadManagementService.layer.pipe(
+        Layer.provide(Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({})),
+        Layer.provide(
+          Layer.mock(Orchestrator.OrchestratorV2)({
+            getThreadEventSequence: () => Effect.succeed(0),
+            streamStoredEventsFrom: () => Stream.never,
+            getThreadRecords: () => Deferred.succeed(read, undefined).pipe(Effect.as(projection)),
+          }),
+        ),
+        Layer.provide(ServerSettings.layerTest()),
+        Layer.provide(layerReceiptsTest),
+      );
+      const service = yield* ThreadManagementService.ThreadManagementService.pipe(
+        Effect.provide(layer),
+      );
+      const fiber = yield* service
+        .waitForThread({
+          projectId: fixture.projection.thread.projectId,
+          threadId: fixture.run.threadId,
+          runId: fixture.run.id,
+          timeoutMs: 1,
+        })
+        .pipe(Effect.forkChild);
+      yield* Deferred.await(read);
+      yield* TestClock.adjust(Duration.millis(1));
+      const result = yield* Fiber.join(fiber);
+      expect(result).toMatchObject({
+        status: phase === "pending" ? "waiting" : "running",
+        timedOut: true,
+        run:
+          phase === "pending"
+            ? { id: fixture.run.id, status: "failed" }
+            : { id: retry.id, status: "running" },
+        capacityRecovery: projection.thread.capacityRecovery,
+      });
+    }),
+);
+
+it.effect.each(["no-deadline", "superseded", "inactive-retry", "cancelled"] as const)(
+  "waitForThread does not extend a failed run for %s capacity evidence",
+  (scenario) =>
+    Effect.gen(function* () {
+      const fixture = capacityWaitFixture(yield* DateTime.now);
+      const later = { ...fixture.run, id: RunId.make("capacity-wait:new-human"), ordinal: 2 };
+      const recovery =
+        scenario === "no-deadline"
+          ? { ...fixture.recovery, nextAttemptAt: null }
+          : scenario === "inactive-retry"
+            ? { ...fixture.recovery, status: "retrying" as const, retryRunId: later.id }
+            : scenario === "cancelled"
+              ? { ...fixture.recovery, status: "cancelled" as const }
+              : fixture.recovery;
+      const projection = {
+        ...fixture.projection,
+        thread: { ...fixture.projection.thread, capacityRecovery: recovery },
+        runs:
+          scenario === "superseded" || scenario === "inactive-retry"
+            ? [fixture.run, later]
+            : [fixture.run],
+      };
+      const layer = ThreadManagementService.layer.pipe(
+        Layer.provide(Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({})),
+        Layer.provide(
+          Layer.mock(Orchestrator.OrchestratorV2)({
+            getThreadEventSequence: () => Effect.succeed(0),
+            streamStoredEventsFrom: () =>
+              Stream.die("Invalid recovery must not subscribe or wait."),
+            getThreadRecords: () => Effect.succeed(projection),
+          }),
+        ),
+        Layer.provide(ServerSettings.layerTest()),
+        Layer.provide(layerReceiptsTest),
+      );
+      const service = yield* ThreadManagementService.ThreadManagementService.pipe(
+        Effect.provide(layer),
+      );
+      const result = yield* service.waitForThread({
+        projectId: projection.thread.projectId,
+        threadId: fixture.run.threadId,
+        runId: fixture.run.id,
+        timeoutMs: 1,
+      });
+      expect(result).toMatchObject({
+        status: "failed",
+        timedOut: false,
+        run: { id: fixture.run.id, status: "failed" },
+      });
+    }),
+);
+
+it.effect("waitForThread ends a capacity hold when durable cancellation metadata arrives", () =>
+  Effect.gen(function* () {
+    const now = yield* DateTime.now;
+    const fixture = capacityWaitFixture(now);
+    const subscribed = yield* Deferred.make<void>();
+    const events = yield* Queue.unbounded<OrchestrationV2StoredEvent>();
+    let current = fixture.projection;
+    const layer = ThreadManagementService.layer.pipe(
+      Layer.provide(Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({})),
+      Layer.provide(
+        Layer.mock(Orchestrator.OrchestratorV2)({
+          getThreadEventSequence: () => Effect.succeed(0),
+          streamStoredEventsFrom: (input) =>
+            input?.eventType === "thread.metadata-updated"
+              ? Stream.fromEffect(Deferred.succeed(subscribed, undefined)).pipe(
+                  Stream.drain,
+                  Stream.concat(Stream.fromQueue(events)),
+                )
+              : Stream.never,
+          getThreadRecords: () => Effect.succeed(current),
+        }),
+      ),
+      Layer.provide(ServerSettings.layerTest()),
+      Layer.provide(layerReceiptsTest),
+    );
+    const service = yield* ThreadManagementService.ThreadManagementService.pipe(
+      Effect.provide(layer),
+    );
+    const fiber = yield* service
+      .waitForThread({
+        projectId: current.thread.projectId,
+        threadId: fixture.run.threadId,
+        runId: fixture.run.id,
+        timeoutMs: 60_000,
+      })
+      .pipe(Effect.forkChild);
+    yield* Deferred.await(subscribed);
+    current = {
+      ...fixture.projection,
+      thread: {
+        ...fixture.projection.thread,
+        capacityRecovery: { ...fixture.recovery, status: "cancelled", nextAttemptAt: null },
+      },
+    };
+    yield* Queue.offer(events, {
+      sequence: 1,
+      commandId: null,
+      event: {
+        id: EventId.make("capacity-wait-cancelled"),
+        type: "thread.metadata-updated",
+        threadId: fixture.run.threadId,
+        occurredAt: now,
+        payload: current.thread,
+      },
+    });
+    expect(yield* Fiber.join(fiber)).toMatchObject({
+      status: "failed",
+      timedOut: false,
+      run: { id: fixture.run.id, status: "failed" },
+      capacityRecovery: { status: "cancelled" },
+    });
+  }),
+);
+
+it.effect("waitForThread follows an owned capacity retry until that retry actually completes", () =>
+  Effect.gen(function* () {
+    const now = yield* DateTime.now;
+    const fixture = capacityWaitFixture(now);
+    const subscribed = yield* Deferred.make<void>();
+    const retryRead = yield* Deferred.make<void>();
+    const events = yield* Queue.unbounded<OrchestrationV2StoredEvent>();
+    let current = fixture.projection;
+    const retry: OrchestrationV2Run = {
+      ...fixture.run,
+      id: RunId.make("run:capacity-wait:retry"),
+      ordinal: 2,
+      status: "running",
+      completedAt: null,
+    };
+    const recovery = {
+      ...fixture.recovery,
+      status: "retrying" as const,
+      attemptsUsed: 1,
+      nextAttemptAt: null,
+      retryRunId: retry.id,
+    };
+    const layer = ThreadManagementService.layer.pipe(
+      Layer.provide(Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({})),
+      Layer.provide(
+        Layer.mock(Orchestrator.OrchestratorV2)({
+          getThreadEventSequence: () => Effect.succeed(0),
+          streamStoredEventsFrom: (input) =>
+            input?.eventType === "run.updated"
+              ? Stream.fromEffect(Deferred.succeed(subscribed, undefined)).pipe(
+                  Stream.drain,
+                  Stream.concat(Stream.fromQueue(events)),
+                )
+              : Stream.never,
+          getThreadRecords: () =>
+            Effect.gen(function* () {
+              if (current.runs.some((run) => run.id === retry.id && run.status === "running"))
+                yield* Deferred.succeed(retryRead, undefined);
+              return current;
+            }),
+        }),
+      ),
+      Layer.provide(ServerSettings.layerTest()),
+      Layer.provide(layerReceiptsTest),
+    );
+    const service = yield* ThreadManagementService.ThreadManagementService.pipe(
+      Effect.provide(layer),
+    );
+    const fiber = yield* service
+      .waitForThread({
+        projectId: current.thread.projectId,
+        threadId: fixture.run.threadId,
+        runId: fixture.run.id,
+        timeoutMs: 60_000,
+      })
+      .pipe(Effect.forkChild);
+    yield* Deferred.await(subscribed);
+    current = {
+      ...fixture.projection,
+      thread: { ...fixture.projection.thread, capacityRecovery: recovery },
+      runs: [fixture.run, retry],
+    };
+    yield* Queue.offer(events, {
+      sequence: 1,
+      commandId: null,
+      event: {
+        id: EventId.make("capacity-retry-running"),
+        type: "run.updated",
+        threadId: retry.threadId,
+        runId: retry.id,
+        occurredAt: now,
+        payload: retry,
+      },
+    });
+    yield* Deferred.await(retryRead);
+    const completed = { ...retry, status: "completed" as const, completedAt: now };
+    current = {
+      ...current,
+      thread: { ...current.thread, capacityRecovery: { ...recovery, status: "complete" } },
+      runs: [fixture.run, completed],
+    };
+    yield* Queue.offer(events, {
+      sequence: 2,
+      commandId: null,
+      event: {
+        id: EventId.make("capacity-retry-completed"),
+        type: "run.updated",
+        threadId: retry.threadId,
+        runId: retry.id,
+        occurredAt: now,
+        payload: completed,
+      },
+    });
+    expect(yield* Fiber.join(fiber)).toMatchObject({
+      status: "completed",
+      timedOut: false,
+      run: { id: retry.id, status: "completed" },
+      capacityRecovery: { status: "complete" },
+    });
+  }),
+);
 
 it.effect.each([
   { finalStatus: "completed" as const, timedOut: false },

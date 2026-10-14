@@ -27,6 +27,28 @@ const MISMATCH_HINT =
   "Version mismatch. Try syncing the client and server to the same T3 Code version.";
 
 describe("versionSkew", () => {
+  it("compares local continuity revisions by their published nightly baseline", () => {
+    const official = "0.0.46-nightly.20261013.3053";
+    const local = `${official}.continuity.45`;
+    expect(resolveVersionMismatch(official, local)).toBeNull();
+    expect(resolveVersionMismatch(local, official)).toBeNull();
+    expect(resolveVersionMismatch(`${official}.continuity.1`, local)).toBeNull();
+    expect(resolveVersionMismatch("0.0.46-nightly.20261014.3054", local)).toBeNull();
+  });
+
+  it("keeps the local client identity but requests a published version for an older server", () => {
+    const official = "0.0.46-nightly.20261013.3053";
+    const server = "0.0.46-nightly.20261012.3021.continuity.2";
+    const mismatch = resolveVersionMismatch(server, `${official}.continuity.45`);
+    expect(mismatch).toEqual({
+      clientVersion: `${official}.continuity.45`,
+      serverVersion: server,
+      updateTargetVersion: official,
+      hint: MISMATCH_HINT,
+    });
+    expect(manualServerUpdateCommand(mismatch!.updateTargetVersion!)).toBe(`npx t3@${official}`);
+  });
+
   it("updates only the proven npm prefix and safely quotes its path", () => {
     expect(manualServerUpdateCommand("0.0.45", { kind: "npm-global", prefix: "/opt/node" })).toBe(
       "npm install --global --prefix '/opt/node' t3@0.0.45",

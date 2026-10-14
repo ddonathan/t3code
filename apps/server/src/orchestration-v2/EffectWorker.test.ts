@@ -42,6 +42,86 @@ const providerTurnId = ProviderTurnId.make("provider-turn:effect-worker-restart"
 const attemptId = RunAttemptId.make("run-attempt:effect-worker-restart");
 const runId = RunId.make("run:effect-worker-restart");
 
+it.effect.each(["declined", "retry", "failed", "defect", "callback-defect"] as const)(
+  "restart recovery callback follows durable settlement for %s",
+  (outcome) =>
+    Effect.gen(function* () {
+      const now = DateTime.formatIso(yield* DateTime.now);
+      const effect: EffectOutbox.OrchestrationEffectV2 = {
+        id: "effect:restart-continuation:test",
+        commandId: CommandId.make("command:restart-continuation:test"),
+        threadId,
+        request: { type: "provider-runtime.continue", sourceRunId: runId },
+        status: "running",
+        attemptCount: outcome === "retry" ? 1 : 3,
+        availableAt: now,
+        leaseOwner: "worker:restart-settlement",
+        leaseExpiresAt: now,
+        createdAt: now,
+        updatedAt: now,
+        completedAt: null,
+        lastError: null,
+      };
+      const state = yield* Ref.make(effect);
+      const callbacks = yield* Ref.make<EffectOutbox.OrchestrationEffectV2["status"][]>([]);
+      const setStatus = (status: EffectOutbox.OrchestrationEffectV2["status"]) =>
+        Ref.update(state, (row) => ({ ...row, status })).pipe(Effect.as(true));
+      const workerLayer = EffectWorker.layerWithOptions({
+        workerId: effect.leaseOwner!,
+        maxAttempts: 3,
+      }).pipe(
+        Layer.provide(
+          Layer.mergeAll(
+            Layer.mock(EffectOutbox.EffectOutboxV2)({
+              claimNext: () => Effect.succeed(Option.some(effect)),
+              get: () => Ref.get(state).pipe(Effect.map(Option.some)),
+              awaitCancellation: () => Effect.never,
+              clearCancellation: () => Effect.void,
+              succeed: () => setStatus("succeeded"),
+              fail: () => setStatus("failed"),
+              retry: () => setStatus("pending"),
+            }),
+            Layer.succeed(
+              EffectWorker.OrchestrationEffectExecutorV2,
+              EffectWorker.OrchestrationEffectExecutorV2.of({
+                execute: () =>
+                  outcome === "defect"
+                    ? Effect.die("execution defect")
+                    : outcome === "failed" || outcome === "retry"
+                      ? Effect.fail(
+                          new EffectWorker.OrchestrationEffectExecutionError({
+                            effectId: effect.id,
+                            effectType: effect.request.type,
+                            cause: "execution failure",
+                          }),
+                        )
+                      : Effect.void,
+                afterSettled: () =>
+                  Effect.gen(function* () {
+                    const row = yield* Ref.get(state);
+                    yield* Ref.update(callbacks, (statuses) => [...statuses, row.status]);
+                    if (outcome === "callback-defect") return yield* Effect.die("callback defect");
+                  }),
+              }),
+            ),
+          ),
+        ),
+      );
+      yield* EffectWorker.OrchestrationEffectWorkerV2.pipe(
+        Effect.flatMap((worker) => worker.runOnce),
+        Effect.provide(workerLayer),
+      );
+      const expected =
+        outcome === "retry"
+          ? "pending"
+          : outcome === "failed" || outcome === "defect"
+            ? "failed"
+            : "succeeded";
+      assert.equal((yield* Ref.get(state)).status, expected);
+      assert.deepEqual(yield* Ref.get(callbacks), outcome === "retry" ? [] : [expected]);
+    }),
+);
+
 function restartEffect(
   now: DateTime.Utc,
   sessionTransition: NonNullable<

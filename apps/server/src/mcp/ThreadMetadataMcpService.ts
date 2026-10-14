@@ -71,39 +71,33 @@ function metadataCommand(input: {
   readonly threadId: ThreadId;
   readonly projectId: OrchestrationV2AppThread["projectId"];
   readonly update: ThreadMetadataMcpUpdateInput;
-}): Extract<OrchestrationV2Command, { readonly type: "thread.metadata.update" }> {
+}): Effect.Effect<OrchestrationV2Command, OrchestratorMcpFailure> {
+  const base = { commandId: input.commandId, threadId: input.threadId };
   switch (input.update.action) {
     case "rename":
-      return {
-        type: "thread.metadata.update",
-        commandId: input.commandId,
-        threadId: input.threadId,
-        title: input.update.title!,
-      };
+      return input.update.title === undefined
+        ? Effect.fail(failure("invalid_request", "rename requires title."))
+        : Effect.succeed({ type: "thread.metadata.update", ...base, title: input.update.title });
     case "regenerate_title":
-      return {
-        type: "thread.metadata.update",
-        commandId: input.commandId,
-        threadId: input.threadId,
-        regenerateTitle: true,
-      };
+      return Effect.succeed({ type: "thread.metadata.update", ...base, regenerateTitle: true });
     case "link_pull_request":
-      return {
-        type: "thread.metadata.update",
-        commandId: input.commandId,
-        threadId: input.threadId,
-        linkedPullRequest: {
-          projectId: input.projectId,
-          ...input.update.pullRequest!,
-        },
-      };
+      return input.update.pullRequest === undefined
+        ? Effect.fail(failure("invalid_request", "link_pull_request requires pullRequest."))
+        : Effect.succeed({
+            type: "thread.metadata.update",
+            ...base,
+            linkedPullRequest: { projectId: input.projectId, ...input.update.pullRequest },
+          });
     case "unlink_pull_request":
-      return {
-        type: "thread.metadata.update",
-        commandId: input.commandId,
-        threadId: input.threadId,
-        linkedPullRequest: null,
-      };
+      return Effect.succeed({ type: "thread.metadata.update", ...base, linkedPullRequest: null });
+    case "cancel_capacity_retry":
+      return input.update.generation === undefined
+        ? Effect.fail(failure("invalid_request", "cancel_capacity_retry requires generation."))
+        : Effect.succeed({
+            type: "thread.capacity.cancel",
+            ...base,
+            generation: input.update.generation,
+          });
   }
 }
 
@@ -112,6 +106,7 @@ function resultFromThread(input: {
   readonly commandId: CommandId;
   readonly sequence: number;
   readonly thread: OrchestrationV2AppThread;
+  readonly capacityCancellation?: ThreadMetadataMcpUpdateResult["capacityCancellation"];
 }): ThreadMetadataMcpUpdateResult {
   return {
     threadId: input.thread.id,
@@ -128,6 +123,12 @@ function resultFromThread(input: {
           },
     linkedPullRequest: input.thread.linkedPullRequest ?? null,
     updatedAt: DateTime.formatIso(input.thread.updatedAt),
+    ...(input.capacityCancellation === undefined
+      ? {}
+      : {
+          capacityRecovery: input.thread.capacityRecovery ?? null,
+          capacityCancellation: input.capacityCancellation,
+        }),
   };
 }
 
@@ -167,7 +168,10 @@ const make = Effect.gen(function* () {
       return yield* failure("thread_not_found", `Thread ${threadId} was not found.`);
     }
     const target = yield* threadManagement
-      .getProjectThreadRecords({ projectId: shell.projectId, threadId }, [])
+      .getProjectThreadRecords(
+        { projectId: shell.projectId, threadId },
+        input.action === "cancel_capacity_retry" ? ["runs"] : [],
+      )
       .pipe(Effect.mapError(threadLookupFailure));
     const requestKey =
       input.clientRequestId === undefined
@@ -179,15 +183,77 @@ const make = Effect.gen(function* () {
       action: input.action,
       requestKey,
     });
-    const dispatched = yield* threadManagement
-      .dispatch(
-        metadataCommand({
+    const command = yield* metadataCommand({
+      commandId: updateCommandId,
+      threadId,
+      projectId: target.thread.projectId,
+      update: input,
+    });
+    if (input.action === "cancel_capacity_retry") {
+      const recovery = target.thread.capacityRecovery;
+      if (recovery == null || recovery.generation !== input.generation)
+        return yield* failure(
+          "invalid_request",
+          "The capacity recovery generation is no longer current. Read the thread before cancelling.",
+        );
+      if (recovery.status === "cancelled" || recovery.status !== "pending") {
+        const sequence = yield* threadManagement
+          .getThreadEventSequence(threadId)
+          .pipe(Effect.mapError((error) => failure("orchestration_error", errorMessage(error))));
+        return resultFromThread({
+          action: input.action,
           commandId: updateCommandId,
-          threadId,
-          projectId: target.thread.projectId,
-          update: input,
-        }),
+          sequence,
+          thread: target.thread,
+          capacityCancellation:
+            recovery.status === "cancelled" ? "already_cancelled" : "not_pending",
+        });
+      }
+      const latest = ThreadManagementService.latestRun(target);
+      const active = ThreadManagementService.latestActiveRun(target);
+      if (
+        ThreadManagementService.capacityRecoveryDisposition(
+          recovery,
+          latest?.id ?? null,
+          active?.id ?? null,
+          active?.status ?? latest?.status ?? "idle",
+        ) !== "pending"
       )
+        return yield* failure(
+          "invalid_request",
+          "This generation has no owned deadline-backed pending retry to cancel.",
+        );
+      const dispatched = yield* threadManagement
+        .dispatch(command)
+        .pipe(
+          Effect.mapError((error) =>
+            failure(
+              "orchestration_error",
+              `Unable to cancel capacity retry for thread ${threadId}: ${errorMessage(error)}`,
+            ),
+          ),
+        );
+      // The generation/status guard may lose to a retry or new human intake.
+      // Re-read instead of claiming cancellation from the requested command.
+      const current = yield* threadManagement
+        .getProjectThreadRecords({ projectId: shell.projectId, threadId }, ["runs"])
+        .pipe(Effect.mapError(threadLookupFailure));
+      if (current.thread.capacityRecovery?.generation !== input.generation)
+        return yield* failure(
+          "invalid_request",
+          "The capacity recovery generation changed before cancellation; the newer assignment was left unchanged.",
+        );
+      return resultFromThread({
+        action: input.action,
+        commandId: updateCommandId,
+        sequence: dispatched.sequence,
+        thread: current.thread,
+        capacityCancellation:
+          current.thread.capacityRecovery.status === "cancelled" ? "cancelled" : "not_pending",
+      });
+    }
+    const dispatched = yield* threadManagement
+      .dispatch(command)
       .pipe(
         Effect.mapError((error) =>
           failure(

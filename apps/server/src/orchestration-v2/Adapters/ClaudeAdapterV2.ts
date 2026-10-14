@@ -7625,6 +7625,26 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           ) {
             // This user turn ran the wake itself, so no offer will name its work.
             yield* clearWakeReports(liveQuery.nativeThreadId);
+            // An idle init can queue a continuation just before this prompt
+            // joins that native wake. Its prompt-echoed completion consumes
+            // the init too; otherwise the queued continuation attaches to an
+            // already idle query without sending a prompt and never settles.
+            // Only retire an init-only buffer: distinct wake output, results,
+            // task lifecycle and usage-limit frames keep their own replay.
+            if (
+              context.promptUuid !== null &&
+              claudeEchoedPromptUuids(message).includes(context.promptUuid) &&
+              terminalStatusFromResult(message) === "completed"
+            ) {
+              yield* Ref.update(wakeBuffers, (current) => {
+                const buffered = current.get(liveQuery.nativeThreadId);
+                if (buffered === undefined || !buffered.messages.every(isClaudeTurnStartMessage))
+                  return current;
+                const updated = new Map(current);
+                updated.delete(liveQuery.nativeThreadId);
+                return updated;
+              });
+            }
             yield* Effect.logInfo("orchestration-v2.claude-task-notification-result-accepted", {
               providerTurnId: context.providerTurnId,
               num_turns: message.num_turns,

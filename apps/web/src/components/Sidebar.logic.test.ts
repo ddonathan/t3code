@@ -63,7 +63,17 @@ import {
 } from "./Sidebar.logic";
 import { threadSearchMatchKey } from "@t3tools/client-runtime/state/thread-search";
 import { sortSettledThreads } from "@t3tools/client-runtime/state/thread-sort";
-import { EnvironmentId, ProjectId, ProviderInstanceId, RunId, ThreadId } from "@t3tools/contracts";
+import {
+  CommandId,
+  EnvironmentId,
+  MessageId,
+  ProjectId,
+  ProviderInstanceId,
+  ProviderThreadId,
+  RunId,
+  ThreadId,
+  type OrchestrationV2CapacityRecovery,
+} from "@t3tools/contracts";
 
 import {
   DEFAULT_INTERACTION_MODE,
@@ -899,6 +909,52 @@ describe("resolveSidebarThreadStatus", () => {
   };
 
   const idle = { hasPendingApprovals: false, hasPendingUserInput: false, runtime: null };
+
+  it("keeps scheduled capacity retries waiting in the default sidebar until exhausted", () => {
+    const failedId = RunId.make("capacity-failed");
+    const recovery: OrchestrationV2CapacityRecovery = {
+      generation: CommandId.make("capacity-generation"),
+      originalRunId: failedId,
+      authorityMessageId: MessageId.make("capacity-authority"),
+      failedRunId: failedId,
+      providerThreadId: ProviderThreadId.make("capacity-native"),
+      modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-6.1-sol" },
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      reactionsReleased: false,
+      retryRunId: null,
+      attemptsUsed: 0,
+      nextAttemptAt: DateTime.makeUnsafe("2026-10-12T12:00:00Z"),
+      status: "pending",
+      reason: "Temporary model capacity failure.",
+    };
+    const thread = makeThread({
+      runtime: { ...runtime, status: "failed", lastError: "Selected model is at capacity." },
+      latestRun: {
+        runId: failedId,
+        status: "failed",
+        requestedAt: null,
+        startedAt: null,
+        completedAt: null,
+        assistantMessageId: null,
+      },
+      capacityRecovery: recovery,
+    });
+    expect(resolveSidebarThreadStatus(thread)).toBe("waiting");
+    expect(resolveSidebarThreadStatus({ ...thread, hasPendingUserInput: true })).toBe("input");
+    expect(
+      resolveSidebarThreadStatus({
+        ...thread,
+        capacityRecovery: { ...recovery, status: "exhausted", nextAttemptAt: null },
+      }),
+    ).toBe("failed");
+    expect(
+      resolveSidebarThreadStatus({
+        ...thread,
+        capacityRecovery: { ...recovery, nextAttemptAt: null },
+      }),
+    ).toBe("failed");
+  });
 
   it("prioritizes approval over a running runtime", () => {
     expect(resolveSidebarThreadStatus({ ...idle, hasPendingApprovals: true, runtime })).toBe(

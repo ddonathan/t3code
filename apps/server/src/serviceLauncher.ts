@@ -30,6 +30,23 @@ import {
   SERVICE_STOP_MARKER_FILE,
 } from "./cloud/serviceProtocol.ts";
 
+import {
+  verifyApprovedRuntime,
+  ApprovedRuntimeRefused,
+  approvedRuntimeManifestPath,
+} from "./cloud/approvedRuntime.ts";
+
+const verifyRuntimeApproval = (baseDir: string, version: string) =>
+  verifyApprovedRuntime(
+    baseDir,
+    version,
+    // oxlint-disable-next-line t3code/no-global-process-runtime -- Standalone launcher has no Effect runtime.
+    process.platform,
+    // oxlint-disable-next-line t3code/no-global-process-runtime -- Standalone launcher has no Effect runtime.
+    process.arch,
+    runtimePaths(baseDir, version).versionDir,
+  );
+
 const HANDOFF_DELAY_MS = 2_000;
 const PREPARED_TIMEOUT_MS = 120_000;
 const TERMINATE_GRACE_MS = 5_000;
@@ -280,6 +297,7 @@ const restartPendingPath = (baseDir: string) =>
 export class Launcher {
   readonly #baseDir: string;
   readonly #statePath: string;
+  readonly #executablePath: string;
   #state: ServiceState;
   #child: ManagedChild | null = null;
   #timer: NodeJS.Timeout | undefined;
@@ -289,10 +307,13 @@ export class Launcher {
   #done = false;
   readonly #completion = Promise.withResolvers<void>();
 
-  constructor(baseDir: string, state: ServiceState) {
+  // Invocation binding is supplied by an embedding host; the real CLI uses
+  // process.execPath. It is never a fallback-version argument or environment flag.
+  constructor(baseDir: string, state: ServiceState, executablePath = process.execPath) {
     this.#baseDir = baseDir;
     this.#statePath = NodePath.join(baseDir, "runtime", SERVICE_STATE_FILE);
     this.#state = state;
+    this.#executablePath = executablePath;
   }
 
   async run(): Promise<void> {
@@ -365,7 +386,93 @@ export class Launcher {
     this.#timer = undefined;
   }
 
+  async #recoverLegacySelection(): Promise<string | undefined> {
+    try {
+      await verifyRuntimeApproval(this.#baseDir, this.#state.activeVersion);
+      return undefined;
+    } catch (cause) {
+      // Restrict recovery to an unknown exact build, never a corrupt policy or
+      // an approved selection whose bytes changed. Pending updates use rollback.
+      if (!(cause instanceof ApprovedRuntimeRefused) || cause.code !== "unknown-build") throw cause;
+      const raw: unknown = JSON.parse(await NodeFSP.readFile(this.#statePath, "utf8"));
+      if (
+        typeof raw !== "object" ||
+        raw === null ||
+        Array.isArray(raw) ||
+        Object.keys(raw).length !== 2 ||
+        !("protocol" in raw) ||
+        raw.protocol !== SERVICE_LAUNCHER_PROTOCOL ||
+        !("activeVersion" in raw) ||
+        raw.activeVersion !== this.#state.activeVersion ||
+        this.#state.update !== undefined
+      )
+        throw cause;
+      let ownExecutable: string;
+      let versionsDirectory: string;
+      try {
+        ownExecutable = await NodeFSP.realpath(this.#executablePath);
+        versionsDirectory = await NodeFSP.realpath(
+          NodePath.join(this.#baseDir, "runtime", "versions"),
+        );
+      } catch {
+        throw new ApprovedRuntimeRefused(
+          approvedRuntimeManifestPath(this.#baseDir),
+          this.#state.activeVersion,
+          "launcher executable or runtime versions directory cannot be resolved",
+        );
+      }
+      const ownVersion = NodePath.basename(NodePath.dirname(ownExecutable));
+      if (
+        NodePath.basename(ownExecutable) !== "t3" ||
+        NodePath.dirname(NodePath.dirname(ownExecutable)) !== versionsDirectory ||
+        !isExactServiceVersion(ownVersion)
+      ) {
+        throw new ApprovedRuntimeRefused(
+          approvedRuntimeManifestPath(this.#baseDir),
+          this.#state.activeVersion,
+          "launcher executable is outside this T3 home's exact runtime versions",
+        );
+      }
+      await verifyRuntimeApproval(this.#baseDir, ownVersion);
+      if (!(await runtimeExists(this.#baseDir, ownVersion)))
+        throw new ApprovedRuntimeRefused(
+          approvedRuntimeManifestPath(this.#baseDir),
+          ownVersion,
+          "launcher runtime is missing or incomplete",
+        );
+      const refusedLegacyVersion = this.#state.activeVersion;
+      const next: ServiceState = { protocol: SERVICE_LAUNCHER_PROTOCOL, activeVersion: ownVersion };
+      // A deferred legacy install names the refused selection, not our restored one.
+      const restartPending = restartPendingPath(this.#baseDir);
+      const awaitedVersion = await NodeFSP.readFile(restartPending, "utf8").catch(
+        (error: unknown) => {
+          if (error instanceof Error && "code" in error && error.code === "ENOENT")
+            return undefined;
+          throw error;
+        },
+      );
+      await writeServiceState(this.#statePath, next);
+      this.#state = next;
+      if (awaitedVersion?.trim() === refusedLegacyVersion)
+        await NodeFSP.rm(restartPending, { force: true });
+      process.stdout.write(
+        `[service-launcher] launcherVersion=${ownVersion} selectedVersion=${ownVersion} refusedLegacyVersion=${refusedLegacyVersion} recovered verified launcher selection\n`,
+      );
+      return refusedLegacyVersion;
+    }
+  }
+
   async #recover(): Promise<void> {
+    // A stable launcher can outlive a legacy CLI rewriting plain selection.
+    // Every refusal path verifies bytes before marker or selection mutations.
+    const refusedLegacyVersion = await this.#recoverLegacySelection();
+    const launcherDirectoryVersion = NodePath.basename(NodePath.dirname(this.#executablePath));
+    process.stdout.write(
+      `[service-launcher] launcherVersion=${isExactServiceVersion(launcherDirectoryVersion) ? launcherDirectoryVersion : "unmanaged"} selectedVersion=${this.#state.activeVersion}\n`,
+    );
+    if (this.#state.update?.status === "pending") {
+      await verifyRuntimeApproval(this.#baseDir, this.#state.update.fromVersion);
+    }
     // A fresh launcher means servers are running again: any stop marker from
     // a previous explicit stop is stale and must not make a future update
     // handoff release its tunnel. A restart deferred by `t3 update` is done
@@ -376,7 +483,10 @@ export class Launcher {
     await NodeFSP.rm(stopMarkerPath(this.#baseDir), { force: true }).catch(() => undefined);
     const restartPending = restartPendingPath(this.#baseDir);
     const awaitedVersion = await NodeFSP.readFile(restartPending, "utf8").catch(() => undefined);
-    if (awaitedVersion?.trim() === this.#state.activeVersion) {
+    if (
+      refusedLegacyVersion === undefined &&
+      awaitedVersion?.trim() === this.#state.activeVersion
+    ) {
       await NodeFSP.rm(restartPending, { force: true }).catch(() => undefined);
     }
     const update = this.#state.update;
@@ -387,6 +497,7 @@ export class Launcher {
       await this.#startChild(this.#state.activeVersion, "active", update);
       return;
     }
+    if (!(await this.#verifyPendingApproval(update))) return;
     if (await databaseRestorePending(this.#baseDir, update)) {
       await this.#returnToPrevious(update, "failed", "rollback-interrupted");
       return;
@@ -398,7 +509,49 @@ export class Launcher {
     await this.#startTrial(update);
   }
 
+  async #verifyPendingApproval(
+    pending: PendingServiceUpdate,
+    child?: ManagedChild,
+  ): Promise<boolean> {
+    // An unapproved rollback is still fatal: never restore or launch unknown bytes.
+    await verifyRuntimeApproval(this.#baseDir, pending.fromVersion);
+    try {
+      await verifyRuntimeApproval(this.#baseDir, pending.targetVersion);
+      return true;
+    } catch (cause) {
+      if (!(cause instanceof ApprovedRuntimeRefused)) throw cause;
+      process.stderr.write(`${cause.message}\n`);
+      this.#clearTimer();
+      if (
+        child !== undefined &&
+        this.#child === child &&
+        child.role === "active" &&
+        child.version === pending.fromVersion
+      ) {
+        // The approved current child has not stopped or migrated. Clear pending
+        // without terminating it, touching its database, or spawning a duplicate.
+        const outcome = terminalUpdate({
+          pending,
+          status: "failed",
+          reason: "target-not-approved",
+        });
+        const next: ServiceState = {
+          ...this.#state,
+          activeVersion: pending.fromVersion,
+          update: outcome,
+        };
+        await writeServiceState(this.#statePath, next);
+        this.#state = next;
+        await sendMessage(child.process, { type: "update-rejected", reason: cause.message });
+      } else {
+        await this.#returnToPrevious(pending, "failed", "target-not-approved", child);
+      }
+      return false;
+    }
+  }
+
   async #startTrial(pending: PendingServiceUpdate): Promise<void> {
+    if (!(await this.#verifyPendingApproval(pending))) return;
     // The previous child is dead here, so all three SQLite files are quiescent.
     try {
       await backupDatabaseOnce(this.#baseDir, pending);
@@ -408,8 +561,13 @@ export class Launcher {
     }
     try {
       await this.#startChild(pending.targetVersion, "trial", pending);
-    } catch {
-      await this.#returnToPrevious(pending, "failed", "candidate-start-failed");
+    } catch (cause) {
+      if (cause instanceof ApprovedRuntimeRefused) process.stderr.write(`${cause.message}\n`);
+      await this.#returnToPrevious(
+        pending,
+        "failed",
+        cause instanceof ApprovedRuntimeRefused ? "target-not-approved" : "candidate-start-failed",
+      );
     }
   }
 
@@ -420,6 +578,7 @@ export class Launcher {
     }
     if (this.#stopping) return;
     const paths = runtimePaths(this.#baseDir, version);
+    await verifyRuntimeApproval(this.#baseDir, version);
     const context: ServiceLauncherContext = {
       protocol: SERVICE_LAUNCHER_PROTOCOL,
       childVersion: version,
@@ -510,6 +669,16 @@ export class Launcher {
       return;
     }
 
+    try {
+      await verifyRuntimeApproval(this.#baseDir, message.targetVersion);
+      await verifyRuntimeApproval(this.#baseDir, child.version);
+    } catch (cause) {
+      if (!(cause instanceof ApprovedRuntimeRefused)) throw cause;
+      process.stderr.write(`${cause.message}\n`);
+      await reject(cause.message);
+      return;
+    }
+
     const pending: PendingServiceUpdate = {
       id: NodeCrypto.randomUUID(),
       fromVersion: child.version,
@@ -530,6 +699,7 @@ export class Launcher {
       return;
     }
     this.#timer = undefined;
+    if (!(await this.#verifyPendingApproval(pending, child))) return;
     this.#child = null;
     await terminateChild(child.process);
     await this.#startTrial(pending);
@@ -550,6 +720,7 @@ export class Launcher {
       throw new Error("Trial child reported prepared for an unexpected update.");
     }
     this.#clearTimer();
+    if (!(await this.#verifyPendingApproval(pending, child))) return;
     const committed = terminalUpdate({ pending, status: "committed" });
     const next: ServiceState = {
       ...this.#state,
@@ -608,6 +779,7 @@ export class Launcher {
     reason: string,
     child?: ManagedChild,
   ): Promise<void> {
+    await verifyRuntimeApproval(this.#baseDir, pending.fromVersion);
     if (child !== undefined) {
       this.#child = null;
       await terminateChild(child.process);

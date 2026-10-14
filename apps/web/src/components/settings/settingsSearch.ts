@@ -350,6 +350,12 @@ export const SETTINGS_SEARCH_ITEMS = [
     searchTerms: ["usage quota rate limit reset wake recover continue"],
   },
   {
+    id: "auto-resume-capacity-threads",
+    title: "Retry model capacity errors",
+    to: "/settings/general",
+    searchTerms: ["capacity overloaded retry model temporarily unavailable"],
+  },
+  {
     id: "auto-resume-limited-threads",
     title: "Auto-resume limited threads",
     to: "/settings/general",
@@ -479,6 +485,15 @@ export const SETTINGS_SEARCH_ITEMS = [
     scope: "project-defaults",
     searchTerms: [
       "resume running active interrupted work restart reboot machine crash desktop update automatically",
+    ],
+  },
+  {
+    id: "work-continuity-auto-enroll",
+    title: "Automatic continuation checks",
+    to: "/settings/general",
+    scope: "environment-defaults",
+    searchTerms: [
+      "unfinished work keep going stopped agent bounded checks continuity automatically",
     ],
   },
   {

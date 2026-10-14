@@ -414,6 +414,10 @@
     "./pull-request-markdown": {
       "types": "./src/pullRequestMarkdown.ts",
       "default": "./src/pullRequestMarkdown.ts"
+    },
+    "./state/capacity-recovery": {
+      "types": "./src/state/capacityRecovery.ts",
+      "default": "./src/state/capacityRecovery.ts"
     }
   },
   "scripts": {

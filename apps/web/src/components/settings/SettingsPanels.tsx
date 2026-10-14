@@ -585,6 +585,9 @@ export function useSettingsRestore(onRestored?: () => void) {
       ...(settings.sidebarAutoSettleOnMerge !== DEFAULT_UNIFIED_SETTINGS.sidebarAutoSettleOnMerge
         ? ["Auto-settle merged threads"]
         : []),
+      ...(settings.autoResumeCapacityThreads !== DEFAULT_UNIFIED_SETTINGS.autoResumeCapacityThreads
+        ? ["Retry model capacity errors"]
+        : []),
       ...(settings.autoResumeLimitedThreads !== DEFAULT_UNIFIED_SETTINGS.autoResumeLimitedThreads
         ? ["Auto-resume limited threads"]
         : []),
@@ -633,6 +636,9 @@ export function useSettingsRestore(onRestored?: () => void) {
       ...(settings.continueThreadsAfterServerUpdate !==
       DEFAULT_UNIFIED_SETTINGS.continueThreadsAfterServerUpdate
         ? ["Continue threads after restarts"]
+        : []),
+      ...(settings.workContinuityAutoEnroll !== DEFAULT_UNIFIED_SETTINGS.workContinuityAutoEnroll
+        ? ["Automatic continuation checks"]
         : []),
       ...(isBackgroundActivityDirty ? ["Background activity"] : []),
       ...(settings.defaultThreadEnvMode !== DEFAULT_UNIFIED_SETTINGS.defaultThreadEnvMode
@@ -707,8 +713,10 @@ export function useSettingsRestore(onRestored?: () => void) {
       settings.persistComposerContextStrip,
       settings.enableProviderUpdateChecks,
       settings.continueThreadsAfterServerUpdate,
+      settings.workContinuityAutoEnroll,
       settings.sidebarAutoSettleAfterDays,
       settings.sidebarAutoSettleOnMerge,
+      settings.autoResumeCapacityThreads,
       settings.autoResumeLimitedThreads,
       settings.snoozeLimitedThreads,
       settings.sidebarProjectGroupingMode,
@@ -816,11 +824,13 @@ export function useSettingsRestore(onRestored?: () => void) {
       sidebarWorkingShelfEnabled: DEFAULT_UNIFIED_SETTINGS.sidebarWorkingShelfEnabled,
       sidebarAutoSettleAfterDays: DEFAULT_UNIFIED_SETTINGS.sidebarAutoSettleAfterDays,
       sidebarAutoSettleOnMerge: DEFAULT_UNIFIED_SETTINGS.sidebarAutoSettleOnMerge,
+      autoResumeCapacityThreads: DEFAULT_UNIFIED_SETTINGS.autoResumeCapacityThreads,
       autoResumeLimitedThreads: DEFAULT_UNIFIED_SETTINGS.autoResumeLimitedThreads,
       snoozeLimitedThreads: DEFAULT_UNIFIED_SETTINGS.snoozeLimitedThreads,
       responseStreamingMode: DEFAULT_UNIFIED_SETTINGS.responseStreamingMode,
       enableProviderUpdateChecks: DEFAULT_UNIFIED_SETTINGS.enableProviderUpdateChecks,
       continueThreadsAfterServerUpdate: DEFAULT_UNIFIED_SETTINGS.continueThreadsAfterServerUpdate,
+      workContinuityAutoEnroll: DEFAULT_UNIFIED_SETTINGS.workContinuityAutoEnroll,
       backgroundActivity: DEFAULT_UNIFIED_SETTINGS.backgroundActivity,
       backgroundActivityProfile: DEFAULT_UNIFIED_SETTINGS.backgroundActivityProfile,
       automaticGitFetchInterval: DEFAULT_UNIFIED_SETTINGS.automaticGitFetchInterval,
@@ -2207,6 +2217,18 @@ export function GeneralSettingsPanel() {
     connectedEnvironments.every(
       (target) => target.serverConfig?.environment.capabilities.threadRestartContinuation === true,
     );
+  const supportsCapacityRecovery =
+    connectedEnvironments.length > 0 &&
+    connectedEnvironments.every(
+      (target) =>
+        target.serverConfig?.environment.capabilities.threadModelCapacityRecovery === true,
+    );
+  const supportsAutomaticContinuity =
+    connectedEnvironments.length > 0 &&
+    connectedEnvironments.every(
+      (target) =>
+        target.serverConfig?.environment.capabilities.threadWorkContinuityAutoEnrollment === true,
+    );
 
   const textGenerationProviders = serverProviders.filter(
     (provider) => provider.supportsTextGeneration !== false,
@@ -2344,6 +2366,28 @@ export function GeneralSettingsPanel() {
           }
         />
 
+        <SettingsRow
+          serverScoped
+          {...searchableSetting("auto-resume-capacity-threads")}
+          description="Retry the same Codex model up to three times after temporary capacity failures. Cancel a pending retry from the thread."
+          status={
+            !supportsCapacityRecovery
+              ? "All selected connected environments must support model capacity retries."
+              : undefined
+          }
+          settingKeys={["autoResumeCapacityThreads"]}
+          control={
+            <ScopedSwitch
+              settingKeys={["autoResumeCapacityThreads"]}
+              checked={settings.autoResumeCapacityThreads}
+              disabled={!supportsCapacityRecovery}
+              onCheckedChange={(checked) =>
+                updateSettings({ autoResumeCapacityThreads: Boolean(checked) })
+              }
+              aria-label="Retry model capacity errors"
+            />
+          }
+        />
         <SettingsRow
           serverScoped
           {...searchableSetting("auto-resume-limited-threads")}
@@ -2911,6 +2955,43 @@ export function GeneralSettingsPanel() {
                 updateSettings({ enableProviderUpdateChecks: Boolean(checked) })
               }
               aria-label="Check provider versions"
+            />
+          }
+        />
+
+        <SettingsRow
+          {...searchableSetting("work-continuity-auto-enroll")}
+          serverScoped
+          settingKeys={["workContinuityAutoEnroll"]}
+          description="Automatically enable up to three checks for new work, including a new job after completion. Paused, blocked, exhausted, and disabled checks stay closed."
+          status={
+            !supportsAutomaticContinuity
+              ? "All selected connected environments must support automatic continuation checks."
+              : undefined
+          }
+          resetAction={
+            supportsAutomaticContinuity &&
+            settings.workContinuityAutoEnroll !==
+              DEFAULT_UNIFIED_SETTINGS.workContinuityAutoEnroll ? (
+              <SettingResetButton
+                label="automatic continuation checks"
+                onClick={() =>
+                  updateSettings({
+                    workContinuityAutoEnroll: DEFAULT_UNIFIED_SETTINGS.workContinuityAutoEnroll,
+                  })
+                }
+              />
+            ) : null
+          }
+          control={
+            <ScopedSwitch
+              settingKeys={["workContinuityAutoEnroll"]}
+              checked={settings.workContinuityAutoEnroll}
+              disabled={!supportsAutomaticContinuity}
+              onCheckedChange={(checked) =>
+                updateSettings({ workContinuityAutoEnroll: Boolean(checked) })
+              }
+              aria-label="Automatic continuation checks"
             />
           }
         />

@@ -1,3 +1,4 @@
+import { capacityRecoveryPresentation } from "@t3tools/client-runtime/state/capacity-recovery";
 import { resolveThreadWorkingStartedAt } from "@t3tools/client-runtime/state/models";
 import { backgroundWorkHoldsCompletion } from "@t3tools/shared/orchestrationV2PendingBackgroundWork";
 import { threadPullRequestSearchTerms } from "@t3tools/shared/threadPullRequests";
@@ -626,6 +627,8 @@ export function buildBulkUnpinContextMenuItem(input: {
 export interface ThreadStatusPill {
   label:
     | "Working"
+    | "Retry scheduled"
+    | "Retrying"
     | "Connecting"
     | "Completed"
     | "Pending Approval"
@@ -641,6 +644,8 @@ const THREAD_STATUS_PRIORITY: Record<ThreadStatusPill["label"], number> = {
   "Pending Approval": 5,
   "Awaiting Input": 4,
   Working: 3,
+  "Retry scheduled": 2.5,
+  Retrying: 3,
   Connecting: 3,
   Waiting: 2.5,
   "Plan Ready": 2,
@@ -654,6 +659,7 @@ type ThreadStatusInput = Pick<
   | "hasPendingUserInput"
   | "interactionMode"
   | "latestRun"
+  | "capacityRecovery"
   | "runtime"
 > & {
   lastVisitedAt?: string | null | undefined;
@@ -978,7 +984,8 @@ export function shouldRecedeSidebarThread(input: {
 type SidebarThreadStatusInput = Pick<
   SidebarThreadSummary,
   "hasPendingApprovals" | "hasPendingUserInput" | "runtime"
->;
+> &
+  Partial<Pick<SidebarThreadSummary, "capacityRecovery" | "latestRun">>;
 
 export function resolveSidebarThreadStatus(thread: SidebarThreadStatusInput): SidebarThreadStatus {
   if (thread.hasPendingApprovals) {
@@ -987,6 +994,13 @@ export function resolveSidebarThreadStatus(thread: SidebarThreadStatusInput): Si
   if (thread.hasPendingUserInput) {
     return "input";
   }
+  const capacity = capacityRecoveryPresentation({
+    runtime: thread.runtime,
+    latestRun: thread.latestRun ?? null,
+    capacityRecovery: thread.capacityRecovery ?? null,
+  });
+  if (capacity?.sidebarLabel === "Retry scheduled") return "waiting";
+  if (capacity?.sidebarLabel === "Retrying") return "working";
   if (
     thread.runtime !== null &&
     ["preparing", "queued", "starting", "running", "waiting"].includes(thread.runtime.status)
@@ -1195,6 +1209,16 @@ export function resolveThreadStatusPill(input: {
       label: "Awaiting Input",
       colorClass: "text-indigo-600 dark:text-indigo-300/90",
       dotClass: "bg-indigo-500 dark:bg-indigo-300/90",
+      pulse: false,
+    };
+  }
+
+  const capacity = capacityRecoveryPresentation(thread);
+  if (capacity?.sidebarLabel) {
+    return {
+      label: capacity.sidebarLabel,
+      colorClass: "text-sidebar-muted-foreground",
+      dotClass: "bg-sidebar-muted-foreground",
       pulse: false,
     };
   }

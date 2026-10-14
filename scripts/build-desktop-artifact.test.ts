@@ -272,6 +272,35 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
     assert.equal(resolveDesktopUpdateChannel("0.0.17"), "latest");
   });
 
+  it.effect("continuity builds preserve nightly branding and omit every update feed", () =>
+    Effect.gen(function* () {
+      const version = "0.0.46-nightly.20261013.3053.continuity.45";
+      assert.equal(resolveDesktopUpdateChannel(version), "nightly");
+      assert.equal(resolveDesktopProductName(version), "T3 Code (Nightly)");
+      assert.equal(resolveDesktopWebAssetBrand(version), "nightly");
+      assert.deepStrictEqual(
+        resolveDesktopBuildIconAssets(version),
+        resolveDesktopBuildIconAssets("0.0.46-nightly.20261013.3053"),
+      );
+      const config = yield* createBuildConfig(
+        "linux",
+        "AppImage",
+        version,
+        false,
+        false,
+        undefined,
+        undefined,
+      );
+      assert.equal(config.publish, null);
+    }).pipe(
+      Effect.provide(
+        ConfigProvider.layer(
+          ConfigProvider.fromEnv({ env: { GITHUB_REPOSITORY: "pingdotgg/t3code" } }),
+        ),
+      ),
+    ),
+  );
+
   it("switches desktop packaging product names to nightly for nightly builds", () => {
     assert.equal(resolveDesktopProductName("0.0.17"), "T3 Code (Alpha)");
     assert.equal(resolveDesktopProductName("0.0.17-nightly.20260413.42"), "T3 Code (Nightly)");
@@ -368,8 +397,8 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
         undefined,
       );
 
-      assert.notProperty(preview, "publish");
-      assert.notProperty(previewChannel, "publish");
+      assert.equal(preview.publish, null);
+      assert.equal(previewChannel.publish, null);
       assert.deepStrictEqual(release.publish, [
         {
           provider: "github",

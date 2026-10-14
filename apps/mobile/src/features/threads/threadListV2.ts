@@ -9,6 +9,7 @@ import {
 } from "@t3tools/client-runtime/state/thread-settled";
 import type { SnoozePreset } from "@t3tools/client-runtime/state/thread-settled";
 import type { EnvironmentThreadShell } from "@t3tools/client-runtime/state/shell";
+import { capacityRecoveryPresentation } from "@t3tools/client-runtime/state/capacity-recovery";
 import { resolveThreadProviderStack } from "@t3tools/client-runtime/state/models";
 import { threadSearchMatchKey } from "@t3tools/client-runtime/state/thread-search";
 import {
@@ -81,6 +82,8 @@ export type ThreadListV2Status =
   | "input"
   | "working"
   | "waiting"
+  | "retry_scheduled"
+  | "retrying"
   | "failed"
   | "limited"
   | "ready";
@@ -183,7 +186,10 @@ export function threadHasUnseenCompletion(
 }
 
 export function resolveThreadListV2Status(
-  thread: Pick<EnvironmentThreadShell, "hasPendingApprovals" | "hasPendingUserInput" | "runtime">,
+  thread: Pick<
+    EnvironmentThreadShell,
+    "hasPendingApprovals" | "hasPendingUserInput" | "runtime" | "latestRun" | "capacityRecovery"
+  >,
 ): ThreadListV2Status {
   if (thread.hasPendingApprovals) {
     return "approval";
@@ -191,6 +197,9 @@ export function resolveThreadListV2Status(
   if (thread.hasPendingUserInput) {
     return "input";
   }
+  const recovery = capacityRecoveryPresentation(thread);
+  if (recovery?.sidebarLabel === "Retry scheduled") return "retry_scheduled";
+  if (recovery?.sidebarLabel === "Retrying") return "retrying";
   if (
     thread.runtime !== null &&
     ["preparing", "queued", "starting", "running", "waiting"].includes(thread.runtime.status)

@@ -1,5 +1,6 @@
 import { assert, it } from "@effect/vitest";
 import {
+  CommandId,
   ContextTransferId,
   MessageId,
   type ModelSelection,
@@ -106,11 +107,11 @@ function makeSourceProjection(sourceRun: OrchestrationV2Run): OrchestrationV2Thr
   };
 }
 
-const planFork = (sourceRun: OrchestrationV2Run) =>
+const planFork = (sourceRun: OrchestrationV2Run, sourceThread = makeSourceThread()) =>
   Effect.gen(function* () {
     const service = yield* ThreadForkService.ThreadForkServiceV2;
     return yield* service.plan({
-      sourceProjection: makeSourceProjection(sourceRun),
+      sourceProjection: { ...makeSourceProjection(sourceRun), thread: sourceThread },
       sourceRun,
       sourceProviderThread: undefined,
       canonicalSourcePoint: {
@@ -125,6 +126,42 @@ const planFork = (sourceRun: OrchestrationV2Run) =>
       createdAt: forkCreatedAt,
     });
   }).pipe(Effect.provide(ThreadForkService.layer));
+
+it.effect.each(["pending", "complete"] as const)(
+  "forks without sharing the source's %s capacity episode or retry allowance",
+  (status) =>
+    Effect.gen(function* () {
+      const sourceThread = {
+        ...makeSourceThread(),
+        capacityRecovery: {
+          generation: CommandId.make("source-capacity-generation"),
+          originalRunId: sourceRunId,
+          failedRunId: sourceRunId,
+          authorityMessageId: MessageId.make("source-capacity-authority"),
+          providerThreadId: ProviderThreadId.make("source-capacity-provider"),
+          modelSelection,
+          runtimeMode: "full-access" as const,
+          interactionMode: "default" as const,
+          reactionsReleased: status === "complete",
+          retryRunId: null,
+          attemptsUsed: status === "complete" ? 3 : 2,
+          nextAttemptAt: status === "pending" ? forkCreatedAt : null,
+          status,
+          reason: "Source capacity failure",
+        },
+      } satisfies OrchestrationV2AppThread;
+      const originalRecovery = { ...sourceThread.capacityRecovery };
+      const fork = yield* planFork(makeSourceRun("failed"), sourceThread);
+      assert.isNull(fork.targetThread.capacityRecovery);
+      assert.deepEqual(sourceThread.capacityRecovery, originalRecovery);
+      assert.deepEqual(fork.targetThread.forkedFrom, {
+        type: "run",
+        threadId: sourceThreadId,
+        runId: sourceRunId,
+      });
+      assert.equal(fork.transfer.sourceThreadId, sourceThreadId);
+    }),
+);
 
 it("treats usage-limited and other provider-finished runs as forkable", () => {
   assert.isTrue(ThreadForkService.isForkableSourceRunStatus("completed"));

@@ -1,5 +1,6 @@
 import { assert, it } from "@effect/vitest";
 import {
+  CommandId,
   type ModelSelection,
   NodeId,
   RunId,
@@ -116,6 +117,50 @@ it("keeps a subagent child awake when its parent thread is snoozed", () => {
     nodeId: parentNodeId,
   });
 });
+
+it.each(["pending", "complete"] as const)(
+  "keeps the parent's %s capacity episode and retry allowance out of delegated and native children",
+  (status) => {
+    const parentThread = {
+      ...makeParentThread(),
+      capacityRecovery: {
+        generation: CommandId.make("parent-capacity-generation"),
+        originalRunId: RunId.make("parent-failed-run"),
+        failedRunId: RunId.make("parent-failed-run"),
+        authorityMessageId: MessageId.make("parent-human-authority"),
+        providerThreadId: ProviderThreadId.make("parent-capacity-provider"),
+        modelSelection: parentModelSelection,
+        runtimeMode: "full-access" as const,
+        interactionMode: "default" as const,
+        reactionsReleased: status === "complete",
+        retryRunId: null,
+        attemptsUsed: status === "complete" ? 3 : 2,
+        nextAttemptAt: status === "pending" ? childCreatedAt : null,
+        status,
+        reason: "Parent capacity failure",
+      },
+    } satisfies OrchestrationV2AppThread;
+    const originalRecovery = { ...parentThread.capacityRecovery };
+    for (const creationSource of ["mcp", "provider"] as const) {
+      const child = makeSubagentChildThread({
+        parentThread,
+        childThreadId,
+        parentNodeId: NodeId.make("parent-capacity-node"),
+        activeProviderThreadId: null,
+        providerInstanceId: childProviderInstanceId,
+        modelSelection: childModelSelection,
+        title: "Independent child",
+        now: childCreatedAt,
+        createdBy: "agent",
+        creationSource,
+      });
+      assert.isNull(child.capacityRecovery);
+      assert.deepEqual(parentThread.capacityRecovery, originalRecovery);
+      assert.equal(child.lineage.parentThreadId, parentThread.id);
+      assert.deepEqual(child.modelSelection, childModelSelection);
+    }
+  },
+);
 
 it("attributes native subagent prompts to their parent thread", () => {
   for (const role of ["user", "assistant"] as const) {

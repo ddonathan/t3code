@@ -8,6 +8,7 @@ import type {
   ThreadId,
 } from "@t3tools/contracts";
 import { isProviderNativeSubagentThread } from "@t3tools/contracts";
+import * as DateTime from "effect/DateTime";
 import { Atom } from "effect/reactivity";
 
 import type { EnvironmentThreadShell } from "./models.ts";
@@ -43,6 +44,20 @@ const isChildRunLive = (
       thread.status === "starting" ||
       thread.status === "running" ||
       thread.status === "waiting";
+
+// A question asked before the activity run's work started belongs to an
+// earlier run the child already moved past, so the parent is not waiting on it.
+const isChildQuestionLive = (
+  thread: Pick<
+    OrchestrationV2ThreadShell,
+    "activityRunStartedAt" | "activityRunStatus" | "pendingRuntimeRequest" | "status"
+  >,
+) =>
+  thread.pendingRuntimeRequest?.kind === "user_input" &&
+  isChildRunLive(thread) &&
+  (thread.activityRunStartedAt == null ||
+    DateTime.toEpochMillis(thread.pendingRuntimeRequest.createdAt) >=
+      DateTime.toEpochMillis(thread.activityRunStartedAt));
 
 export function createEnvironmentThreadShellAtoms(input: {
   readonly catalogValueAtom: Atom.Atom<EnvironmentCatalogState>;
@@ -94,8 +109,7 @@ export function createEnvironmentThreadShellAtoms(input: {
       for (const child of threads.values()) {
         if (
           child.archivedAt !== null ||
-          child.pendingRuntimeRequest?.kind !== "user_input" ||
-          !isChildRunLive(child) ||
+          !isChildQuestionLive(child) ||
           isProviderNativeSubagentThread(child)
         )
           continue;
@@ -221,11 +235,7 @@ export function createEnvironmentThreadShellAtoms(input: {
           if (child.archivedAt !== null || seen.has(child.id)) continue;
           seen.add(child.id);
           pending.push(child.id);
-          if (
-            child.pendingRuntimeRequest?.kind === "user_input" &&
-            isChildRunLive(child) &&
-            !isProviderNativeSubagentThread(child)
-          ) {
+          if (isChildQuestionLive(child) && !isProviderNativeSubagentThread(child)) {
             next.push(scopedThread(ref.environmentId, child));
           }
         }

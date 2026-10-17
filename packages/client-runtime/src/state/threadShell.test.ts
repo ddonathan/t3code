@@ -6,6 +6,7 @@ import {
   ThreadId,
   type OrchestrationV2ShellSnapshot,
 } from "@t3tools/contracts";
+import * as DateTime from "effect/DateTime";
 import * as Option from "effect/Option";
 import { Atom, AtomRegistry } from "effect/reactivity";
 import { describe, expect, it } from "vite-plus/test";
@@ -172,6 +173,24 @@ describe("v2 thread shell lists", () => {
         threads: [root, { ...legacyChild, status: "completed" }],
       });
       assertAttention(false);
+      // A question left over from an earlier run does not hold the parent once
+      // the child is working on a later run; one asked during that run does.
+      const laterRun = {
+        ...child,
+        status: "running" as const,
+        activityRunStatus: "running" as const,
+        activityRunStartedAt: DateTime.add(v2Now, { minutes: 5 }),
+      };
+      registry.set(snapshotAtom(environmentId), { ...v2ShellSnapshot, threads: [root, laterRun] });
+      assertAttention(false);
+      registry.set(snapshotAtom(environmentId), {
+        ...v2ShellSnapshot,
+        threads: [
+          root,
+          { ...laterRun, activityRunStartedAt: DateTime.subtract(v2Now, { minutes: 5 }) },
+        ],
+      });
+      assertAttention(true);
     } finally {
       disposeInputs();
       disposeList();
